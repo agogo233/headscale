@@ -200,7 +200,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		// Gets a [tailcfg.QueryFeatureRequest] and returns a [tailcfg.QueryFeatureResponse].
 		r.Post("/feature/query", ns.NotImplementedHandler)
 
-		r.Post("/update-health", ns.NotImplementedHandler)
+		r.Post("/update-health", ns.UpdateHealthHandler)
 
 		r.Route("/webclient", func(r chi.Router) {})
 
@@ -308,6 +308,14 @@ func overrideRemoteAddr(addr string) func(http.Handler) http.Handler {
 func (ns *noiseServer) NotImplementedHandler(writer http.ResponseWriter, req *http.Request) {
 	log.Trace().Caller().Str("path", req.URL.String()).Msg("not implemented handler hit")
 	http.Error(writer, "Not implemented yet", http.StatusNotImplemented)
+}
+
+// UpdateHealthHandler receives node health status updates.
+// tailscale stopped sending this proactively as of 2025-10-02,
+// so this is a no-op that discards the body and returns 204.
+func (ns *noiseServer) UpdateHealthHandler(writer http.ResponseWriter, req *http.Request) {
+	io.Copy(io.Discard, req.Body)
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 // PingResponseHandler handles HEAD requests from clients responding to a
