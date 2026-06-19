@@ -1,0 +1,42 @@
+FROM docker.io/golang:1.26.3-trixie AS builder
+
+ARG VERSION=dev
+WORKDIR /go/src/headscale
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w" \
+    -o /go/bin/headscale ./cmd/headscale
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install --no-install-recommends --yes \
+    ca-certificates \
+    curl \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 1000 headscale \
+    && useradd --system --gid headscale --uid 1000 --create-home \
+    --home-dir /var/lib/headscale headscale \
+    && mkdir -p /etc/headscale /var/run/headscale \
+    && chown headscale:headscale /var/run/headscale
+
+COPY --from=builder /go/bin/headscale /usr/local/bin/headscale
+
+EXPOSE 8080/tcp
+EXPOSE 9090/tcp
+EXPOSE 50443/tcp
+
+VOLUME ["/var/lib/headscale", "/etc/headscale"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail http://localhost:8080/health || exit 1
+
+USER headscale:headscale
+
+ENTRYPOINT ["/usr/local/bin/headscale"]
+CMD ["serve"]
