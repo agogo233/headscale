@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
-	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/types"
 )
 
@@ -17,7 +16,7 @@ func init() {
 
 // TailnetSettings is the Tailscale tailnet-settings response. Headscale's config
 // is file-based and mostly not runtime-mutable, so only a few fields carry a
-// real value; the rest report the default "off".
+// real value; the rest report the honest "off"/default.
 type TailnetSettings struct {
 	ACLsExternallyManagedOn bool   `json:"aclsExternallyManagedOn"`
 	ACLsExternalLink        string `json:"aclsExternalLink"`
@@ -60,7 +59,7 @@ func registerSettings(api huma.API, b Backend) {
 		Tags:        settingsTags,
 		Security:    security,
 		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.FeatureSettingsRead), func(ctx context.Context, in *getSettingsInput) (*settingsOutput, error) {
+	}, ScopeFeatureSettingsRead), func(ctx context.Context, in *getSettingsInput) (*settingsOutput, error) {
 		err := requireDefaultTailnet(in.Tailnet)
 		if err != nil {
 			return nil, err
@@ -87,7 +86,7 @@ func registerSettings(api huma.API, b Backend) {
 		// The body is accepted but ignored; skip validation.
 		SkipValidateBody: true,
 		Errors:           []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusNotImplemented},
-	}, scope.FeatureSettings), func(ctx context.Context, in *patchSettingsInput) (*settingsOutput, error) {
+	}, ScopeFeatureSettings), func(ctx context.Context, in *patchSettingsInput) (*settingsOutput, error) {
 		err := requireDefaultTailnet(in.Tailnet)
 		if err != nil {
 			return nil, err
