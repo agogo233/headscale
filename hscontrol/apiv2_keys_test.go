@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2/humatest"
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	apiv2 "github.com/juanfont/headscale/hscontrol/api/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
@@ -17,8 +15,8 @@ import (
 )
 
 // taggedCaps builds capabilities for a tagged auth key.
-func taggedCaps(tags ...string) *apiv2.KeyCapabilities {
-	return &apiv2.KeyCapabilities{
+func taggedCaps(tags ...string) apiv2.KeyCapabilities {
+	return apiv2.KeyCapabilities{
 		Devices: apiv2.KeyDeviceCapabilities{Create: apiv2.KeyDeviceCreateCapabilities{
 			Reusable:      true,
 			Preauthorized: true,
@@ -133,21 +131,17 @@ func TestAPIv2Key_Create_Tagged(t *testing.T) {
 	})
 
 	// (a) create response — Tailscale Key shape, exact seconds (int64 wire).
-	// ID/Key/Created/Expires are server-assigned; assert their presence apart.
-	want := apiv2.Key{
-		KeyType:       "auth",
-		Description:   "dev access",
-		ExpirySeconds: 86400,
-		Capabilities:  *taggedCaps("tag:test"),
-		Tags:          []string{"tag:test"},
-	}
-	if diff := cmp.Diff(want, created, cmpopts.IgnoreFields(apiv2.Key{}, "ID", "Key", "Created", "Expires")); diff != "" {
-		t.Errorf("created key mismatch (-want +got):\n%s", diff)
-	}
-
+	assert.Equal(t, "auth", created.KeyType)
 	assert.NotEmpty(t, created.ID)
 	assert.NotEmpty(t, created.Key, "secret returned on create")
+	assert.Equal(t, "dev access", created.Description)
+	assert.Equal(t, int64(86400), created.ExpirySeconds, "seconds, not nanoseconds")
+	assert.Empty(t, created.UserID, "tagged key presents no owner")
+	assert.Equal(t, []string{"tag:test"}, created.Capabilities.Devices.Create.Tags)
+	assert.True(t, created.Capabilities.Devices.Create.Reusable)
+	assert.True(t, created.Capabilities.Devices.Create.Preauthorized, "echoed on create")
 	assert.NotNil(t, created.Expires)
+	assert.False(t, created.Invalid)
 
 	// (c) server-side — the stored key.
 	pak := srvKey(t, app, created.ID)
@@ -172,7 +166,7 @@ func TestAPIv2Key_Create_Permutations(t *testing.T) {
 	}{
 		{
 			name: "single-use",
-			req: apiv2.CreateKeyRequest{Capabilities: &apiv2.KeyCapabilities{
+			req: apiv2.CreateKeyRequest{Capabilities: apiv2.KeyCapabilities{
 				Devices: apiv2.KeyDeviceCapabilities{Create: apiv2.KeyDeviceCreateCapabilities{Tags: []string{"tag:test"}}},
 			}},
 			wantSeconds: 7776000,
@@ -185,7 +179,7 @@ func TestAPIv2Key_Create_Permutations(t *testing.T) {
 		},
 		{
 			name: "ephemeral",
-			req: apiv2.CreateKeyRequest{Capabilities: &apiv2.KeyCapabilities{
+			req: apiv2.CreateKeyRequest{Capabilities: apiv2.KeyCapabilities{
 				Devices: apiv2.KeyDeviceCapabilities{Create: apiv2.KeyDeviceCreateCapabilities{
 					Ephemeral: true,
 					Tags:      []string{"tag:test"},
@@ -240,18 +234,14 @@ func TestAPIv2Key_Get(t *testing.T) {
 	})
 
 	got := getKey(t, api, created.ID)
-	// Get omits the secret (empty Key) and is stable across the round-trip.
-	want := apiv2.Key{
-		ID:            created.ID,
-		KeyType:       "auth",
-		Description:   "dev access",
-		ExpirySeconds: 86400,
-		Capabilities:  *taggedCaps("tag:test"),
-		Tags:          []string{"tag:test"},
-	}
-	if diff := cmp.Diff(want, got, cmpopts.IgnoreFields(apiv2.Key{}, "Created", "Expires")); diff != "" {
-		t.Errorf("got key mismatch (-want +got):\n%s", diff)
-	}
+	assert.Equal(t, created.ID, got.ID)
+	assert.Empty(t, got.Key, "secret omitted on get")
+	assert.Equal(t, "dev access", got.Description)
+	assert.Equal(t, int64(86400), got.ExpirySeconds, "stable across get")
+	assert.True(t, got.Capabilities.Devices.Create.Reusable)
+	assert.True(t, got.Capabilities.Devices.Create.Preauthorized, "Headscale always preauthorizes")
+	assert.Equal(t, []string{"tag:test"}, got.Capabilities.Devices.Create.Tags)
+	assert.False(t, got.Invalid)
 
 	// Unknown id and bad tailnet both 404 with the Tailscale error body.
 	assert.Equal(t, http.StatusNotFound, api.Get("/api/v2/tailnet/-/keys/999999").Code)
@@ -313,7 +303,7 @@ func TestAPIv2Key_Create_NoTags_NoOwner_400(t *testing.T) {
 
 	before := keyCount(t, app)
 
-	resp := api.Post("/api/v2/tailnet/-/keys", apiv2.CreateKeyRequest{Capabilities: &apiv2.KeyCapabilities{}})
+	resp := api.Post("/api/v2/tailnet/-/keys", apiv2.CreateKeyRequest{Capabilities: apiv2.KeyCapabilities{}})
 	assert.Equal(t, http.StatusBadRequest, resp.Code)
 	assert.Contains(t, resp.Body.String(), `"message"`)
 
