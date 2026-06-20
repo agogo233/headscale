@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
-	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"tailscale.com/net/tsaddr"
@@ -126,7 +125,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:        deviceTags,
 		Security:    security,
 		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCoreRead), func(ctx context.Context, in *deviceByIDInput) (*deviceOutput, error) {
+	}, ScopeDevicesCoreRead), func(ctx context.Context, in *deviceByIDInput) (*deviceOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -143,7 +142,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:        deviceTags,
 		Security:    security,
 		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCoreRead), func(ctx context.Context, in *listDevicesInput) (*listDevicesOutput, error) {
+	}, ScopeDevicesCoreRead), func(ctx context.Context, in *listDevicesInput) (*listDevicesOutput, error) {
 		err := requireDefaultTailnet(in.Tailnet)
 		if err != nil {
 			return nil, err
@@ -171,7 +170,7 @@ func registerDevices(api huma.API, b Backend) {
 		Security:      security,
 		DefaultStatus: http.StatusOK,
 		Errors:        []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCore), func(ctx context.Context, in *deviceByIDInput) (*emptyOutput, error) {
+	}, ScopeDevicesCore), func(ctx context.Context, in *deviceByIDInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -196,7 +195,7 @@ func registerDevices(api huma.API, b Backend) {
 		Security:      security,
 		DefaultStatus: http.StatusOK,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCore), func(ctx context.Context, in *setAuthorizedInput) (*emptyOutput, error) {
+	}, ScopeDevicesCore), func(ctx context.Context, in *setAuthorizedInput) (*emptyOutput, error) {
 		_, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -223,7 +222,7 @@ func registerDevices(api huma.API, b Backend) {
 		Security:      security,
 		DefaultStatus: http.StatusOK,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCore), func(ctx context.Context, in *setNameInput) (*emptyOutput, error) {
+	}, ScopeDevicesCore), func(ctx context.Context, in *setNameInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -248,7 +247,7 @@ func registerDevices(api huma.API, b Backend) {
 		Security:      security,
 		DefaultStatus: http.StatusOK,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCore), func(ctx context.Context, in *setTagsInput) (*emptyOutput, error) {
+	}, ScopeDevicesCore), func(ctx context.Context, in *setTagsInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -260,19 +259,6 @@ func registerDevices(api huma.API, b Backend) {
 		// sends "tags":null for "make untagged".
 		if len(in.Body.Tags) == 0 {
 			return &emptyOutput{}, nil
-		}
-
-		// An OAuth token may only assign tags within its grant (held directly or
-		// owned by a held tag per policy); an admin API key is unrestricted. The
-		// devices:core scope alone must not let a token stamp an arbitrary policy
-		// tag (e.g. tag:prod) onto any node. SetNodeTags still enforces that each
-		// tag exists in policy.
-		if tokenTags, isOAuth := principalTags(ctx); isOAuth {
-			for _, tag := range in.Body.Tags {
-				if !b.State.TagOwnedByTags(tag, tokenTags) {
-					return nil, huma.Error403Forbidden("token may not assign tag " + tag)
-				}
-			}
 		}
 
 		_, nodeChange, err := b.State.SetNodeTags(node.ID(), in.Body.Tags)
@@ -294,7 +280,7 @@ func registerDevices(api huma.API, b Backend) {
 		Security:      security,
 		DefaultStatus: http.StatusOK,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesCore), func(ctx context.Context, in *setKeyInput) (*emptyOutput, error) {
+	}, ScopeDevicesCore), func(ctx context.Context, in *setKeyInput) (*emptyOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -327,7 +313,7 @@ func registerDevices(api huma.API, b Backend) {
 		Security:      security,
 		DefaultStatus: http.StatusOK,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesRoutes), func(ctx context.Context, in *setSubnetRoutesInput) (*deviceRoutesOutput, error) {
+	}, ScopeDevicesRoutes), func(ctx context.Context, in *setSubnetRoutesInput) (*deviceRoutesOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
@@ -356,7 +342,7 @@ func registerDevices(api huma.API, b Backend) {
 		Tags:        deviceTags,
 		Security:    security,
 		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
-	}, scope.DevicesRoutesRead), func(ctx context.Context, in *deviceByIDInput) (*deviceRoutesOutput, error) {
+	}, ScopeDevicesRoutesRead), func(ctx context.Context, in *deviceByIDInput) (*deviceRoutesOutput, error) {
 		node, err := lookupNode(b, in.DeviceID)
 		if err != nil {
 			return nil, err
