@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
-	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 )
@@ -45,8 +44,9 @@ type setACLInput struct {
 	Tailnet string `path:"tailnet"`
 	IfMatch string `header:"If-Match"`
 	Accept  string `header:"Accept"`
-	// RawBody captures the raw HuJSON or JSON policy bytes; huma feeds them here
-	// regardless of Content-Type. The declared type only shapes the OpenAPI schema.
+	// RawBody captures the HuJSON or JSON policy body verbatim; huma feeds the
+	// raw request bytes here regardless of Content-Type. The declared type only
+	// shapes the OpenAPI schema.
 	RawBody []byte `contentType:"application/json"`
 }
 
@@ -61,7 +61,7 @@ func registerACL(api huma.API, b Backend) {
 		Tags:        aclTags,
 		Security:    security,
 		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusInternalServerError},
-	}, scope.PolicyFileRead), func(ctx context.Context, in *getACLInput) (*huma.StreamResponse, error) {
+	}, ScopePolicyFileRead), func(ctx context.Context, in *getACLInput) (*huma.StreamResponse, error) {
 		err := requireDefaultTailnet(in.Tailnet)
 		if err != nil {
 			return nil, err
@@ -90,7 +90,7 @@ func registerACL(api huma.API, b Backend) {
 			http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
 			http.StatusNotFound, http.StatusPreconditionFailed, http.StatusInternalServerError,
 		},
-	}, scope.PolicyFile), func(ctx context.Context, in *setACLInput) (*huma.StreamResponse, error) {
+	}, ScopePolicyFile), func(ctx context.Context, in *setACLInput) (*huma.StreamResponse, error) {
 		err := requireDefaultTailnet(in.Tailnet)
 		if err != nil {
 			return nil, err
@@ -183,7 +183,7 @@ func currentPolicy(b Backend) ([]byte, error) {
 	return nil, huma.Error500InternalServerError("unsupported policy mode", nil)
 }
 
-// streamPolicy writes the policy bytes as-is with the chosen content type and
+// streamPolicy writes the policy bytes verbatim with the chosen content type and
 // a content-addressed ETag, bypassing huma's JSON marshaler so HuJSON survives.
 func streamPolicy(data []byte, contentType string) *huma.StreamResponse {
 	return &huma.StreamResponse{Body: func(ctx huma.Context) {
