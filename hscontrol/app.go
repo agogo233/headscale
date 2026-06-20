@@ -310,43 +310,11 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			Msg("HA subnet router health probing enabled")
 	}
 
-	var revokedKeyGCChan <-chan time.Time
-
-	if h.cfg.PreAuthKeys.RevokedRetention > 0 {
-		revokedKeyTicker := time.NewTicker(time.Hour)
-		defer revokedKeyTicker.Stop()
-
-		revokedKeyGCChan = revokedKeyTicker.C
-	}
-
-	// OAuth access tokens are short-lived (1h) and re-minted on demand; reap
-	// expired rows hourly so the table stays bounded.
-	accessTokenTicker := time.NewTicker(time.Hour)
-	defer accessTokenTicker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info().Caller().Msg("scheduled task worker is shutting down.")
 			return
-
-		case <-revokedKeyGCChan:
-			cutoff := time.Now().Add(-h.cfg.PreAuthKeys.RevokedRetention)
-
-			reaped, err := h.state.DestroyRevokedPreAuthKeysBefore(cutoff)
-			if err != nil {
-				log.Error().Err(err).Msg("reaping revoked pre-auth keys")
-			} else if reaped > 0 {
-				log.Info().Int("count", reaped).Msg("reaped revoked pre-auth keys")
-			}
-
-		case <-accessTokenTicker.C:
-			reaped, err := h.state.DeleteExpiredAccessTokens(time.Now())
-			if err != nil {
-				log.Error().Err(err).Msg("reaping expired oauth access tokens")
-			} else if reaped > 0 {
-				log.Debug().Int64("count", reaped).Msg("reaped expired oauth access tokens")
-			}
 
 		case <-expireTicker.C:
 			var (
@@ -460,11 +428,6 @@ func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeaders)
 
-	// TS2021 accepts both the native client's HTTP POST upgrade and the
-	// browser/WASM client's WebSocket GET upgrade; NoiseUpgradeHandler
-	// dispatches on the Upgrade header, not the method. Registering GET as
-	// well keeps the router from rejecting the WebSocket handshake with 405.
-	r.Get(ts2021UpgradePath, h.NoiseUpgradeHandler)
 	r.Post(ts2021UpgradePath, h.NoiseUpgradeHandler)
 
 	r.Get("/robots.txt", h.RobotsHandler)
@@ -645,26 +608,20 @@ func (h *Headscale) Serve() error {
 		Cfg:    h.cfg,
 	})
 
-	// The Headscale v2 API. Served behind Basic/Bearer auth on the remote
-	// listener, and over the local unix socket (local trust) so the CLI can
-	// manage OAuth clients through the same v2 keys handler the Tailscale
-	// ecosystem uses.
+	// The Headscale v2 API. It is served only over the remote
+	// listener (Basic/Bearer auth); no unix-socket mount yet, as nothing local
+	// calls it — the CLI still speaks v1.
 	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
 		State:  h.state,
 		Change: h.Change,
 		Cfg:    h.cfg,
 	})
 
-	// Serve both Huma APIs over the unix socket without TLS or auth: socket
-	// access implies trust. WithLocalTrust marks these requests so each API's
-	// security middleware skips the credential check. v2 paths route to the v2
-	// mux; everything else (the v1 paths) to v1.
-	socketHandler := http.NewServeMux()
-	socketHandler.Handle("/api/v2/", apiv2.WithLocalTrust(humaV2Mux))
-	socketHandler.Handle("/", apiv1.WithLocalTrust(humaMux))
-
+	// Serve the Huma API over the unix socket without TLS or auth: socket access
+	// implies trust. WithLocalTrust marks these requests so the security
+	// middleware skips the API-key check.
 	socketServer := &http.Server{
-		Handler:     socketHandler,
+		Handler:     apiv1.WithLocalTrust(humaMux),
 		ReadTimeout: types.HTTPTimeout,
 	}
 
