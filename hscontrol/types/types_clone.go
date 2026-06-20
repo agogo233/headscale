@@ -132,9 +132,6 @@ func (src *PreAuthKey) Clone() *PreAuthKey {
 	if dst.Expiration != nil {
 		dst.Expiration = new(*src.Expiration)
 	}
-	if dst.Revoked != nil {
-		dst.Revoked = new(*src.Revoked)
-	}
 	return dst
 }
 
@@ -153,5 +150,4 @@ var _PreAuthKeyCloneNeedsRegeneration = PreAuthKey(struct {
 	Tags        []string
 	CreatedAt   *time.Time
 	Expiration  *time.Time
-	Revoked     *time.Time
 }{})
