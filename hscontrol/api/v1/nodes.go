@@ -75,6 +75,11 @@ type SetTagsRequestBody struct {
 	Tags []string `json:"tags,omitempty"`
 }
 
+// MoveNodeRequestBody mirrors v1.MoveNodeRequest.
+type MoveNodeRequestBody struct {
+	User string `format:"uint64" json:"user"`
+}
+
 // SetApprovedRoutesRequestBody mirrors v1.SetApprovedRoutesRequest.
 type SetApprovedRoutesRequestBody struct {
 	Routes []string `json:"routes,omitempty"`
@@ -134,6 +139,11 @@ type expireNodeInput struct {
 type renameNodeInput struct {
 	NodeID  string `format:"uint64" path:"nodeId"`
 	NewName string `path:"newName"`
+}
+
+type moveNodeInput struct {
+	NodeID string `format:"uint64" path:"nodeId"`
+	Body   MoveNodeRequestBody
 }
 
 type setTagsInput struct {
@@ -350,6 +360,39 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 		node, nodeChange, err := b.State.RenameNode(nodeID, in.NewName)
 		if err != nil {
 			return nil, mapError("renaming node", err)
+		}
+
+		b.Change(nodeChange)
+
+		out := &nodeOutput{}
+		out.Body.Node = nodeFromView(node)
+
+		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "moveNode",
+		Method:      http.MethodPost,
+		Path:        "/api/v1/node/{nodeId}/user",
+		Summary:     "Move node to a different user",
+		Tags:        []string{"Nodes"},
+		Security:    bearerAuth,
+	}, func(ctx context.Context, in *moveNodeInput) (*nodeOutput, error) {
+		nodeID, err := parseNodeID(in.NodeID)
+		if err != nil {
+			return nil, err
+		}
+
+		uid, err := strconv.ParseUint(in.Body.User, 10, 64)
+		if err != nil {
+			return nil, huma.Error400BadRequest("invalid user id", err)
+		}
+
+		node, nodeChange, err := b.State.MoveNodeToUser(
+			nodeID, types.UserID(uid),
+		)
+		if err != nil {
+			return nil, mapError("moving node", err)
 		}
 
 		b.Change(nodeChange)

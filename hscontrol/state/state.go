@@ -77,6 +77,10 @@ var ErrNodeNotInNodeStore = errors.New("node no longer exists in NodeStore")
 // ErrNodeNameNotUnique is returned when a node name is not unique.
 var ErrNodeNameNotUnique = errors.New("node name is not unique")
 
+// ErrNodeIsTagged is returned when attempting to move a tagged node to
+// another user. Tagged nodes are owned by their tags, not a user.
+var ErrNodeIsTagged = errors.New("tagged node cannot be moved to another user")
+
 // nodeUpdateColumns lists all Node columns that should be written
 // during a struct-based GORM Updates() call.  Listing them explicitly
 // forces GORM to include nil/zero-value fields (e.g. UserID=nil when
@@ -1050,6 +1054,42 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 	}
 
 	return s.persistNodeToDB(view)
+}
+
+// MoveNodeToUser transfers a user-owned node to a different user.
+// Tagged nodes are owned by their tags and cannot be moved — the caller
+// must verify IsTagged() before calling this function.
+func (s *State) MoveNodeToUser(nodeID types.NodeID, userID types.UserID) (types.NodeView, change.Change, error) {
+	existingNode, exists := s.nodeStore.GetNode(nodeID)
+	if !exists {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotFound, nodeID)
+	}
+
+	if existingNode.IsTagged() {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeIsTagged, nodeID)
+	}
+
+	user, err := s.GetUserByID(userID)
+	if err != nil {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("getting target user: %w", err)
+	}
+
+	n, ok := s.nodeStore.UpdateNode(nodeID, func(node *types.Node) {
+		node.UserID = &user.ID
+		node.User = user
+	})
+	if !ok {
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
+	}
+
+	nodeView, c, err := s.persistNodeToDB(n)
+	if err != nil {
+		return nodeView, c, err
+	}
+
+	c.OriginNode = nodeID
+
+	return nodeView, c, nil
 }
 
 // BackfillNodeIPs assigns IP addresses to nodes that don't have them.
