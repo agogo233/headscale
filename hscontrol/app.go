@@ -319,6 +319,11 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 		revokedKeyGCChan = revokedKeyTicker.C
 	}
 
+	// OAuth access tokens are short-lived (1h) and re-minted on demand; reap
+	// expired rows hourly so the table stays bounded.
+	accessTokenTicker := time.NewTicker(time.Hour)
+	defer accessTokenTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -333,6 +338,14 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 				log.Error().Err(err).Msg("reaping revoked pre-auth keys")
 			} else if reaped > 0 {
 				log.Info().Int("count", reaped).Msg("reaped revoked pre-auth keys")
+			}
+
+		case <-accessTokenTicker.C:
+			reaped, err := h.state.DeleteExpiredAccessTokens(time.Now())
+			if err != nil {
+				log.Error().Err(err).Msg("reaping expired oauth access tokens")
+			} else if reaped > 0 {
+				log.Debug().Int64("count", reaped).Msg("reaped expired oauth access tokens")
 			}
 
 		case <-expireTicker.C:
@@ -447,6 +460,11 @@ func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
 	r.Use(middleware.Recoverer)
 	r.Use(securityHeaders)
 
+	// TS2021 accepts both the native client's HTTP POST upgrade and the
+	// browser/WASM client's WebSocket GET upgrade; NoiseUpgradeHandler
+	// dispatches on the Upgrade header, not the method. Registering GET as
+	// well keeps the router from rejecting the WebSocket handshake with 405.
+	r.Get(ts2021UpgradePath, h.NoiseUpgradeHandler)
 	r.Post(ts2021UpgradePath, h.NoiseUpgradeHandler)
 
 	r.Get("/robots.txt", h.RobotsHandler)
