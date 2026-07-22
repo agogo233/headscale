@@ -1,4 +1,4 @@
-FROM docker.io/golang:1.26.4-bookworm AS builder
+FROM docker.io/golang:1.26.5-bookworm AS builder
 
 ARG VERSION=dev
 ARG TARGETARCH
