@@ -349,6 +349,8 @@ jobs:
           - TestTagsAuthKeyWithTagCannotAddViaCLI
           - TestTagsAuthKeyWithTagCannotChangeViaCLI
           - TestTagsAuthKeyWithTagAdminOverrideReauthPreserves
+          - TestTagsReauthDifferentKeyRetagsNode
+          - TestTagsReauthDifferentKeyRemovesTag
           - TestTagsAuthKeyWithTagCLICannotModifyAdminTags
           - TestTagsAuthKeyWithoutTagCannotRequestTags
           - TestTagsAuthKeyWithoutTagRegisterNoTags
@@ -376,6 +378,15 @@ jobs:
           - TestTagsAuthKeyWithoutUserInheritsTags
           - TestTagsAuthKeyWithoutUserRejectsAdvertisedTags
           - TestTagsAuthKeyConvertToUserViaCLIRegister
+<<<<<<< HEAD:.github/workflows/test-integration.yaml.bak
+=======
+          - TestTaggedNodeLogoutReloginSingleUseKeyOnline
+          - TestTaggedNodeLogoutReloginReusableKeyOnline
+          - TestTagsOIDCReauthAddOwnedTag
+          - TestTagsReauthEmptyTagsReturnsToUserSurvives
+          - TestTS2021WebSocketGET
+          - TestTS2021WASMClientUnderNode
+>>>>>>> upstream/main:.github/workflows/test-integration.yaml
           - TestTailscaleRustAxum
     uses: ./.github/workflows/integration-test-template.yml
     secrets: inherit

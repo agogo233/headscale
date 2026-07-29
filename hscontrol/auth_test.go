@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
@@ -692,6 +693,11 @@ func TestAuthenticationFlows(t *testing.T) {
 					user := app.state.CreateUserForTest("followup-user")
 
 					node := app.state.CreateNodeForTest(user, "followup-success-node")
+					// [State.HandleNodeFromAuthPath] resolves the node from the
+					// machine key cached when the registration was opened, so on
+					// the real path the node carries the polling session's
+					// machine key. CreateNodeForTest picks a random one.
+					node.MachineKey = machineKey1.Public()
 					nodeToRegister.FinishAuth(types.AuthVerdict{Node: node.View()})
 				}()
 
@@ -4100,4 +4106,151 @@ func TestHandleNodeFromAuthPath_OldUserNil_NoPanic(t *testing.T) {
 	require.True(t, node.Valid())
 	assert.NotEqual(t, types.NodeID(99002), node.ID(), "new node, not orphan")
 	assert.Equal(t, userB.ID, node.UserID().Get(), "new node belongs to userB")
+}
+
+// TestWaitForFollowupMachineKeyMismatch covers the followup poll in
+// [Headscale.waitForFollowup]. That poll is authenticated only by the auth ID
+// embedded in the followup URL, so without a machine-key check anyone who
+// learns an ID gets the registering user's User/Login back in the
+// [tailcfg.RegisterResponse].
+//
+// [Headscale.handleRegister] and [Headscale.handleLogout] already fail closed
+// here; see the "existing_node_machine_key_mismatch" case in
+// [TestAuthenticationFlows] for the equivalent assertion on that path.
+//
+// The nodes are given the registering session's machine key because that is
+// what production produces: [State.HandleNodeFromAuthPath] resolves the node
+// from the machine key cached in [types.RegistrationData] when the
+// registration was opened.
+func TestWaitForFollowupMachineKeyMismatch(t *testing.T) {
+	app := createTestApp(t)
+
+	victimMachineKey := key.NewMachine()
+	attackerMachineKey := key.NewMachine()
+
+	// Park a completed registration in the auth cache, as a node that is
+	// already polling for its verdict would see it.
+	newPendingFollowup := func(hostname string) string {
+		authID := types.MustAuthID()
+		regEntry := types.NewRegisterAuthRequest(&types.RegistrationData{
+			MachineKey: victimMachineKey.Public(),
+			NodeKey:    key.NewNode().Public(),
+			Hostname:   hostname,
+		})
+		app.state.SetAuthCacheEntry(authID, regEntry)
+
+		user := app.state.CreateUserForTest(hostname + "-user")
+		node := app.state.CreateNodeForTest(user, hostname)
+		node.MachineKey = victimMachineKey.Public()
+		// CreateNodeForTest only sets UserID, but nodeToRegisterResponse reads
+		// the owner, and the owner's identity is exactly what must not leak.
+		node.User = user
+		regEntry.FinishAuth(types.AuthVerdict{Node: node.View()})
+
+		return fmt.Sprintf("http://localhost:8080/register/%s", authID)
+	}
+
+	followup := func(url string, machineKey key.MachinePublic) (*tailcfg.RegisterResponse, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		return app.handleRegister(ctx, tailcfg.RegisterRequest{
+			Followup: url,
+			NodeKey:  key.NewNode().Public(),
+		}, machineKey)
+	}
+
+	t.Run("mismatched machine key is rejected", func(t *testing.T) {
+		resp, err := followup(newPendingFollowup("followup-mismatch"), attackerMachineKey.Public())
+
+		require.Error(t, err, "followup with a foreign machine key must not succeed")
+		assert.Nil(t, resp, "no registration details should be returned")
+
+		var httpErr HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusUnauthorized, httpErr.Code)
+	})
+
+	// Positive control. Without it a regression that stops the poll from
+	// finding the cache entry at all would still pass the case above, because
+	// waitForFollowup falls back to handing out a fresh AuthURL.
+	t.Run("matching machine key still completes", func(t *testing.T) {
+		resp, err := followup(newPendingFollowup("followup-match"), victimMachineKey.Public())
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.MachineAuthorized)
+		assert.NotEmpty(t, resp.User.DisplayName, "the owner's identity is returned on the legitimate path")
+	})
+}
+
+// TestFollowupWaitPrefersCompletedAuthOverExpiredContext reproduces
+// https://github.com/juanfont/headscale/issues/3385.
+//
+// Root cause: [Headscale.waitForFollowup] selects on ctx.Done() and the auth
+// verdict channel with equal priority. When the registration has ALREADY
+// completed (verdict buffered) but the request context has ALSO expired, Go's
+// select picks a ready case at random, so roughly half the time it returns
+// "registration timed out" and discards a successful registration.
+//
+// The v0.28.0 hscontrol test suite hit this because the followup context
+// timeout was only 100ms while the setup goroutine (create user + node in
+// SQLite) frequently took longer on slower/constrained builders (ppc64le,
+// Alpine CI). Both channels ended up ready at once and the flake surfaced as
+// TestAuthenticationFlows/followup_registration_success failing with
+// "http error[401]: registration timed out".
+//
+// The fix must give the completed-auth case priority over context
+// cancellation. This test forces both cases ready on every iteration; it must
+// never report a timeout.
+func TestFollowupWaitPrefersCompletedAuthOverExpiredContext(t *testing.T) {
+	app := createTestApp(t)
+
+	machineKey := key.NewMachine().Public()
+	nodeKey := key.NewNode().Public()
+
+	const iterations = 300
+
+	timeouts, authorized := 0, 0
+
+	for i := range iterations {
+		regID, err := types.NewAuthID()
+		require.NoError(t, err)
+
+		authReq := types.NewRegisterAuthRequest(&types.RegistrationData{
+			Hostname: "followup-race-node",
+		})
+		app.state.SetAuthCacheEntry(regID, authReq)
+
+		// Registration completes BEFORE we wait: verdict is buffered.
+		user := app.state.CreateUserForTest(fmt.Sprintf("followup-race-user-%d", i))
+		node := app.state.CreateNodeForTest(user, "followup-race-node")
+		// waitForFollowup fails closed unless the node carries the polling
+		// session's machine key; production sets this via the cached
+		// RegistrationData. CreateNodeForTest picks a random one.
+		node.MachineKey = machineKey
+		authReq.FinishAuth(types.AuthVerdict{Node: node.View()})
+
+		// Context is expired BEFORE we wait: both select cases are ready.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		req := tailcfg.RegisterRequest{
+			Followup: fmt.Sprintf("http://localhost:8080/register/%s", regID),
+			NodeKey:  nodeKey,
+		}
+
+		resp, err := app.waitForFollowup(ctx, req, machineKey)
+		switch {
+		case err != nil:
+			timeouts++
+		case resp != nil && resp.MachineAuthorized:
+			authorized++
+		}
+	}
+
+	assert.Zero(t, timeouts,
+		"waitForFollowup must never report a timeout when auth has already completed; got %d/%d timeouts",
+		timeouts, iterations)
+	assert.Equal(t, iterations, authorized, "every completed registration must be returned as authorized")
 }

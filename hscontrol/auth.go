@@ -233,6 +233,20 @@ func (h *Headscale) handleLogout(
 			Msg("Node is not ephemeral, setting expiry instead of deleting")
 	}
 
+	// Tagged nodes have key expiry permanently disabled (they are owned by
+	// their tags, not a user, and never expire - KB 1068). Logging one out has
+	// no expiry semantics, so do not stamp an expiry on it: doing so leaves the
+	// node IsExpired() forever and it can never re-authenticate (#3371). The
+	// admin path `headscale nodes expire` remains free to set a deliberate
+	// expiry via SetNodeExpiry; only the logout path is guarded here.
+	if node.IsTagged() {
+		log.Debug().
+			EmbedObject(node).
+			Msg("Tagged node logout: not stamping expiry (tagged nodes never expire)")
+
+		return nodeToRegisterResponse(node), nil
+	}
+
 	// Update the internal state with the nodes new expiry, meaning it is
 	// logged out.
 	//
@@ -301,18 +315,40 @@ func (h *Headscale) waitForFollowup(
 	}
 
 	if reg, ok := h.state.GetAuthCacheEntry(followupReg); ok {
+		var verdict types.AuthVerdict
 		select {
-		case <-ctx.Done():
-			return nil, NewHTTPError(http.StatusUnauthorized, "registration timed out", err)
-		case verdict := <-reg.WaitForAuth():
-			if verdict.Accept() {
-				if !verdict.Node.Valid() {
-					// registration is expired in the cache, instruct the client to try a new registration
-					return h.reqToNewRegisterResponse(req, machineKey)
-				}
-
-				return nodeToRegisterResponse(verdict.Node), nil
+		// Prefer a completed registration even if the context has also
+		// expired. When both are ready, a plain select picks at random and
+		// would discard a successful registration as a spurious timeout
+		// (issue #3385).
+		case verdict = <-reg.WaitForAuth():
+		default:
+			select {
+			case <-ctx.Done():
+				return nil, NewHTTPError(http.StatusUnauthorized, "registration timed out", ctx.Err())
+			case verdict = <-reg.WaitForAuth():
 			}
+		}
+
+		if verdict.Accept() {
+			if !verdict.Node.Valid() {
+				// registration is expired in the cache, instruct the client to try a new registration
+				return h.reqToNewRegisterResponse(req, machineKey)
+			}
+
+			// The followup poll is only authenticated by the auth ID in the
+			// URL, so fail closed unless the Noise session asking for the
+			// result was started with the same machine key that opened the
+			// registration. [State.HandleNodeFromAuthPath] resolves the node
+			// from the cached [types.RegistrationData.MachineKey], so the two
+			// match on the normal path. [Headscale.handleRegister] and
+			// [Headscale.handleLogout] apply the same check.
+			err := machineKeyMismatch(verdict.Node, machineKey)
+			if err != nil {
+				return nil, err
+			}
+
+			return nodeToRegisterResponse(verdict.Node), nil
 		}
 	}
 
