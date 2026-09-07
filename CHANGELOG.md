@@ -2,7 +2,7 @@
 
 ## 0.30.0 (202x-xx-xx)
 
-**Minimum supported Tailscale client version: v1.xx.0**
+**Minimum supported Tailscale client version: v1.82.0**
 
 ### v1 REST API replaced; gRPC and Protobuf removed
 
@@ -44,6 +44,19 @@ keys remain all-access.
 
 - Expiring or deleting a non-existent pre-auth key now returns an error instead of silently succeeding [#3324](https://github.com/juanfont/headscale/pull/3324)
 - Improve systemd service file hardening [#3341](https://github.com/juanfont/headscale/pull/3341)
+- Headscale now requires Go 1.27 to build
+
+## 0.29.4 (unreleased)
+
+**Minimum supported Tailscale client version: v1.80.0**
+
+### Changes
+
+- Fix HTTP metrics only counting `OPTIONS` requests, so `http_requests_total` and `http_request_duration_seconds` now cover regular traffic [#3414](https://github.com/juanfont/headscale/pull/3414)
+- Fix extra-records filewatcher hanging on shutdown after the watched file is deleted, and leaking the watcher when setup fails [#3437](https://github.com/juanfont/headscale/pull/3437)
+- Fix `headscale users rename` sending the raw `--identifier` flag value instead of the matched user's identifier, so renaming by name works again [#3442](https://github.com/juanfont/headscale/pull/3442)
+- Fix tailsql not shutting down with headscale, leaving the process hanging on graceful shutdown [#3400](https://github.com/juanfont/headscale/pull/3400)
+- Fix tvOS setup instructions: install the VPN configuration before setting the coordination server URL [#3431](https://github.com/juanfont/headscale/pull/3431)
 
 ## 0.29.3 (2026-07-29)
 
@@ -1143,7 +1156,7 @@ part of adopting [#1460](https://github.com/juanfont/headscale/pull/1460).
   - `ip_prefixes` option is now `prefixes.v4` and `prefixes.v6`
   - `prefixes.allocation` can be set to assign IPs at `sequential` or `random`.
     [#1869](https://github.com/juanfont/headscale/pull/1869)
-- MagicDNS domains no longer contain usernames []()
+- MagicDNS domains no longer contain usernames
   - This is in preparation to fix Headscales implementation of tags which
     currently does not correctly remove the link between a tagged device and a
     user. As tagged devices will not have a user, this will require a change to

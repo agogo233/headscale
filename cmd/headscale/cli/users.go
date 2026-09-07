@@ -43,15 +43,15 @@ func usernameAndIDFromFlag(cmd *cobra.Command) (uint64, string, error) {
 }
 
 // resolveSingleUser resolves exactly one user from the --name/--id flags,
-// returning the raw flag id and the matched user.
+// returning the identifier of the matched user and the user itself.
 func resolveSingleUser(
 	ctx context.Context,
 	client *clientv1.ClientWithResponses,
 	cmd *cobra.Command,
-) (uint64, *clientv1.User, error) {
+) (string, *clientv1.User, error) {
 	id, username, err := usernameAndIDFromFlag(cmd)
 	if err != nil {
-		return 0, nil, err
+		return "", nil, err
 	}
 
 	params := &clientv1.ListUsersParams{}
@@ -66,19 +66,19 @@ func resolveSingleUser(
 
 	resp, err := client.ListUsersWithResponse(ctx, params)
 	if err != nil {
-		return 0, nil, fmt.Errorf("listing users: %w", err)
+		return "", nil, fmt.Errorf("listing users: %w", err)
 	}
 
 	if resp.StatusCode() != http.StatusOK {
-		return 0, nil, apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
+		return "", nil, apiError(resp.StatusCode(), resp.ApplicationproblemJSONDefault)
 	}
 
 	users := resp.JSON200.Users
 	if len(users) != 1 {
-		return 0, nil, errMultipleUsersMatch
+		return "", nil, errMultipleUsersMatch
 	}
 
-	return id, &users[0], nil
+	return users[0].Id, &users[0], nil
 }
 
 func init() {
@@ -239,14 +239,14 @@ var renameUserCmd = &cobra.Command{
 	Short:   "Renames a user",
 	Aliases: []string{"mv"},
 	RunE: clientRunE(func(ctx context.Context, client *clientv1.ClientWithResponses, cmd *cobra.Command, args []string) error {
-		id, _, err := resolveSingleUser(ctx, client, cmd)
+		userId, _, err := resolveSingleUser(ctx, client, cmd)
 		if err != nil {
 			return err
 		}
 
 		newName, _ := cmd.Flags().GetString("new-name")
 
-		resp, err := client.RenameUserWithResponse(ctx, strconv.FormatUint(id, util.Base10), newName)
+		resp, err := client.RenameUserWithResponse(ctx, userId, newName)
 		if err != nil {
 			return fmt.Errorf("renaming user: %w", err)
 		}

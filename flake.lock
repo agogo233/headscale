@@ -9,11 +9,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1781951072,
-        "narHash": "sha256-hA9u6hB4QzpReP8hudxqiaa4vLhoRvtXi6YmUgJRGEs=",
+        "lastModified": 1783015821,
+        "narHash": "sha256-vmzYTZxIAy3OYXwkRL5GQYk8fNnh8TLWcxQRIO3ywOU=",
         "owner": "kradalby",
         "repo": "flake-checks",
-        "rev": "3d2882efec5cf10f8b5a8a035d93ba6ba9f21717",
+        "rev": "3c821706eb0bd07f515f9a7726b650ccae927433",
         "type": "github"
       },
       "original": {
@@ -60,16 +60,16 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1781153106,
-        "narHash": "sha256-yzsroLCcuRG4KdGMxWt0eXKOrRSgQT8/xjYngeq9ujU=",
+        "lastModified": 1787394516,
+        "narHash": "sha256-pRGOQSClnXNI2iLUG6DYpsGvYcuw0drOutVZFTJNw90=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "9ee75f111a06d7ab2b2f729698a8eff53d54e070",
+        "rev": "c8f90650c15282fa8656a041bfbbd2403997a9a7",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "staging-next-26.05",
+        "ref": "nixpkgs-unstable",
         "repo": "nixpkgs",
         "type": "github"
       }
