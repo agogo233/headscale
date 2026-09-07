@@ -117,6 +117,14 @@ func Spec() ([]byte, error) {
 	return api.OpenAPI().YAML()
 }
 
+// Spec30 emits the document downgraded to OpenAPI 3.0.3, needed because
+// oapi-codegen cannot yet read 3.1; the typed client is generated from this.
+func Spec30() ([]byte, error) {
+	api := NewAPI(chi.NewMux(), Backend{})
+
+	return api.OpenAPI().DowngradeYAML()
+}
+
 type contextKey int
 
 const (
