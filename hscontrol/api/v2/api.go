@@ -24,6 +24,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
+	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -262,13 +263,14 @@ const scopeMetaKey = "headscale.scope"
 
 // requireScope records op's required scope in its Metadata, where the auth
 // middleware can read it back. It keeps the requirement next to the operation
-// definition.
+// definition. The value is stored as [scope.Scope] so enforcement and the
+// structural guard test share one type.
 func requireScope(op huma.Operation, s Scope) huma.Operation {
 	if op.Metadata == nil {
 		op.Metadata = map[string]any{}
 	}
 
-	op.Metadata[scopeMetaKey] = s
+	op.Metadata[scopeMetaKey] = scope.Scope(s)
 
 	return op
 }

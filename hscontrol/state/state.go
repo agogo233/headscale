@@ -1113,7 +1113,7 @@ func (s *State) MoveNodeToUser(nodeID types.NodeID, userID types.UserID) (types.
 		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
 	}
 
-	nodeView, c, err := s.persistNodeToDB(n)
+	nodeView, c, err := s.persistNodeAndRefreshPolicy(n)
 	if err != nil {
 		return nodeView, c, err
 	}
