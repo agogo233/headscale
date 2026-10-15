@@ -35,6 +35,7 @@ func mapError(msg string, err error) error {
 		errors.Is(err, state.ErrRequestedTagsInvalidOrNotPermitted),
 		errors.Is(err, state.ErrNodeIsTagged),
 		errors.Is(err, db.ErrUserStillHasNodes),
+		errors.Is(err, db.ErrUserNotUnique),
 		errors.Is(err, db.ErrCannotChangeOIDCUser),
 		errors.Is(err, db.ErrPreAuthKeyNotTaggedOrOwned),
 		errors.Is(err, db.ErrSingleUseAuthKeyHasBeenUsed):

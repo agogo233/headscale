@@ -514,9 +514,10 @@ func registerNodeAdminOps(api huma.API, b Backend) {
 			return nil, huma.Error400BadRequest("registering node", err)
 		}
 
-		user, err := b.State.GetUserByName(in.User)
+		// Numeric user values are ids, anything else a username.
+		user, err := resolveUserByIDOrName(b, in.User)
 		if err != nil {
-			return nil, mapError("looking up user", err)
+			return nil, err
 		}
 
 		node, nodeChange, err := b.State.HandleNodeFromAuthPath(

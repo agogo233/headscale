@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -63,6 +64,26 @@ type (
 	}
 )
 
+// PendingAuthRequest is the v1 list item for an open node-registration request
+// waiting for an auth verdict.
+type PendingAuthRequest struct {
+	AuthID      string    `json:"authId"`
+	Hostname    string    `json:"hostname"`
+	User        string    `json:"user"`
+	OS          string    `json:"os"`
+	OSVersion   string    `json:"osVersion"`
+	RoutableIPs []string  `json:"routableIPs" nullable:"false"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+type (
+	listPendingAuthRequestsOutput struct {
+		Body struct {
+			AuthRequests []PendingAuthRequest `json:"authRequests" nullable:"false"`
+		}
+	}
+)
+
 func registerAuth(api huma.API, b Backend) {
 	huma.Register(api, huma.Operation{
 		OperationID: "authRegister",
@@ -79,9 +100,10 @@ func registerAuth(api huma.API, b Backend) {
 			return nil, huma.Error400BadRequest("registering node", err)
 		}
 
-		user, err := b.State.GetUserByName(in.Body.User)
+		// Numeric user values are ids, anything else a username.
+		user, err := resolveUserByIDOrName(b, in.Body.User)
 		if err != nil {
-			return nil, mapError("looking up user", err)
+			return nil, err
 		}
 
 		node, nodeChange, err := b.State.HandleNodeFromAuthPath(
@@ -146,6 +168,70 @@ func registerAuth(api huma.API, b Backend) {
 
 		return &authRejectOutput{}, nil
 	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "listPendingAuthRequests",
+		Method:      http.MethodGet,
+		Path:        "/api/v1/auth/pending",
+		Summary:     "List pending auth requests",
+		Description: "Lists open node-registration requests waiting for an auth verdict.",
+		Tags:        []string{"Auth"},
+		Security:    bearerAuth,
+	}, func(ctx context.Context, _ *struct{}) (*listPendingAuthRequestsOutput, error) {
+		entries := b.State.ListPendingAuthRequests()
+
+		out := &listPendingAuthRequestsOutput{}
+		out.Body.AuthRequests = make([]PendingAuthRequest, 0, len(entries))
+
+		for _, entry := range entries {
+			out.Body.AuthRequests = append(out.Body.AuthRequests,
+				pendingAuthRequestFromEntry(b, entry),
+			)
+		}
+
+		return out, nil
+	})
+}
+
+// pendingAuthRequestFromEntry builds one list item from a cached pending
+// request. User is only known after the OIDC callback resolved the identity,
+// and the routable-IP field stays empty until the client announced it.
+func pendingAuthRequestFromEntry(
+	b Backend,
+	entry types.AuthRequestEntry,
+) PendingAuthRequest {
+	reg := entry.Request.RegistrationData()
+
+	item := PendingAuthRequest{
+		AuthID:    entry.ID.String(),
+		Hostname:  reg.Hostname,
+		CreatedAt: entry.Request.CreatedAt(),
+	}
+
+	if reg.Hostinfo != nil {
+		item.OS = reg.Hostinfo.OS
+		item.OSVersion = reg.Hostinfo.OSVersion
+
+		for _, prefix := range reg.Hostinfo.RoutableIPs {
+			item.RoutableIPs = append(item.RoutableIPs, prefix.String())
+		}
+	}
+
+	if item.RoutableIPs == nil {
+		item.RoutableIPs = []string{}
+	}
+
+	if pc := entry.Request.PendingConfirmation(); pc != nil {
+		if user, err := b.State.GetUserByID(types.UserID(pc.UserID)); err == nil {
+			item.User = user.Name
+
+			if item.User == "" {
+				item.User = user.Username()
+			}
+		}
+	}
+
+	return item
 }
 
 // pendingAuthRequest looks up the pending session for auth_id. Malformed

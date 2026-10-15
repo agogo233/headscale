@@ -1820,6 +1820,26 @@ func (s *State) DeleteAuthCacheEntryForTest(id types.AuthID) {
 	s.authCache.Remove(id)
 }
 
+// ListPendingAuthRequests returns the open node-registration requests still
+// waiting for a verdict, as (id, request) pairs. Finished (approved, rejected,
+// or expired) requests and non-registration requests are excluded; entries
+// evicted between the key scan and the lookup are skipped. Peek is used so the
+// read does not refresh the LRU recency of pending entries.
+func (s *State) ListPendingAuthRequests() []types.AuthRequestEntry {
+	entries := make([]types.AuthRequestEntry, 0, s.authCache.Len())
+
+	for _, id := range s.authCache.Keys() {
+		req, ok := s.authCache.Peek(id)
+		if !ok || !req.IsRegistration() || req.IsFinished() {
+			continue
+		}
+
+		entries = append(entries, types.AuthRequestEntry{ID: id, Request: req})
+	}
+
+	return entries
+}
+
 // SetLastSSHAuth records a successful SSH check authentication
 // for the given (src, dst) node pair.
 func (s *State) SetLastSSHAuth(src, dst types.NodeID) {

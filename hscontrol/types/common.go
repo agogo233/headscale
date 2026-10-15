@@ -141,6 +141,10 @@ type AuthRequest struct {
 	// finalise the registration without re-running the OIDC flow.
 	pendingConfirmation *PendingRegistrationConfirmation
 
+	// createdAt is when the request was created; exposed for
+	// observability (pending-request lists) but not for flow control.
+	createdAt time.Time
+
 	finished chan AuthVerdict
 	closed   *atomic.Bool
 }
@@ -149,8 +153,9 @@ type AuthRequest struct {
 // for non-registration flows that only need a verdict channel.
 func NewAuthRequest() *AuthRequest {
 	return &AuthRequest{
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		finished:  make(chan AuthVerdict, 1),
+		closed:    &atomic.Bool{},
+		createdAt: time.Now(),
 	}
 }
 
@@ -159,9 +164,10 @@ func NewAuthRequest() *AuthRequest {
 // stored by pointer; callers must not mutate it after handing it off.
 func NewRegisterAuthRequest(data *RegistrationData) *AuthRequest {
 	return &AuthRequest{
-		regData:  data,
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		regData:   data,
+		finished:  make(chan AuthVerdict, 1),
+		closed:    &atomic.Bool{},
+		createdAt: time.Now(),
 	}
 }
 
@@ -175,8 +181,9 @@ func NewSSHCheckAuthRequest(src, dst NodeID) *AuthRequest {
 			SrcNodeID: src,
 			DstNodeID: dst,
 		},
-		finished: make(chan AuthVerdict, 1),
-		closed:   &atomic.Bool{},
+		finished:  make(chan AuthVerdict, 1),
+		closed:    &atomic.Bool{},
+		createdAt: time.Now(),
 	}
 }
 
@@ -229,6 +236,26 @@ func (rn *AuthRequest) SetPendingConfirmation(p *PendingRegistrationConfirmation
 // has yet resolved an identity for this [AuthRequest].
 func (rn *AuthRequest) PendingConfirmation() *PendingRegistrationConfirmation {
 	return rn.pendingConfirmation
+}
+
+// CreatedAt returns when this request was created.
+func (rn *AuthRequest) CreatedAt() time.Time {
+	return rn.createdAt
+}
+
+// IsFinished reports whether a verdict has been recorded for this request,
+// i.e. it has been approved, rejected, or expired. It must not receive from
+// the finished channel: the waiting registration follow-up is its only
+// consumer, and a second reader would swallow the verdict.
+func (rn *AuthRequest) IsFinished() bool {
+	return rn.closed.Load()
+}
+
+// AuthRequestEntry pairs a pending auth request with its id, as returned by
+// list-style state queries over the auth cache.
+type AuthRequestEntry struct {
+	ID      AuthID
+	Request *AuthRequest
 }
 
 func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {

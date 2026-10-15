@@ -230,3 +230,28 @@ func parseUserID(s string) (types.UserID, error) {
 
 	return types.UserID(id), nil
 }
+
+// resolveUserByIDOrName resolves a "user" argument the way the CLI's --user
+// flags do: a purely numeric value is a user id, anything else is a username.
+// Unknown ids and names map to 404 via mapError.
+func resolveUserByIDOrName(b Backend, raw string) (types.User, error) {
+	if raw == "" {
+		return types.User{}, huma.Error400BadRequest("user is required")
+	}
+
+	if id, err := strconv.ParseUint(raw, 10, 64); err == nil {
+		user, err := b.State.GetUserByID(types.UserID(id))
+		if err != nil {
+			return types.User{}, mapError("looking up user", err)
+		}
+
+		return *user, nil
+	}
+
+	user, err := b.State.GetUserByName(raw)
+	if err != nil {
+		return types.User{}, mapError("looking up user", err)
+	}
+
+	return *user, nil
+}
