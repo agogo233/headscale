@@ -675,20 +675,26 @@ func (h *Headscale) Serve() error {
 		Cfg:    h.cfg,
 	})
 
-	// The Headscale v2 API. It is served only over the remote
-	// listener (Basic/Bearer auth); no unix-socket mount yet, as nothing local
-	// calls it — the CLI still speaks v1.
+	// The Headscale v2 API. Served behind Basic/Bearer auth on the remote
+	// listener, and over the local unix socket (local trust) so the CLI can
+	// manage OAuth clients through the same v2 keys handler the Tailscale
+	// ecosystem uses.
 	humaV2Mux, _ := apiv2.Handler(apiv2.Backend{
 		State:  h.state,
 		Change: h.Change,
 		Cfg:    h.cfg,
 	})
 
-	// Serve the Huma API over the unix socket without TLS or auth: socket access
-	// implies trust. WithLocalTrust marks these requests so the security
-	// middleware skips the API-key check.
+	// Serve both Huma APIs over the unix socket without TLS or auth: socket
+	// access implies trust. WithLocalTrust marks these requests so each API's
+	// security middleware skips the credential check. v2 paths route to the v2
+	// mux; everything else (the v1 paths) to v1.
+	socketHandler := http.NewServeMux()
+	socketHandler.Handle("/api/v2/", apiv2.WithLocalTrust(humaV2Mux))
+	socketHandler.Handle("/", apiv1.WithLocalTrust(humaMux))
+
 	socketServer := &http.Server{
-		Handler:     apiv1.WithLocalTrust(humaMux),
+		Handler:     socketHandler,
 		ReadTimeout: types.HTTPTimeout,
 	}
 
