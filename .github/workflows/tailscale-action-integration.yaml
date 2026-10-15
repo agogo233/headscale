@@ -72,7 +72,7 @@ jobs:
           fi
 
       - name: Connect via the tailscale action + ping
-        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        uses: tailscale/github-action@v4.2.0 # tag pin: the v4.2.0 commit SHA 404s on codeload
         with:
           authkey: ${{ steps.prep.outputs.authkey }}
           args: ${{ steps.prep.outputs.args }}
@@ -128,7 +128,7 @@ jobs:
         uses: ./.github/actions/headscale-up
 
       - name: Connect with ${{ matrix.input }}
-        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        uses: tailscale/github-action@v4.2.0 # tag pin: the v4.2.0 commit SHA 404s on codeload
         with:
           authkey: ${{ steps.hs.outputs.preauth }}
           args: --login-server=${{ steps.hs.outputs.url }} ${{ matrix.extra_args }}
