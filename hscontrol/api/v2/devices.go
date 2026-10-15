@@ -176,10 +176,8 @@ func registerDevices(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		nodeChange, err := b.State.DeleteNode(node)
-		if !nodeChange.IsEmpty() {
-			b.Change(nodeChange)
-		}
+		changes, err := b.State.DeleteNode(node)
+		b.Change(changes...)
 
 		if err != nil {
 			return nil, mapError("deleting device", err)
@@ -231,11 +229,11 @@ func registerDevices(api huma.API, b Backend) {
 		}
 
 		_, nodeChange, err := b.State.RenameNode(node.ID(), in.Body.Name)
+		b.Change(nodeChange)
+
 		if err != nil {
 			return nil, mapError("renaming device", err)
 		}
-
-		b.Change(nodeChange)
 
 		return &emptyOutput{}, nil
 	})
@@ -264,11 +262,11 @@ func registerDevices(api huma.API, b Backend) {
 		}
 
 		_, nodeChange, err := b.State.SetNodeTags(node.ID(), in.Body.Tags)
+		b.Change(nodeChange)
+
 		if err != nil {
 			return nil, mapError("setting device tags", err)
 		}
-
-		b.Change(nodeChange)
 
 		return &emptyOutput{}, nil
 	})
@@ -297,11 +295,11 @@ func registerDevices(api huma.API, b Backend) {
 		}
 
 		_, nodeChange, err := b.State.SetNodeExpiry(node.ID(), nil)
+		b.Change(nodeChange)
+
 		if err != nil {
 			return nil, mapError("setting device key expiry", err)
 		}
-
-		b.Change(nodeChange)
 
 		return &emptyOutput{}, nil
 	})
@@ -327,11 +325,11 @@ func registerDevices(api huma.API, b Backend) {
 		}
 
 		updated, nodeChange, err := b.State.SetApprovedRoutes(node.ID(), approved)
+		b.Change(nodeChange)
+
 		if err != nil {
 			return nil, mapError("setting device routes", err)
 		}
-
-		b.Change(nodeChange)
 
 		return &deviceRoutesOutput{Body: routesFromView(updated)}, nil
 	})
