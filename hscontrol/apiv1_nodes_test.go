@@ -3,8 +3,11 @@ package hscontrol
 import (
 	"encoding/json"
 	"net/http"
+	"net/netip"
 	"testing"
+	"time"
 
+	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -412,5 +415,242 @@ func TestAPIV1NodeDebugCreate(t *testing.T) {
 		// Zero-time expiry/lastSeen are emitted as the zero instant, not null.
 		assert.Equal(t, "0001-01-01T00:00:00Z", got.Node["expiry"])
 		assert.Equal(t, "0001-01-01T00:00:00Z", got.Node["lastSeen"])
+	})
+}
+
+// createTestAppWithPrefixV4 mirrors createTestApp but configures an IPv4
+// prefix so the IP allocation and SetNodeIPv4 paths are exercised.
+func createTestAppWithPrefixV4(t *testing.T, prefix string) *Headscale {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+
+	p := netip.MustParsePrefix(prefix)
+
+	cfg := types.Config{
+		ServerURL:           "http://localhost:8080",
+		NoisePrivateKeyPath: tmpDir + "/noise_private.key",
+		Database: types.DatabaseConfig{
+			Type: "sqlite3",
+			Sqlite: types.SqliteConfig{
+				Path: tmpDir + "/headscale_test.db",
+			},
+		},
+		OIDC:   types.OIDCConfig{},
+		Policy: types.PolicyConfig{Mode: types.PolicyModeDB},
+		Tuning: types.Tuning{
+			BatchChangeDelay: 100 * time.Millisecond,
+			BatcherWorkers:   1,
+		},
+		IPAllocation: types.IPAllocationStrategySequential,
+	}
+	cfg.PrefixV4 = &p
+
+	app, err := NewHeadscale(&cfg)
+	require.NoError(t, err)
+
+	app.mapBatcher = mapper.NewBatcherAndMapper(&cfg, app.state)
+	app.mapBatcher.Start()
+
+	t.Cleanup(func() {
+		if app.mapBatcher != nil {
+			app.mapBatcher.Close()
+		}
+	})
+
+	return app
+}
+
+// nodeIPAddresses fetches the ipAddresses of a node through the v1 API.
+func nodeIPAddresses(t *testing.T, handler http.Handler, nodeID string) []string {
+	t.Helper()
+
+	res := callHandler(handler, http.MethodGet, "/api/v1/node/"+nodeID, nil)
+	require.Equal(t, http.StatusOK, res.status)
+
+	var out struct {
+		Node struct {
+			IPAddresses []string `json:"ipAddresses"`
+		} `json:"node"`
+	}
+	require.NoError(t, json.Unmarshal(res.body, &out))
+
+	return out.Node.IPAddresses
+}
+
+// setNodeIP posts an IPv4 address to the node's IP endpoint and returns the
+// status and body.
+func setNodeIP(t *testing.T, handler http.Handler, nodeID, ip string) (int, []byte) {
+	t.Helper()
+
+	body, _ := json.Marshal(map[string]string{"ipv4": ip})
+	res := callHandler(handler, http.MethodPost, "/api/v1/node/"+nodeID+"/ip", body)
+
+	return res.status, res.body
+}
+
+func setNodeIPStatus(t *testing.T, handler http.Handler, nodeID, ip string) int {
+	t.Helper()
+
+	status, _ := setNodeIP(t, handler, nodeID, ip)
+
+	return status
+}
+
+// craftIPv4 puts a node into a state holding rawIP in the store and database
+// without going through the allocator (nil clears the address), so tests can
+// build edge states such as out-of-prefix addresses.
+func craftIPv4(t *testing.T, app *Headscale, nodeID types.NodeID, rawIP string) {
+	t.Helper()
+
+	view, found := app.state.GetNodeByID(nodeID)
+	require.True(t, found)
+
+	node := view.AsStruct()
+	if rawIP == "" {
+		node.IPv4 = nil
+	} else {
+		parsed := netip.MustParseAddr(rawIP)
+		node.IPv4 = &parsed
+	}
+
+	_, _, err := app.state.SaveNode(node.View())
+	require.NoError(t, err)
+}
+
+func TestAPIV1NodeSetIP(t *testing.T) {
+	t.Run("set free address releases the old one", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(
+			newNodeSeed("alice", "node-a"),
+			newNodeSeed("bob", "node-b"),
+		)(t, app)
+
+		require.Equal(t, []string{"100.64.1.1"}, nodeIPAddresses(t, h, "1"))
+		require.Equal(t, []string{"100.64.1.2"}, nodeIPAddresses(t, h, "2"))
+
+		status, body := setNodeIP(t, h, "1", "100.64.1.50")
+		require.Equal(t, http.StatusOK, status)
+
+		var out struct {
+			Node struct {
+				IPAddresses []string `json:"ipAddresses"`
+			} `json:"node"`
+		}
+		require.NoError(t, json.Unmarshal(body, &out))
+		require.Equal(t, []string{"100.64.1.50"}, out.Node.IPAddresses)
+
+		require.Equal(t, []string{"100.64.1.50"}, nodeIPAddresses(t, h, "1"))
+		// The other node is untouched.
+		require.Equal(t, []string{"100.64.1.2"}, nodeIPAddresses(t, h, "2"))
+
+		// The freed old address is assignable again: give it to node 2.
+		assert.Equal(t, http.StatusOK, setNodeIPStatus(t, h, "2", "100.64.1.1"))
+		require.Equal(t, []string{"100.64.1.1"}, nodeIPAddresses(t, h, "2"))
+	})
+
+	t.Run("swap addresses in use", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(
+			newNodeSeed("alice", "node-a"),
+			newNodeSeed("bob", "node-b"),
+		)(t, app)
+
+		// Node 2 holds 100.64.1.2, so node 1 taking it swaps the pair.
+		assert.Equal(t, http.StatusOK, setNodeIPStatus(t, h, "1", "100.64.1.2"))
+
+		require.Equal(t, []string{"100.64.1.2"}, nodeIPAddresses(t, h, "1"))
+		require.Equal(t, []string{"100.64.1.1"}, nodeIPAddresses(t, h, "2"))
+	})
+
+	t.Run("swap rejected when the node has no address to hand over", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(
+			newNodeSeed("alice", "node-a"),
+			newNodeSeed("bob", "node-b"),
+		)(t, app)
+
+		craftIPv4(t, app, 1, "")
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "100.64.1.2"))
+	})
+
+	t.Run("swap rejected when the previous address is out of prefix", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(
+			newNodeSeed("alice", "node-a"),
+			newNodeSeed("bob", "node-b"),
+		)(t, app)
+
+		craftIPv4(t, app, 1, "10.9.9.9")
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "100.64.1.2"))
+	})
+
+	t.Run("idempotent keeps the address", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusOK, setNodeIPStatus(t, h, "1", "100.64.1.1"))
+		require.Equal(t, []string{"100.64.1.1"}, nodeIPAddresses(t, h, "1"))
+	})
+
+	t.Run("out of prefix is rejected", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "10.1.2.3"))
+	})
+
+	t.Run("network address is rejected", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "100.64.1.0"))
+	})
+
+	t.Run("broadcast address is rejected", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "100.64.1.255"))
+	})
+
+	t.Run("reserved tailscale address is rejected", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.100.100.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "100.100.100.100"))
+	})
+
+	t.Run("no prefix configured is rejected", func(t *testing.T) {
+		h := newAPIV1Harness(t)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, h.app)
+
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h.huma, "1", "100.64.1.5"))
+	})
+
+	t.Run("non-IPv4 addresses are rejected", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "banana"))
+		assert.Equal(t, http.StatusBadRequest, setNodeIPStatus(t, h, "1", "fd7a:115c:a1e0::1"))
+	})
+
+	t.Run("node not found", func(t *testing.T) {
+		app := createTestAppWithPrefixV4(t, "100.64.1.0/24")
+		h := newHumaTestHandler(app)
+		seedNodes(newNodeSeed("alice", "node-a"))(t, app)
+
+		assert.Equal(t, http.StatusNotFound, setNodeIPStatus(t, h, "9999", "100.64.1.5"))
 	})
 }

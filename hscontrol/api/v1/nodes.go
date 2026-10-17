@@ -75,6 +75,11 @@ type SetTagsRequestBody struct {
 	Tags []string `json:"tags,omitempty"`
 }
 
+// SetNodeIPRequestBody is the request body to set a node's IPv4 address.
+type SetNodeIPRequestBody struct {
+	IPv4 string `json:"ipv4"`
+}
+
 // MoveNodeRequestBody mirrors v1.MoveNodeRequest.
 type MoveNodeRequestBody struct {
 	User string `format:"uint64" json:"user"`
@@ -149,6 +154,11 @@ type moveNodeInput struct {
 type setTagsInput struct {
 	NodeID string `format:"uint64" path:"nodeId"`
 	Body   SetTagsRequestBody
+}
+
+type setNodeIPInput struct {
+	NodeID string `format:"uint64" path:"nodeId"`
+	Body   SetNodeIPRequestBody
 }
 
 type setApprovedRoutesInput struct {
@@ -441,6 +451,39 @@ func registerNodeWriteOps(api huma.API, b Backend) {
 
 		if err != nil {
 			return nil, huma.Error400BadRequest("setting tags", err)
+		}
+
+		out := &nodeOutput{}
+		out.Body.Node = nodeFromView(node)
+
+		return out, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "setNodeIP",
+		Method:      http.MethodPost,
+		Path:        "/api/v1/node/{nodeId}/ip",
+		Summary:     "Set node IPv4 address",
+		Tags:        []string{"Nodes"},
+		Security:    bearerAuth,
+	}, func(ctx context.Context, in *setNodeIPInput) (*nodeOutput, error) {
+		nodeID, err := parseNodeID(in.NodeID)
+		if err != nil {
+			return nil, err
+		}
+
+		ip, err := netip.ParseAddr(in.Body.IPv4)
+		if err != nil {
+			return nil, huma.Error400BadRequest("parsing IP address", err)
+		}
+
+		// The changes are live in the NodeStore even on error, so they are
+		// published before the error is returned, as every write here.
+		node, changes, err := b.State.SetNodeIPv4(nodeID, ip)
+		b.Change(changes...)
+
+		if err != nil {
+			return nil, mapError("setting node IP", err)
 		}
 
 		out := &nodeOutput{}

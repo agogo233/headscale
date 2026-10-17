@@ -84,6 +84,16 @@ var ErrNodeNameNotUnique = errors.New("node name is not unique")
 // another user. Tagged nodes are owned by their tags, not a user.
 var ErrNodeIsTagged = errors.New("tagged node cannot be moved to another user")
 
+// ErrNodeIPv4Invalid is returned when the requested IPv4 address is not
+// usable: it is not an IPv4 address, no IPv4 prefix is configured, or the
+// address falls outside the prefix or on a reserved address.
+var ErrNodeIPv4Invalid = errors.New("invalid node IPv4 address")
+
+// ErrNodeIPv4CannotSwap is returned when the requested IPv4 address is held
+// by another node and cannot be swapped, because the node has no IPv4 address
+// of its own to hand over or its previous address is no longer usable.
+var ErrNodeIPv4CannotSwap = errors.New("node IPv4 addresses cannot be swapped")
+
 // nodeUpdateColumns lists all Node columns that should be written
 // during a struct-based GORM Updates() call.  Listing them explicitly
 // forces GORM to include nil/zero-value fields (e.g. UserID=nil when
@@ -970,6 +980,192 @@ func (s *State) SetNodeExpiry(nodeID types.NodeID, expiry *time.Time) (types.Nod
 	c = c.Merge(change.NodeAdded(n.ID())).Merge(recompute)
 
 	return n, c, nil
+}
+
+// ipv4Of returns the node's current IPv4 address, if it has one.
+func ipv4Of(view types.NodeView) (netip.Addr, bool) {
+	for _, addr := range view.IPs() {
+		if addr.Is4() {
+			return addr, true
+		}
+	}
+
+	return netip.Addr{}, false
+}
+
+// validateNodeIPv4 verifies ip is a usable IPv4 address within the
+// configured prefix.
+func (s *State) validateNodeIPv4(ip netip.Addr) error {
+	if !ip.Is4() {
+		return fmt.Errorf("%w: %s is not an IPv4 address", ErrNodeIPv4Invalid, ip)
+	}
+
+	prefix := s.cfg.PrefixV4
+	if prefix == nil {
+		return fmt.Errorf("%w: no IPv4 prefix is configured", ErrNodeIPv4Invalid)
+	}
+	if !prefix.Contains(ip) {
+		return fmt.Errorf("%w: %s is outside the configured prefix %s", ErrNodeIPv4Invalid, ip, prefix)
+	}
+
+	network, broadcast := util.GetIPPrefixEndpoints(*prefix)
+	if ip == network || ip == broadcast || hsdb.IsTailscaleReservedIP(ip) {
+		return fmt.Errorf("%w: %s is not a usable address", ErrNodeIPv4Invalid, ip)
+	}
+
+	return nil
+}
+
+// nodeIPWriteChanges builds the changes an IP write publishes: the policy
+// change, when the policy inputs moved, plus a whole-node update for every
+// readdressed node. The NodeAdded carries the OriginNode so the node itself
+// learns its own new address.
+func (s *State) nodeIPWriteChanges(c change.Change, ids ...types.NodeID) []change.Change {
+	cs := make([]change.Change, 0, len(ids)+1)
+	if !c.IsEmpty() {
+		cs = append(cs, c)
+	}
+
+	for _, id := range ids {
+		cs = append(cs, change.NodeAdded(id))
+	}
+
+	return cs
+}
+
+// SetNodeIPv4 sets the node's IPv4 address. If the address is already held
+// by another node, the two addresses are swapped so no allocation is lost;
+// when the target address was free, the node's previous address, if any, is
+// released back to the allocation pool.
+//
+// It returns the updated node view, the changes every affected node and
+// peer needs to learn the new addresses, and an error. Callers publish the
+// changes even on error, because the NodeStore is the source of truth and
+// the new addresses are already live there.
+func (s *State) SetNodeIPv4(nodeID types.NodeID, ip netip.Addr) (types.NodeView, []change.Change, error) {
+	if err := s.validateNodeIPv4(ip); err != nil {
+		return types.NodeView{}, nil, err
+	}
+
+	genBefore := s.polMan.NodesGeneration()
+
+	// Hold persistMu so a concurrent full-row persist ([persistNode]
+	// re-reads the NodeStore under this lock) cannot write a stale address
+	// back between our read and our database write, the same discipline
+	// as [BackfillNodeIPs].
+	s.persistMu.Lock()
+
+	node, exists := s.nodeStore.GetNode(nodeID)
+	if !exists {
+		s.persistMu.Unlock()
+		return types.NodeView{}, nil, fmt.Errorf("%w: %d", ErrNodeNotFound, nodeID)
+	}
+
+	oldIPv4, hadOld := ipv4Of(node)
+	if hadOld && oldIPv4 == ip {
+		// The node already has the address.
+		s.persistMu.Unlock()
+		return node, nil, nil
+	}
+
+	// Find whether another node holds the target address; when it does, the
+	// two nodes swap instead of the write failing.
+	var occupant types.NodeView
+	for _, n := range s.nodeStore.ListNodes().All() {
+		if n.ID() != nodeID && n.HasIP(ip) {
+			occupant = n
+			break
+		}
+	}
+
+	swap := occupant.Valid()
+	if swap {
+		if !hadOld {
+			s.persistMu.Unlock()
+			return types.NodeView{}, nil, fmt.Errorf("%w: node %d has no IPv4 address of its own to swap", ErrNodeIPv4CannotSwap, nodeID)
+		}
+
+		if err := s.validateNodeIPv4(oldIPv4); err != nil {
+			s.persistMu.Unlock()
+			return types.NodeView{}, nil, fmt.Errorf("%w: previous address cannot be handed over: %v", ErrNodeIPv4CannotSwap, err)
+		}
+	}
+
+	// Update the NodeStore, the source of truth for the batcher.
+	if swap {
+		s.nodeStore.UpdateNodes(map[types.NodeID]UpdateNodeFunc{
+			nodeID: func(node *types.Node) {
+				node.IPv4 = &ip
+			},
+			occupant.ID(): func(node *types.Node) {
+				node.IPv4 = &oldIPv4
+			},
+		})
+	} else {
+		// Keep the address out of future automatic allocations before
+		// anything else: a concurrent registration must not hand it to a
+		// new node.
+		s.ipAlloc.Reserve(ip)
+
+		if _, ok := s.nodeStore.UpdateNode(nodeID, func(node *types.Node) {
+			node.IPv4 = &ip
+		}); !ok {
+			s.ipAlloc.FreeIPs([]netip.Addr{ip})
+			s.persistMu.Unlock()
+
+			return types.NodeView{}, nil, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
+		}
+	}
+
+	updated, exists := s.nodeStore.GetNode(nodeID)
+	if !exists {
+		// The node vanished in the gap between the update and this
+		// re-read: the NodeStore already carries the new addresses, so
+		// publish them even though the database row no longer exists.
+		affected := []types.NodeID{nodeID}
+		if swap {
+			affected = append(affected, occupant.ID())
+		}
+
+		cs := s.nodeIPWriteChanges(s.policyChangeSince(genBefore), affected...)
+		s.persistMu.Unlock()
+
+		return types.NodeView{}, cs, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
+	}
+
+	var writeErr error
+	if swap {
+		writeErr = s.db.NodeSetIPs([]hsdb.NodeIPPair{
+			{NodeID: nodeID, IPv4: &ip},
+			{NodeID: occupant.ID(), IPv4: &oldIPv4},
+		})
+	} else {
+		writeErr = s.db.NodeSetIPv4(nodeID, &ip)
+	}
+	s.persistMu.Unlock()
+
+	affected := []types.NodeID{nodeID}
+	if swap {
+		affected = append(affected, occupant.ID())
+	}
+
+	if writeErr != nil {
+		return updated, s.nodeIPWriteChanges(s.policyChangeSince(genBefore), affected...), fmt.Errorf("persisting node %d IPv4 in database: %w", nodeID, writeErr)
+	}
+
+	// Release the previous address only once the database write
+	// succeeded; keeping it reserved is conservative when a persist
+	// retry is still pending.
+	if !swap && hadOld {
+		s.ipAlloc.FreeIPs([]netip.Addr{oldIPv4})
+	}
+
+	c, err := s.updatePolicyManagerNodes(genBefore)
+	if err != nil {
+		return updated, s.nodeIPWriteChanges(c, affected...), fmt.Errorf("updating policy manager after setting node %d IPv4: %w", nodeID, err)
+	}
+
+	return updated, s.nodeIPWriteChanges(c, affected...), nil
 }
 
 // SetNodeTags assigns tags to a node, making it a "tagged node".

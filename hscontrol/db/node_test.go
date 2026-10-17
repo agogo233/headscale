@@ -752,3 +752,52 @@ func TestListNodes(t *testing.T) {
 	assert.Equal(t, "test1", nodes[0].Hostname)
 	assert.Equal(t, "test2", nodes[1].Hostname)
 }
+
+func TestNodeSetIPv4(t *testing.T) {
+	db, err := newSQLiteTestDB()
+	require.NoError(t, err)
+	defer db.Close()
+
+	user := db.CreateUserForTest("test")
+	node := db.CreateNodeForTest(user, "testnode")
+
+	newIP := netip.MustParseAddr("100.64.1.50")
+	require.NoError(t, db.NodeSetIPv4(node.ID, &newIP))
+
+	retrieved, err := db.GetNodeByID(node.ID)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved.IPv4)
+	assert.Equal(t, newIP, *retrieved.IPv4)
+
+	// A nil address clears the IPv4.
+	require.NoError(t, db.NodeSetIPv4(node.ID, nil))
+
+	retrieved, err = db.GetNodeByID(node.ID)
+	require.NoError(t, err)
+	assert.Nil(t, retrieved.IPv4)
+}
+
+func TestNodeSetIPs(t *testing.T) {
+	db, err := newSQLiteTestDB()
+	require.NoError(t, err)
+	defer db.Close()
+
+	user := db.CreateUserForTest("test")
+	nodeA := db.CreateNodeForTest(user, "node-a")
+	nodeB := db.CreateNodeForTest(user, "node-b")
+
+	aIP := netip.MustParseAddr("100.64.1.1")
+	bIP := netip.MustParseAddr("100.64.1.2")
+	require.NoError(t, db.NodeSetIPs([]NodeIPPair{
+		{NodeID: nodeA.ID, IPv4: &aIP},
+		{NodeID: nodeB.ID, IPv4: &bIP},
+	}))
+
+	retrievedA, err := db.GetNodeByID(nodeA.ID)
+	require.NoError(t, err)
+	assert.Equal(t, aIP, *retrievedA.IPv4)
+
+	retrievedB, err := db.GetNodeByID(nodeB.ID)
+	require.NoError(t, err)
+	assert.Equal(t, bIP, *retrievedB.IPv4)
+}

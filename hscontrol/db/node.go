@@ -224,6 +224,47 @@ func NodeSetExpiry(tx *gorm.DB, nodeID types.NodeID, expiry *time.Time) error {
 	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("expiry", expiry).Error
 }
 
+// NodeIPPair is a node address update; a set of pairs is applied in a single
+// transaction by [HSDatabase.NodeSetIPs].
+type NodeIPPair struct {
+	NodeID types.NodeID
+	IPv4   *netip.Addr
+}
+
+// NodeSetIPv4 sets the IPv4 address of a node.
+func (hsdb *HSDatabase) NodeSetIPv4(nodeID types.NodeID, ip *netip.Addr) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return NodeSetIPv4(tx, nodeID, ip)
+	})
+}
+
+// NodeSetIPv4 updates the ipv4 column of a node within a transaction. The
+// string form of the address is written because a single-column update does
+// not run GORM's text serializer, which the driver cannot apply to
+// netip.Addr; a nil value clears the address.
+func NodeSetIPv4(tx *gorm.DB, nodeID types.NodeID, ip *netip.Addr) error {
+	var value any
+	if ip != nil {
+		value = ip.String()
+	}
+
+	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("ipv4", value).Error
+}
+
+// NodeSetIPs updates the IPv4 addresses of multiple nodes in a single
+// transaction, e.g. when two nodes swap addresses.
+func (hsdb *HSDatabase) NodeSetIPs(pairs []NodeIPPair) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		for _, pair := range pairs {
+			if err := NodeSetIPv4(tx, pair.NodeID, pair.IPv4); err != nil {
+				return fmt.Errorf("setting IPv4 for node %d: %w", pair.NodeID, err)
+			}
+		}
+
+		return nil
+	})
+}
+
 func (hsdb *HSDatabase) DeleteNode(node *types.Node) error {
 	return hsdb.Write(func(tx *gorm.DB) error {
 		return DeleteNode(tx, node)

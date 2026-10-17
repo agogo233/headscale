@@ -211,7 +211,7 @@ func (i *IPAllocator) next(prev netip.Addr, prefix *netip.Prefix) (*netip.Addr, 
 	// instead of re-drawing in-prefix addresses forever under i.mu.
 	start := ip
 	for {
-		if prefix.Contains(ip) && !set.Contains(ip) && !isTailscaleReservedIP(ip) {
+		if prefix.Contains(ip) && !set.Contains(ip) && !IsTailscaleReservedIP(ip) {
 			i.usedIPs.Add(ip)
 
 			return &ip, nil
@@ -288,7 +288,9 @@ func randomNext(pfx netip.Prefix) (netip.Addr, error) {
 	return ip, nil
 }
 
-func isTailscaleReservedIP(ip netip.Addr) bool {
+// IsTailscaleReservedIP reports whether ip is an address Tailscale holds for
+// its own use and never hands out to nodes.
+func IsTailscaleReservedIP(ip netip.Addr) bool {
 	return tsaddr.ChromeOSVMRange().Contains(ip) ||
 		tsaddr.TailscaleServiceIP() == ip ||
 		tsaddr.TailscaleServiceIPv6() == ip
@@ -389,4 +391,15 @@ func (i *IPAllocator) FreeIPs(ips []netip.Addr) {
 	for _, ip := range ips {
 		i.usedIPs.Remove(ip)
 	}
+}
+
+// Reserve marks ip as used so future allocations skip it. It is a no-op when
+// the address is already marked. Addresses set manually through
+// [State.SetNodeIPv4] are reserved this way so the allocator does not hand
+// them to a newly registered node before the next restart.
+func (i *IPAllocator) Reserve(ip netip.Addr) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.usedIPs.Add(ip)
 }

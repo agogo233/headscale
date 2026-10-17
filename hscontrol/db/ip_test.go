@@ -514,3 +514,31 @@ func TestIPAllocatorNextNoReservedIPs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, na("100.115.94.0"), *nextChrome)
 }
+
+func TestIPAllocatorReserve(t *testing.T) {
+	alloc, err := NewIPAllocator(
+		nil,
+		mpp("100.64.1.0/30"),
+		nil,
+		types.IPAllocationStrategySequential,
+	)
+	require.NoError(t, err)
+
+	// A /30 has exactly two usable addresses: .1 and .2.
+	v4, _, err := alloc.Next()
+	require.NoError(t, err)
+	require.Equal(t, na("100.64.1.1"), *v4)
+
+	// A manually reserved address must not be handed out.
+	alloc.Reserve(na("100.64.1.2"))
+
+	_, _, err = alloc.Next()
+	require.ErrorIs(t, err, ErrCouldNotAllocateIP)
+
+	// Freeing the address makes it allocatable again.
+	alloc.FreeIPs([]netip.Addr{na("100.64.1.2")})
+
+	v4, _, err = alloc.Next()
+	require.NoError(t, err)
+	require.Equal(t, na("100.64.1.2"), *v4)
+}

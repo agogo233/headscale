@@ -34,6 +34,8 @@ func mapError(msg string, err error) error {
 		errors.Is(err, state.ErrNodeHasNeitherUserNorTags),
 		errors.Is(err, state.ErrRequestedTagsInvalidOrNotPermitted),
 		errors.Is(err, state.ErrNodeIsTagged),
+		errors.Is(err, state.ErrNodeIPv4Invalid),
+		errors.Is(err, state.ErrNodeIPv4CannotSwap),
 		errors.Is(err, db.ErrUserStillHasNodes),
 		errors.Is(err, db.ErrUserNotUnique),
 		errors.Is(err, db.ErrCannotChangeOIDCUser),
