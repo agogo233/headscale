@@ -311,6 +311,96 @@ func DedupePolicyChanges(changes []Change) []Change {
 	return out
 }
 
+// isPeerDelta reports whether r only adds, refreshes or patches peers other
+// than nodeID: [CoalescePeerDeltas] can fold such changes together.
+func (r Change) isPeerDelta(nodeID types.NodeID) bool {
+	if r.IncludeSelf || r.IncludeDERPMap || r.IncludeDNS || r.IncludeDomain ||
+		r.IncludePolicy || r.SendAllPeers || r.RequiresRuntimePeerComputation {
+		return false
+	}
+
+	if r.OriginNode == nodeID || r.PingRequest != nil ||
+		len(r.PeersRemoved) > 0 || len(r.DeletedNodes) > 0 {
+		return false
+	}
+
+	return len(r.PeersChanged) > 0 || len(r.PeerPatches) > 0
+}
+
+// isDeletion reports whether r only announces deleted nodes, as
+// [NodeRemoved] does: [CoalescePeerDeltas] can hoist and fold such changes.
+func (r Change) isDeletion() bool {
+	rest := r
+	rest.Reason, rest.TargetNode, rest.PeersRemoved, rest.DeletedNodes = "", 0, nil, nil
+
+	return len(r.DeletedNodes) > 0 && rest.IsEmpty() && rest.OriginNode == 0
+}
+
+// CoalescePeerDeltas cuts the responses nodeID's changes for one tick render
+// to, so a burst of joins or deletes renders as a few [tailcfg.MapResponse]
+// values instead of one per change. Every change renders from live state after
+// the drain:
+//   - A deleted node can no longer render anywhere and its ID is never reused,
+//     so all deletions fold into one removal ahead of the tick.
+//   - A peer in a run's PeersChanged is sent whole and newer than any patch
+//     queued for it, so each run of adjacent peer deltas folds into one change
+//     and those patches are dropped. Runs never move across other changes,
+//     which keeps other removals and policy recomputes in order.
+func CoalescePeerDeltas(nodeID types.NodeID, changes []Change) []Change {
+	out := make([]Change, 0, len(changes))
+
+	var deleted Change
+
+	for _, c := range changes {
+		if c.isDeletion() {
+			deleted.PeersRemoved = append(deleted.PeersRemoved, c.PeersRemoved...)
+			deleted.DeletedNodes = append(deleted.DeletedNodes, c.DeletedNodes...)
+		}
+	}
+
+	if deleted.DeletedNodes != nil {
+		deleted.Reason = "node removed"
+		deleted.PeersRemoved = uniqueNodeIDs(deleted.PeersRemoved)
+		deleted.DeletedNodes = uniqueNodeIDs(deleted.DeletedNodes)
+		out = append(out, deleted)
+		changes = slices.DeleteFunc(slices.Clone(changes), Change.isDeletion)
+	}
+
+	for i := 0; i < len(changes); {
+		j := i
+		for j < len(changes) && changes[j].isPeerDelta(nodeID) {
+			j++
+		}
+
+		if j-i < 2 {
+			out = append(out, changes[i])
+			i++
+
+			continue
+		}
+
+		merged := Change{Reason: "coalesced peer changes"}
+		for _, c := range changes[i:j] {
+			merged.PeersChanged = append(merged.PeersChanged, c.PeersChanged...)
+		}
+
+		merged.PeersChanged = uniqueNodeIDs(merged.PeersChanged)
+
+		for _, c := range changes[i:j] {
+			for _, p := range c.PeerPatches {
+				if _, whole := slices.BinarySearch(merged.PeersChanged, types.NodeID(p.NodeID)); !whole { //nolint:gosec // NodeID types are equivalent
+					merged.PeerPatches = append(merged.PeerPatches, p)
+				}
+			}
+		}
+
+		out = append(out, merged)
+		i = j
+	}
+
+	return out
+}
+
 func uniqueNodeIDs(ids []types.NodeID) []types.NodeID {
 	if len(ids) == 0 {
 		return nil

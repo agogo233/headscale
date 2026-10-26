@@ -70,7 +70,7 @@ func generateUserProfiles(
 	node types.NodeView,
 	peers views.Slice[types.NodeView],
 ) []tailcfg.UserProfile {
-	userMap := make(map[uint]*types.UserView)
+	userMap := make(map[uint]types.UserView)
 
 	user := node.Owner()
 	if !user.Valid() {
@@ -81,7 +81,7 @@ func generateUserProfiles(
 		return nil
 	}
 
-	userMap[user.Model().ID] = &user
+	userMap[user.Model().ID] = user
 
 	for _, peer := range peers.All() {
 		peerUser := peer.Owner()
@@ -89,7 +89,7 @@ func generateUserProfiles(
 			continue
 		}
 
-		userMap[peerUser.Model().ID] = &peerUser
+		userMap[peerUser.Model().ID] = peerUser
 	}
 
 	var profiles []tailcfg.UserProfile
@@ -147,6 +147,10 @@ func generateDNSConfig(
 		}
 	}
 
+	if domain, ok := node.CertDomain(cfg); ok {
+		dnsConfig.CertDomains = []string{domain}
+	}
+
 	return dnsConfig
 }
 
@@ -170,19 +174,19 @@ func nextDNSProfileFromCapMap(capMap tailcfg.NodeCapMap) string {
 
 	candidates := make([]string, 0, len(capMap))
 
-	for cap := range capMap {
-		if cap == nextDNSAttrNoInfo {
+	for attr := range capMap {
+		if attr == nextDNSAttrNoInfo {
 			continue
 		}
 
-		profile, ok := strings.CutPrefix(string(cap), nextDNSAttrPrefix)
+		profile, ok := strings.CutPrefix(string(attr), nextDNSAttrPrefix)
 		if !ok || profile == "" {
 			continue
 		}
 
 		if !nextDNSProfileRE.MatchString(profile) {
 			log.Warn().
-				Str("cap", string(cap)).
+				Str("cap", string(attr)).
 				Msg("nextdns profile rejected: must match [A-Za-z0-9._-]{1,64}")
 
 			continue
@@ -397,9 +401,13 @@ func (m *mapper) buildFromChange(
 		builder.WithPeers(peers)
 	} else {
 		if len(resp.PeersChanged) > 0 {
-			peers := m.state.ListPeers(nodeID, resp.PeersChanged...)
-			builder.WithUserProfiles(peers)
-			builder.WithPeerChanges(peers)
+			// Visibility may leave none of the changed peers for this
+			// recipient; the profiles would then carry only its own
+			// user, which it already holds.
+			if peers := m.state.ListPeers(nodeID, resp.PeersChanged...); peers.Len() > 0 {
+				builder.WithUserProfiles(peers)
+				builder.WithPeerChanges(peers)
+			}
 		}
 
 		if len(resp.PeersRemoved) > 0 {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	hscontrol "github.com/juanfont/headscale/hscontrol"
+	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/net/memnet"
@@ -39,16 +40,18 @@ type TestServer struct {
 type ServerOption func(*serverConfig)
 
 type serverConfig struct {
-	batchDelay       time.Duration
-	bufferedChanSize int
-	ephemeralTimeout time.Duration
-	nodeExpiry       time.Duration
-	batcherWorkers   int
-	taildropEnabled  bool
-	logTailEnabled   bool
-	realListener     bool
-	magicDNSDomain   string
-	dnsResolvers     []string
+	batchDelay            time.Duration
+	bufferedChanSize      int
+	ephemeralTimeout      time.Duration
+	nodeExpiry            time.Duration
+	batcherWorkers        int
+	nodeStoreBatchTimeout time.Duration
+	taildropEnabled       bool
+	logTailEnabled        bool
+	realListener          bool
+	magicDNSDomain        string
+	dnsResolvers          []string
+	certProvider          hsdns.Provider
 }
 
 func defaultServerConfig() *serverConfig {
@@ -76,6 +79,11 @@ func WithBufferedChanSize(n int) ServerOption {
 // [types.DefaultBatcherWorkers] to match production concurrency.
 func WithBatcherWorkers(n int) ServerOption {
 	return func(c *serverConfig) { c.batcherWorkers = n }
+}
+
+// WithNodeStoreBatchTimeout overrides the server's default write-batch wait.
+func WithNodeStoreBatchTimeout(d time.Duration) ServerOption {
+	return func(c *serverConfig) { c.nodeStoreBatchTimeout = d }
 }
 
 // WithEphemeralTimeout sets the ephemeral node inactivity timeout.
@@ -109,6 +117,13 @@ func WithTaildropEnabled(enabled bool) ServerOption {
 // [tailcfg.DNSConfig].
 func WithMagicDNS(domain string) ServerOption {
 	return func(c *serverConfig) { c.magicDNSDomain = domain }
+}
+
+// WithCertificates enables node certificates (dns.certificates) with
+// provider publishing the challenges. It needs [WithMagicDNS]; the
+// propagation check is off because the provider is not real DNS.
+func WithCertificates(provider hsdns.Provider) ServerOption {
+	return func(c *serverConfig) { c.certProvider = provider }
 }
 
 // WithDNSResolvers sets the global DNS resolvers, so map responses carry a
@@ -167,6 +182,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 			BatchChangeDelay:               sc.batchDelay,
 			BatcherWorkers:                 sc.batcherWorkers,
 			NodeMapSessionBufferedChanSize: sc.bufferedChanSize,
+			NodeStoreBatchTimeout:          sc.nodeStoreBatchTimeout,
 		},
 	}
 
@@ -180,6 +196,11 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 		cfg.TailcfgDNSConfig.Domains = []string{sc.magicDNSDomain}
 	}
 
+	if sc.certProvider != nil {
+		cfg.DNSConfig.Certificates = types.CertificatesConfig{Enabled: true, Zone: cfg.BaseDomain}
+		cfg.DNSChallenge.Provider = sc.certProvider
+	}
+
 	for _, addr := range sc.dnsResolvers {
 		cfg.TailcfgDNSConfig.Resolvers = append(cfg.TailcfgDNSConfig.Resolvers, &dnstype.Resolver{Addr: addr})
 	}
@@ -188,6 +209,14 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 	if err != nil {
 		tb.Fatalf("servertest: NewHeadscale: %v", err)
 	}
+
+	// Registered first so clients, HTTP, and background subsystems stop first.
+	tb.Cleanup(func() {
+		err := app.GetState().Close()
+		if err != nil {
+			tb.Errorf("servertest: close state: %v", err)
+		}
+	})
 
 	// Set a minimal DERP map so MapResponse generation works.
 	app.GetState().SetDERPMap(&tailcfg.DERPMap{

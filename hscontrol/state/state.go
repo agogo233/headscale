@@ -205,8 +205,8 @@ type State struct {
 	// caller snapshot or resurrected by an update racing with deletion.
 	persistMu sync.Mutex
 
-	// selfRefresh holds nodes whose NextDNS device metadata changed, drained
-	// by [State.DrainSelfRefreshes].
+	// selfRefresh holds nodes whose own DNS config inputs changed (NextDNS
+	// device metadata, given name), drained by [State.DrainSelfRefreshes].
 	selfRefresh   []types.NodeID
 	selfRefreshMu sync.Mutex
 
@@ -236,14 +236,6 @@ func NewState(cfg *types.Config) (*State, error) {
 	if cfg.Tuning.RegisterCacheMaxEntries > 0 {
 		cacheMaxEntries = cfg.Tuning.RegisterCacheMaxEntries
 	}
-
-	authCache := expirable.NewLRU[types.AuthID, *types.AuthRequest](
-		cacheMaxEntries,
-		func(id types.AuthID, rn *types.AuthRequest) {
-			rn.FinishAuth(types.AuthVerdict{Err: ErrRegistrationExpired})
-		},
-		cacheExpiration,
-	)
 
 	db, err := hsdb.NewHeadscaleDatabase(cfg)
 	if err != nil {
@@ -289,6 +281,15 @@ func NewState(cfg *types.Config) (*State, error) {
 
 	nodeStore := NewNodeStore(nodes, policyPeersFunc(polMan), batchSize, batchTimeout)
 	nodeStore.Start()
+
+	// Last: NewLRU starts the TTL sweeper goroutine, which only Close stops.
+	authCache := expirable.NewLRU[types.AuthID, *types.AuthRequest](
+		cacheMaxEntries,
+		func(id types.AuthID, rn *types.AuthRequest) {
+			rn.FinishAuth(types.AuthVerdict{Err: ErrRegistrationExpired})
+		},
+		cacheExpiration,
+	)
 
 	s := &State{
 		cfg: cfg,
@@ -341,6 +342,10 @@ func policyPeersFunc(pm policy.PolicyManager) PeersFunc {
 func (s *State) Close() error {
 	s.pings.drain()
 	s.nodeStore.Stop()
+	// Purge before Close: Close stops the sweeper, so anything still cached
+	// would never expire and its WaitForAuth caller would hang.
+	s.authCache.Purge()
+	s.authCache.Close()
 
 	err := s.db.Close()
 	if err != nil {
@@ -382,7 +387,17 @@ func (s *State) ReloadPolicy() ([]change.Change, error) {
 	// uses the [policy.PolicyManager]'s filters. Without this, nodes won't see
 	// newly allowed peers until a node is added/removed, causing autogroup:self
 	// policies to not propagate correctly when switching between policy types.
-	s.nodeStore.RebuildPeerMaps()
+	//
+	// An unchanged policy leaves the matchers as they were, and the other
+	// inputs of the peer map rebuild it themselves (node writes in the
+	// [NodeStore], [State.updatePolicyManagerNodes] and
+	// [State.updatePolicyManagerUsers]), so the O(n^2) rebuild is skipped
+	// then. The policy API handlers always get here that way: they apply
+	// the policy with [State.SetPolicy], which rebuilds, store it, and
+	// reload the very same bytes.
+	if policyChanged {
+		s.nodeStore.RebuildPeerMaps()
+	}
 
 	// Nodes whose CapMap shifted get their self refresh from
 	// [State.DrainSelfRefreshes] when these changes are dispatched.
@@ -631,17 +646,18 @@ func (s *State) DeleteNode(node types.NodeView) ([]change.Change, error) {
 	s.persistMu.Lock()
 
 	err := s.db.DeleteNode(node.AsStruct())
-	if err != nil {
-		s.persistMu.Unlock()
+	s.persistMu.Unlock()
 
+	if err != nil {
 		return nil, err
 	}
 
 	// The database is the durable source of truth. Only remove the in-memory
 	// node after its row is gone so a failed database write cannot make a live
-	// node look deleted until the next restart.
+	// node look deleted until the next restart. persistMu stays out of this
+	// write: a persist that still finds the node updates no row, and holding
+	// it would give every concurrent delete a NodeStore batch of its own.
 	s.nodeStore.DeleteNode(node.ID())
-	s.persistMu.Unlock()
 
 	s.ipAlloc.FreeIPs(node.IPs())
 
@@ -1300,6 +1316,10 @@ func (s *State) SetApprovedRoutes(nodeID types.NodeID, routes []netip.Prefix) (t
 // auto-sanitisation) and collisions error out rather than silently
 // bumping a user-facing label. See HOSTNAME.md for the CLI contract.
 func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView, change.Change, error) {
+	// DNS is case-insensitive but uniqueness and the client's certificate
+	// name match are not, so "Foo" and "foo" would share one name.
+	newName = strings.ToLower(newName)
+
 	// Validate the label AND that the resulting FQDN fits MaxHostnameLength:
 	// a valid 63-char label can still overflow under a long base_domain, and
 	// an unmappable name would break this node and its peers (issue #3346).
@@ -1331,6 +1351,12 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 		// A rename is peer visible; resend the whole node.
 		c = change.NodeAdded(nodeID)
 	}
+
+	// The node's own DNS config carries its name (CertDomains), and the
+	// change above does not resend DNS config to the renamed node itself.
+	s.selfRefreshMu.Lock()
+	s.selfRefresh = append(s.selfRefresh, nodeID)
+	s.selfRefreshMu.Unlock()
 
 	return nodeView, c, nil
 }
@@ -1533,6 +1559,12 @@ func (s *State) NodeCapMap(id types.NodeID) tailcfg.NodeCapMap {
 // callers can amortise lock acquisition over a peer loop.
 func (s *State) NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap {
 	return s.polMan.NodeCapMaps()
+}
+
+// NodeCapMapsForPeers returns one policy snapshot containing the requested peer caps.
+// It may include other entries; inner maps are shared and read-only.
+func (s *State) NodeCapMapsForPeers(peers views.Slice[types.NodeView]) map[types.NodeID]tailcfg.NodeCapMap {
+	return s.polMan.NodeCapMapsForPeers(peers)
 }
 
 // NodeCanHaveTag checks if a node is allowed to have a specific tag.
@@ -3007,8 +3039,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 	}
 
 	// Ensure we have valid hostinfo
-	validHostinfo := cmp.Or(regReq.Hostinfo, &tailcfg.Hostinfo{})
-	validHostinfo.Hostname = hostname
+	validHostinfo := cmp.Or(regReq.Hostinfo.Clone(), &tailcfg.Hostinfo{})
 
 	log.Debug().
 		Caller().
@@ -3443,6 +3474,15 @@ func (s *State) DrainSelfRefreshes() []change.Change {
 // have the list already available so it could go much quicker. Alternatively
 // the policy manager could have a remove or add list for nodes.
 func (s *State) updatePolicyManagerNodes(genBefore uint64) (change.Change, error) {
+	// A move since genBefore is the writer applying this write's nodes or a
+	// later batch's, which it hands the policy manager before publishing.
+	// The published snapshot read here can then be older, and SetNodes with
+	// it would recompile the policy back. What is left to do here is retry a
+	// recompile the writer failed, which leaves the generation where it was.
+	if s.polMan.NodesGeneration() != genBefore {
+		return change.PolicyChange(), nil
+	}
+
 	nodes := s.ListNodes()
 
 	changed, err := s.polMan.SetNodes(nodes)
@@ -3742,7 +3782,8 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		currentNode.ApplyPeerChange(&delta.peerChange)
 
 		if hostinfoToStore {
-			currentNode.Hostinfo = newHostinfo
+			// The snapshot outlives the request; deep-copy so its slices and NetInfo are never shared.
+			currentNode.Hostinfo = newHostinfo.Clone()
 		}
 
 		// Only a real hostname change may re-derive GivenName: it is peer

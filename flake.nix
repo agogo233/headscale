@@ -86,10 +86,6 @@
             buildGoModule = buildGo;
           };
 
-          golines = prev.golines.override {
-            buildGoModule = buildGo;
-          };
-
           # goimports and friends: they parse Go with the parser of the Go
           # they were built with, so an older one rejects new syntax.
           gotools = prev.gotools.override {
@@ -123,7 +119,6 @@
           ++ [
             golangci-lint
             golangci-lint-langserver
-            golines
             prettier
             nixfmt
             goreleaser
@@ -204,7 +199,7 @@
           # from the test set but kept in source so cmd/hi and friends still
           # compile. Pure integration helper tests remain included.
           # TestPostgres* needs a server (the SQLite equivalents still
-          # run). CGO off matches the build.
+          # run). This check keeps CGO off; gorace below enables it for tests.
           gotest = fc.goTest (
             common
             // {
@@ -217,12 +212,27 @@
             }
           );
 
-          # Full-tree golangci-lint (golines, gofumpt, etc.); uses the overlay's
+          # -race needs cgo; release build and dev shell stay CGO-free.
+          # Test hscontrol recursively; servertest runs in its own workflow, without -race.
+          gorace = fc.goTest (
+            common
+            // {
+              name = "headscale-gorace";
+              goRace = true;
+              testEnv = "export CGO_ENABLED=1";
+              testFlags = [ "-p=2" ];
+              goSkip = [ "TestPostgres" ];
+              testPackages = "./hscontrol/...";
+              testExclude = [ "/hscontrol/servertest" ];
+            }
+          );
+
+          # Full-tree golangci-lint (gofumpt, gci, etc.); uses the overlay's
           # golangci-lint built against the pinned Go.
           golangci-lint = fc.goLint common;
 
           # nixfmt + prettier, excluding generated output. goFmt = "off":
-          # Go formatting (golines, gofumpt) is enforced by the golangci-lint
+          # Go formatting (gofumpt, gci) is enforced by the golangci-lint
           # check, not treefmt. prettierExts matches the old prettier-lint glob
           # (no json: testdata fixtures are hand-formatted).
           formatting = fc.goFormat (

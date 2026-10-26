@@ -3,6 +3,7 @@ package mapper
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -159,24 +160,49 @@ func generateMapResponse(
 		removed = nc.computePeerDiff(peerIDs)
 	}
 
+	// Visibility filtering can leave a broadcast with nothing for this
+	// recipient; the frame would only cost encode, write and client decode.
+	if emptyMapResponse(resp) {
+		resp = nil
+	}
+
 	return withRemovals(resp, removed), nil
 }
 
-// withRemovals returns resp and the peers removed from the node's view as the
-// responses to send. The removals lead, in a response of their own: clients
-// before Tailscale v1.104 only report removed peers to IPN bus watchers opted
-// out of full netmaps (the Android app since 1.100) from responses they apply
-// as deltas, and resp can carry DNSConfig, SSHPolicy, Node or Peers, which
-// force a full rebuild.
+// emptyMapResponse reports whether resp carries nothing but ControlTime,
+// which every built response has and clients only sample for clock skew.
+// Any other non-zero field counts, an empty slice or map included, and so
+// does a field headscale does not set today: unknown is sent, not dropped.
+// Per response on the hot path, so it must stay allocation-free; see
+// [BenchmarkEmptyMapResponse].
+func emptyMapResponse(resp *tailcfg.MapResponse) bool {
+	stripped := *resp
+	stripped.ControlTime = nil
+
+	return reflect.ValueOf(stripped).IsZero()
+}
+
+// withRemovals returns resp, if any, and the peers removed from the node's
+// view as the responses to send. The removals lead, in a response of their
+// own: clients before Tailscale v1.104 only report removed peers to IPN bus
+// watchers opted out of full netmaps (the Android app since 1.100) from
+// responses they apply as deltas, and resp can carry DNSConfig, SSHPolicy,
+// Node or Peers, which force a full rebuild.
 //
 // TODO(kradalby): when the tailscale/tailscale#15660 compat goes (see
 // capver.CanOldCodeBeCleanedUp), set resp.PeersRemoved and return resp alone.
 func withRemovals(resp *tailcfg.MapResponse, removed []tailcfg.NodeID) []*tailcfg.MapResponse {
-	if len(removed) == 0 {
-		return []*tailcfg.MapResponse{resp}
+	var resps []*tailcfg.MapResponse
+
+	if len(removed) > 0 {
+		resps = append(resps, &tailcfg.MapResponse{PeersRemoved: removed})
 	}
 
-	return []*tailcfg.MapResponse{{PeersRemoved: removed}, resp}
+	if resp != nil {
+		resps = append(resps, resp)
+	}
+
+	return resps
 }
 
 // handleNodeChange generates and sends the [tailcfg.MapResponse] values for a given node and [change.Change].
@@ -292,11 +318,13 @@ func (b *Batcher) AddNode(
 	// Create new connection entry
 	now := time.Now()
 	newEntry := &connectionEntry{
-		id:      connID,
-		c:       c,
-		version: version,
-		created: now,
-		stop:    stop,
+		done:        make(chan struct{}),
+		id:          connID,
+		c:           c,
+		version:     version,
+		created:     now,
+		stop:        stop,
+		batcherDone: b.done,
 	}
 	// Block broadcast sends to this connection until its initial map
 	// is delivered below, so a delta cannot become the stream's first
@@ -478,6 +506,11 @@ func (b *Batcher) Start() {
 	b.wg.Go(b.doWork)
 }
 
+// Done is closed when batcher shutdown begins.
+func (b *Batcher) Done() <-chan struct{} {
+	return b.done
+}
+
 func (b *Batcher) Close() {
 	// Signal shutdown to all goroutines, only once.
 	// Workers and queueWork both select on done, so closing it
@@ -601,22 +634,18 @@ func (b *Batcher) worker(workerID int) {
 			// finish — preventing out-of-order delivery and races
 			// on lastSentPeers (Clear+Store vs Range).
 			if nc, exists := b.nodes.Load(w.nodeID); exists && nc != nil {
-				// Changes that found only connections still awaiting
-				// their initial map are retried next tick: the
-				// in-flight initial map may have been generated from
-				// a snapshot older than the change, so dropping them
-				// would lose updates. Collected and prepended as a
-				// group to keep their order ahead of newer pending
-				// changes — order matters for stateful patches like
-				// online/offline.
+				// Requeue unready or backpressured work so the next tick
+				// regenerates it from current state.
 				var retry []change.Change
 
 				nc.workMu.Lock()
-				for _, ch := range w.changes {
+				for i, ch := range w.changes {
 					err := nc.change(ch)
-					if errors.Is(err, errNoReadyConnections) {
-						retry = append(retry, ch)
-						continue
+					if errors.Is(err, errNoReadyConnections) || errors.Is(err, errConnectionBackpressure) {
+						// Keep the unsent suffix ahead of newer pending changes.
+						// Older reconnect siblings can receive idempotent duplicates on retry.
+						retry = w.changes[i:]
+						break
 					}
 
 					if err != nil {
@@ -633,7 +662,7 @@ func (b *Batcher) worker(workerID int) {
 					nc.prependPending(retry...)
 				}
 
-				// Bundle delivered; allow the next tick's bundle to queue.
+				// Bundle delivered or requeued; allow the next tick's bundle to queue.
 				nc.inFlight.Store(false)
 			}
 		case <-b.done:
@@ -716,18 +745,14 @@ func (b *Batcher) addToBatch(changes ...change.Change) {
 		}
 	}
 
-	// Handle broadcast changes - send to all nodes, filtering as needed
+	// Broadcasts have no TargetNode, so every node receives the same changes.
 	if len(broadcast) > 0 {
-		b.nodes.Range(func(nodeID types.NodeID, nc *multiChannelNodeConn) bool {
+		b.nodes.Range(func(_ types.NodeID, nc *multiChannelNodeConn) bool {
 			if nc == nil {
 				return true
 			}
 
-			filtered := change.FilterForNode(nodeID, broadcast)
-
-			if len(filtered) > 0 {
-				nc.appendPending(filtered...)
-			}
+			nc.appendPending(broadcast...)
 
 			return true
 		})
@@ -749,13 +774,15 @@ func (b *Batcher) processBatchedChanges() {
 			return true
 		}
 
-		pending := nc.drainPending()
+		pending := nc.takePending()
 		if len(pending) == 0 {
 			return true
 		}
 
-		// One policy recompute rebuilds the whole netmap; drop same-tick repeats.
-		pending = change.DedupePolicyChanges(pending)
+		// One policy recompute rebuilds the whole netmap; drop same-tick
+		// repeats. A frame per peer delta lets a join storm outgrow the
+		// session channel within one tick, so render each run as one.
+		pending = change.CoalescePeerDeltas(nodeID, change.DedupePolicyChanges(pending))
 
 		// Queue a single work item containing all pending changes.
 		nc.inFlight.Store(true)

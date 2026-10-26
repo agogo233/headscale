@@ -19,6 +19,10 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+// minPendingFold is the pending size below which appendPending leaves the
+// folding to the drain.
+const minPendingFold = 64
+
 // errNoActiveConnections is returned by [multiChannelNodeConn.send] when a node
 // has no active connections (disconnected but kept in the batcher for rapid
 // reconnection). Callers must not update peer tracking state (lastSentPeers)
@@ -35,6 +39,16 @@ var errNoActiveConnections = errors.New("no active connections")
 // the change, so dropping it would lose the update.
 var errNoReadyConnections = errors.New("no connections ready for updates")
 
+// errConnectionBackpressure keeps unsent changes queued without declaring a busy client dead.
+var errConnectionBackpressure = errors.New("connection queue full")
+
+// Match the initial-map timeout while staying below reconnect grace and client keepalive.
+const connectionStallTimeout = 5 * time.Second
+
+// A full snapshot supersedes state backlog past this size; pings remain
+// one-shot work.
+const maxPendingSize = 256
+
 // connectionEntry represents a single connection to a node.
 type connectionEntry struct {
 	id       string // unique connection ID
@@ -44,6 +58,10 @@ type connectionEntry struct {
 	stop     func()
 	lastUsed atomic.Int64 // Unix timestamp of last successful send
 	closed   atomic.Bool  // Indicates if this connection has been closed
+
+	blockedSince atomic.Pointer[time.Time]
+	done         chan struct{}
+	batcherDone  <-chan struct{}
 
 	// pendingInitial is set by [Batcher.AddNode] while this
 	// connection's initial map is still in flight, and cleared once it
@@ -105,6 +123,15 @@ type multiChannelNodeConn struct {
 	pendingMu sync.Mutex
 	pending   []change.Change
 
+	// pendingSize is [changesSize] of pending. A fold keeps every peer and
+	// patch it merges, so the change count alone hides the backlog.
+	pendingSize int
+
+	// pendingFoldAt is the pending size at which appendPending folds the
+	// backlog again: twice what the last fold left, so appends stay
+	// amortized O(1).
+	pendingFoldAt int
+
 	// workMu serializes change processing for this node across batch ticks.
 	// Without this, two workers could process consecutive ticks' bundles
 	// concurrently, causing out-of-order [tailcfg.MapResponse] delivery and races
@@ -133,6 +160,9 @@ type multiChannelNodeConn struct {
 	// full peer lists (which clients interpret as "no change" when empty).
 	// Using xsync.Map for lock-free concurrent access.
 	lastSentPeers *xsync.Map[tailcfg.NodeID, struct{}]
+
+	// Partial additions remain removal candidates when retries render newer state.
+	partialPeers *xsync.Map[tailcfg.NodeID, struct{}]
 }
 
 // connIDCounter is a monotonically increasing counter used to generate
@@ -151,6 +181,7 @@ func newMultiChannelNodeConn(id types.NodeID, mapper *mapper) *multiChannelNodeC
 		id:            id,
 		mapper:        mapper,
 		lastSentPeers: xsync.NewMap[tailcfg.NodeID, struct{}](),
+		partialPeers:  xsync.NewMap[tailcfg.NodeID, struct{}](),
 		log:           log.With().Uint64(zf.NodeID, id.Uint64()).Logger(),
 	}
 }
@@ -170,6 +201,8 @@ func (mc *multiChannelNodeConn) close() {
 // at most once, even if multiple cleanup paths race to remove it.
 func (mc *multiChannelNodeConn) stopConnection(conn *connectionEntry) {
 	if conn.closed.CompareAndSwap(false, true) {
+		close(conn.done)
+
 		if conn.stop != nil {
 			conn.stop()
 		}
@@ -285,7 +318,23 @@ func (mc *multiChannelNodeConn) offlineDuration() time.Duration {
 // Thread-safe via pendingMu; does not contend with the connection mutex.
 func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 	mc.pendingMu.Lock()
+
 	mc.pending = append(mc.pending, changes...)
+	mc.pendingSize += changesSize(changes)
+	fullAtHead := len(mc.pending) > 0 && mc.pending[0].IsFull()
+
+	// Pending drains only once the bundle in flight is delivered, so behind
+	// workers it grew by every change; it renders folded anyway, and
+	// folding twice gives what folding once does. Folding first leaves the
+	// cap's collapse to a full map for backlogs that do not fold.
+	if !fullAtHead && mc.pendingSize >= max(mc.pendingFoldAt, minPendingFold) {
+		mc.setPendingLocked(change.CoalescePeerDeltas(mc.id, change.DedupePolicyChanges(mc.pending)))
+		mc.pendingFoldAt = 2 * mc.pendingSize
+	}
+
+	if fullAtHead || mc.pendingSize > maxPendingSize {
+		mc.setPendingLocked(change.CollapseToFull(mc.id, mc.pending))
+	}
 	mc.pendingMu.Unlock()
 }
 
@@ -296,7 +345,15 @@ func (mc *multiChannelNodeConn) appendPending(changes ...change.Change) {
 // online/offline.
 func (mc *multiChannelNodeConn) prependPending(changes ...change.Change) {
 	mc.pendingMu.Lock()
+	full := (len(mc.pending) > 0 && mc.pending[0].IsFull()) ||
+		(len(changes) > 0 && changes[0].IsFull())
+
 	mc.pending = append(changes, mc.pending...)
+	mc.pendingSize += changesSize(changes)
+
+	if full || mc.pendingSize > maxPendingSize {
+		mc.setPendingLocked(change.CollapseToFull(mc.id, mc.pending))
+	}
 	mc.pendingMu.Unlock()
 }
 
@@ -304,7 +361,7 @@ func (mc *multiChannelNodeConn) prependPending(changes ...change.Change) {
 // single full update and the pings it cannot carry ([change.CollapseToFull]).
 func (mc *multiChannelNodeConn) collapsePendingToFull(incoming []change.Change) {
 	mc.pendingMu.Lock()
-	mc.pending = change.CollapseToFull(mc.id, slices.Concat(mc.pending, incoming))
+	mc.setPendingLocked(change.CollapseToFull(mc.id, slices.Concat(mc.pending, incoming)))
 	mc.pendingMu.Unlock()
 }
 
@@ -313,18 +370,54 @@ func (mc *multiChannelNodeConn) collapsePendingToFull(incoming []change.Change) 
 func (mc *multiChannelNodeConn) drainPending() []change.Change {
 	mc.pendingMu.Lock()
 	p := mc.pending
-	mc.pending = nil
+	mc.setPendingLocked(nil)
 	mc.pendingMu.Unlock()
+
+	return p
+}
+
+// setPendingLocked replaces pending. Caller must hold pendingMu.
+func (mc *multiChannelNodeConn) setPendingLocked(p []change.Change) {
+	mc.pending = p
+	mc.pendingSize = changesSize(p)
+}
+
+// changesSize is how much pending holds for changes: each change, and the
+// peers and patches it carries.
+func changesSize(changes []change.Change) int {
+	n := len(changes)
+	for _, c := range changes {
+		n += len(c.PeersChanged) + len(c.PeersRemoved) + len(c.PeerPatches)
+	}
+
+	return n
+}
+
+// takePending drains the pending changes for rendering. A node without a
+// connection gets none and its changes are dropped: send would discard what
+// they render, and its next connection opens with a full map rendered after
+// it registered. The read lock keeps that registration out of the gap between
+// the check and the drain.
+func (mc *multiChannelNodeConn) takePending() []change.Change {
+	mc.mutex.RLock()
+	defer mc.mutex.RUnlock()
+
+	p := mc.drainPending()
+	if len(mc.connections) == 0 {
+		mapperChangesDropped.WithLabelValues("no_connection").Add(float64(len(p)))
+
+		return nil
+	}
 
 	return p
 }
 
 // send broadcasts data to all active connections for the node.
 //
-// To avoid holding the write lock during potentially slow sends (each stale
-// connection can block for up to 50ms), the method snapshots connections under
-// a read lock, sends without any lock held, then write-locks only to remove
-// failures. New connections added between the snapshot and cleanup are safe:
+// To avoid holding the write lock during bounded channel waits, the method
+// snapshots connections under a read lock, sends without any lock held, then
+// write-locks only to remove failures. New connections added between the
+// snapshot and cleanup are safe:
 // they receive a full initial map via [Batcher.AddNode], so missing this update
 // causes no data loss.
 func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
@@ -370,16 +463,22 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		Msg("send: broadcasting")
 
 	// Send to all connections without holding any lock.
-	// Stale connection timeouts (50ms each) happen here without blocking
-	// other goroutines that need the mutex.
+	// Bounded channel waits do not block other goroutines that need the mutex.
 	var (
-		lastErr      error
-		successCount int
-		failed       []*connectionEntry
+		lastErr        error
+		successCount   int
+		failed         []*connectionEntry
+		blocked        []*connectionEntry
+		newestAccepted bool
 	)
 
 	for _, conn := range snapshot {
 		err := conn.send(conn.withSSHPolicyDelta(conn.withSelfDelta(data)))
+		if errors.Is(err, errConnectionBackpressure) {
+			blocked = append(blocked, conn)
+			continue
+		}
+
 		if err != nil {
 			lastErr = err
 
@@ -390,6 +489,7 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 				Msg("send: connection failed")
 		} else {
 			successCount++
+			newestAccepted = conn == snapshot[len(snapshot)-1]
 
 			if data.Node != nil {
 				conn.lastSelf.Store(data.Node)
@@ -399,6 +499,12 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 				conn.lastSSHPolicy.Store(data.SSHPolicy)
 			}
 		}
+	}
+
+	// The newest ready stream supersedes blocked siblings left by reconnect overlap.
+	if newestAccepted {
+		failed = append(failed, blocked...)
+		blocked = nil
 	}
 
 	// Write-lock only to remove failed connections.
@@ -433,6 +539,17 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 		Int("failed_connections", len(failed)).
 		Msg("send: broadcast complete")
 
+	if len(blocked) > 0 {
+		if successCount > 0 {
+			// Partial additions still need removal if a retry renders newer state without them.
+			for _, peer := range slices.Concat(data.Peers, data.PeersChanged) {
+				mc.partialPeers.Store(peer.ID, struct{}{})
+			}
+		}
+
+		return errConnectionBackpressure
+	}
+
 	// Success if at least one send succeeded
 	if successCount > 0 {
 		return nil
@@ -441,7 +558,7 @@ func (mc *multiChannelNodeConn) send(data *tailcfg.MapResponse) error {
 	return fmt.Errorf("node %d: all connections failed, last error: %w", mc.id, lastErr)
 }
 
-// send sends data to a single connection entry with timeout-based stale connection detection.
+// send distinguishes temporary backpressure from a connection that has stopped making progress.
 func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
 	if data == nil {
 		return nil
@@ -453,9 +570,7 @@ func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
 		return fmt.Errorf("connection %s: %w", entry.id, errConnectionClosed)
 	}
 
-	// Use a short timeout to detect stale connections where the client isn't reading the channel.
-	// This is critical for detecting Docker containers that are forcefully terminated
-	// but still have channels that appear open.
+	// Let a draining client free a slot before yielding this worker to other nodes.
 	//
 	// Use a timer rather than time.After so the timeout is explicitly released
 	// on the fast path; both are GC-recoverable since Go 1.23.
@@ -466,12 +581,28 @@ func (entry *connectionEntry) send(data *tailcfg.MapResponse) error {
 	case entry.c <- data:
 		// Update last used timestamp on successful send
 		entry.lastUsed.Store(time.Now().Unix())
+		entry.blockedSince.Store(nil)
+
 		return nil
+	case <-entry.done:
+		return fmt.Errorf("connection %s: %w", entry.id, errConnectionClosed)
+	case <-entry.batcherDone:
+		return ErrBatcherShuttingDown
 	case <-timer.C:
+	}
+
+	// A short stall can be a busy reader; only evict after progress stops for the stall budget.
+	since := entry.blockedSince.Load()
+	if since == nil {
+		now := time.Now()
+		entry.blockedSince.CompareAndSwap(nil, &now)
+	} else if time.Since(*since) >= connectionStallTimeout {
 		// Connection is likely stale - client isn't reading from channel
 		// This catches the case where Docker containers are killed but channels remain open
 		return fmt.Errorf("connection %s: %w", entry.id, ErrConnectionSendTimeout)
 	}
+
+	return errConnectionBackpressure
 }
 
 // nodeID returns the node ID.
@@ -502,6 +633,7 @@ func (mc *multiChannelNodeConn) updateSentPeers(resp *tailcfg.MapResponse) {
 
 	// Full peer list replaces tracked state entirely
 	if resp.Peers != nil {
+		mc.partialPeers.Clear()
 		mc.lastSentPeers.Clear()
 
 		for _, peer := range resp.Peers {
@@ -511,11 +643,13 @@ func (mc *multiChannelNodeConn) updateSentPeers(resp *tailcfg.MapResponse) {
 
 	// Incremental additions
 	for _, peer := range resp.PeersChanged {
+		mc.partialPeers.Delete(peer.ID)
 		mc.lastSentPeers.Store(peer.ID, struct{}{})
 	}
 
 	// Incremental removals
 	for _, id := range resp.PeersRemoved {
+		mc.partialPeers.Delete(id)
 		mc.lastSentPeers.Delete(id)
 	}
 }
@@ -531,13 +665,16 @@ func (mc *multiChannelNodeConn) computePeerDiff(currentPeers []tailcfg.NodeID) [
 	var removed []tailcfg.NodeID
 
 	// Find removed: in lastSentPeers but not in current
-	mc.lastSentPeers.Range(func(id tailcfg.NodeID, _ struct{}) bool {
-		if _, exists := currentSet[id]; !exists {
-			removed = append(removed, id)
-		}
+	for _, sent := range []*xsync.Map[tailcfg.NodeID, struct{}]{mc.lastSentPeers, mc.partialPeers} {
+		sent.Range(func(id tailcfg.NodeID, _ struct{}) bool {
+			if _, exists := currentSet[id]; !exists {
+				removed = append(removed, id)
+				currentSet[id] = struct{}{}
+			}
 
-		return true
-	})
+			return true
+		})
+	}
 
 	return removed
 }

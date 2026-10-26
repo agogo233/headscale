@@ -1,9 +1,15 @@
 package mapper
 
 import (
+	stdcmp "cmp"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,14 +17,21 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/dns"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/views"
 )
 
 var iap = func(ipStr string) *netip.Addr {
@@ -1004,6 +1017,9 @@ func TestGenerateMapResponseDebugOnlyOnFullMaps(t *testing.T) {
 				Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{999: {RegionID: 999}},
 			},
 		},
+		// Without these the DERP map and DNS config renders carry
+		// nothing and no frame is generated at all.
+		TailcfgDNSConfig: &tailcfg.DNSConfig{Proxied: true},
 		Tuning: types.Tuning{
 			NodeStoreBatchSize:    state.TestBatchSize,
 			NodeStoreBatchTimeout: state.TestBatchTimeout,
@@ -1021,6 +1037,8 @@ func TestGenerateMapResponseDebugOnlyOnFullMaps(t *testing.T) {
 	s, err := state.NewState(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
+
+	s.SetDERPMap(cfg.DERP.DERPMap)
 
 	_, err = s.SetPolicy([]byte(`{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}`))
 	require.NoError(t, err)
@@ -1059,6 +1077,822 @@ func TestGenerateMapResponseDebugOnlyOnFullMaps(t *testing.T) {
 				}
 
 				assert.Equal(t, want, resps[0].Debug)
+			})
+		}
+	}
+}
+
+// TestCertDomains pins the name sent in DNSConfig.CertDomains: the
+// client only runs `tailscale cert` for a name it finds there exactly,
+// compared against its own MagicDNS name without the trailing dot.
+func TestCertDomains(t *testing.T) {
+	enabled := types.DNSConfig{Certificates: types.CertificatesConfig{Enabled: true}}
+
+	acmeDNS, err := dns.NewProvider("acmedns", map[string]any{"config": map[string]any{
+		"laptop.ts.example.com": map[string]any{
+			"username":   "user",
+			"password":   "pass",
+			"subdomain":  "reg",
+			"server_url": "https://auth.acme-dns.io",
+		},
+	}}, func(string) (any, bool) { return nil, false })
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		node       *types.Node
+		dns        types.DNSConfig
+		provider   dns.Provider
+		baseDomain string
+		want       []string
+	}{
+		{
+			name:     "own acme-dns registration",
+			node:     &types.Node{GivenName: "laptop"},
+			dns:      enabled,
+			provider: acmeDNS,
+			want:     []string{"laptop.ts.example.com"},
+		},
+		{
+			// Without a registration of its own, the node's challenge would
+			// be answered from a record another name's challenge shares.
+			name:     "no acme-dns registration of its own",
+			node:     &types.Node{GivenName: "desktop"},
+			dns:      enabled,
+			provider: acmeDNS,
+		},
+		{
+			name: "user owned",
+			node: &types.Node{GivenName: "laptop", UserID: new(uint(1))},
+			dns:  enabled,
+			want: []string{"laptop.ts.example.com"},
+		},
+		{
+			name: "tagged",
+			node: &types.Node{GivenName: "server", Tags: []string{"tag:server"}},
+			dns:  enabled,
+			want: []string{"server.ts.example.com"},
+		},
+		{
+			name: "disabled",
+			node: &types.Node{GivenName: "laptop"},
+		},
+		{
+			// The operator gave this name, in another case, to a service; a
+			// node naming itself grafana must not get a certificate for it.
+			name: "extra record name",
+			node: &types.Node{GivenName: "grafana"},
+			dns:  enabled,
+		},
+		{
+			// A wildcard order for *.svc shares its challenge record with
+			// svc, so svc must not get one covering grafana.svc.
+			name: "extra record below name",
+			node: &types.Node{GivenName: "svc"},
+			dns:  enabled,
+		},
+		{
+			name: "label suffix of extra record",
+			node: &types.Node{GivenName: "fana"},
+			dns:  enabled,
+			want: []string{"fana.ts.example.com"},
+		},
+		{
+			// Renames are lowercased now; an older mixed-case name could
+			// share its challenge record with another node's name.
+			name: "mixed case name",
+			node: &types.Node{GivenName: "Laptop"},
+			dns:  enabled,
+		},
+		{
+			name:       "challenge name too long",
+			node:       &types.Node{GivenName: strings.Repeat("a", 63)},
+			dns:        enabled,
+			baseDomain: strings.Repeat("b.", 87) + "example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseDomain := tt.baseDomain
+			if baseDomain == "" {
+				baseDomain = "ts.example.com"
+			}
+
+			cfg := &types.Config{
+				BaseDomain:   baseDomain,
+				DNSConfig:    tt.dns,
+				DNSChallenge: types.DNSChallengeConfig{Provider: tt.provider},
+				TailcfgDNSConfig: &tailcfg.DNSConfig{
+					Proxied: true,
+					ExtraRecords: []tailcfg.DNSRecord{
+						{Name: "Grafana.ts.example.com", Type: "A", Value: "100.64.0.3"},
+						{Name: "grafana.svc.ts.example.com.", Type: "A", Value: "100.64.0.4"},
+					},
+				},
+			}
+
+			got := generateDNSConfig(cfg, tt.node.View(), nil)
+			assert.Equal(t, tt.want, got.CertDomains)
+			assert.Nil(t, cfg.TailcfgDNSConfig.CertDomains, "global DNS config must stay untouched")
+		})
+	}
+}
+
+// profileUserOriginal freezes the user profile helpers from 1096abfc8.
+// This package cannot call the test-only originals in types.
+type profileUserOriginal types.User
+
+func (u *profileUserOriginal) StringID() string {
+	if u == nil {
+		return ""
+	}
+
+	return strconv.FormatUint(uint64(u.ID), 10)
+}
+
+func (u *profileUserOriginal) Username() string {
+	return stdcmp.Or(
+		u.Email,
+		u.Name,
+		u.ProviderIdentifier.String,
+		u.StringID(),
+	)
+}
+
+func (u *profileUserOriginal) Display() string {
+	return stdcmp.Or(u.DisplayName, u.Username())
+}
+
+func (u *profileUserOriginal) TailscaleUserProfile() tailcfg.UserProfile {
+	return tailcfg.UserProfile{
+		ID:            tailcfg.UserID(u.ID), //nolint:gosec // UserID is bounded
+		LoginName:     u.Username(),
+		DisplayName:   u.Display(),
+		ProfilePicURL: u.ProfilePicURL,
+	}
+}
+
+// userProfileOriginal reads the view without cloning or calling changed helpers.
+func userProfileOriginal(view *types.UserView) tailcfg.UserProfile {
+	u := profileUserOriginal{
+		Model:              view.Model(),
+		Name:               view.Name(),
+		Email:              view.Email(),
+		DisplayName:        view.DisplayName(),
+		ProviderIdentifier: view.ProviderIdentifier(),
+		ProfilePicURL:      view.ProfilePicURL(),
+	}
+
+	return u.TailscaleUserProfile()
+}
+
+// generateUserProfilesOriginal freezes 1096abfc8, including its profile helpers.
+func generateUserProfilesOriginal(
+	node types.NodeView,
+	peers views.Slice[types.NodeView],
+) []tailcfg.UserProfile {
+	userMap := make(map[uint]*types.UserView)
+
+	user := node.Owner()
+	if !user.Valid() {
+		log.Error().
+			EmbedObject(node).
+			Msg("node has no valid owner, skipping user profile generation")
+
+		return nil
+	}
+
+	userMap[user.Model().ID] = &user
+
+	for _, peer := range peers.All() {
+		peerUser := peer.Owner()
+		if !peerUser.Valid() {
+			continue
+		}
+
+		userMap[peerUser.Model().ID] = &peerUser
+	}
+
+	var profiles []tailcfg.UserProfile
+
+	for _, id := range slices.Sorted(maps.Keys(userMap)) {
+		profiles = append(profiles, userProfileOriginal(userMap[id]))
+	}
+
+	return profiles
+}
+
+// generateUserProfilesPointerMap freezes the map work but uses current name helpers,
+// so map-only benchmarks do not include the frozen profile's view adapter.
+func generateUserProfilesPointerMap(
+	node types.NodeView,
+	peers views.Slice[types.NodeView],
+) []tailcfg.UserProfile {
+	userMap := make(map[uint]*types.UserView)
+
+	user := node.Owner()
+	if !user.Valid() {
+		log.Error().
+			EmbedObject(node).
+			Msg("node has no valid owner, skipping user profile generation")
+
+		return nil
+	}
+
+	userMap[user.Model().ID] = &user
+
+	for _, peer := range peers.All() {
+		peerUser := peer.Owner()
+		if !peerUser.Valid() {
+			continue
+		}
+
+		userMap[peerUser.Model().ID] = &peerUser
+	}
+
+	var profiles []tailcfg.UserProfile
+
+	for _, id := range slices.Sorted(maps.Keys(userMap)) {
+		profiles = append(profiles, userMap[id].TailscaleUserProfile())
+	}
+
+	return profiles
+}
+
+func checkUserProfilesOriginal(
+	t *testing.T,
+	node types.NodeView,
+	peers views.Slice[types.NodeView],
+) {
+	t.Helper()
+
+	want := generateUserProfilesOriginal(node, peers)
+	require.Equal(t, want, generateUserProfiles(node, peers))
+	require.Equal(t, want, generateUserProfilesPointerMap(node, peers))
+}
+
+func TestGenerateUserProfilesMatchesOriginal(t *testing.T) {
+	first := &types.User{
+		ID: 7, Name: "first", DisplayName: "First",
+		Email: "first@example.com", ProfilePicURL: "https://example.com/first",
+	}
+	last := &types.User{
+		ID: 7, Name: "last", DisplayName: "Last",
+		Email: "last@example.com", ProfilePicURL: "https://example.com/last",
+	}
+	other := &types.User{ID: 100}
+	node := (&types.Node{ID: 1, UserID: new(first.ID), User: first}).View()
+	duplicate := (&types.Node{ID: 2, UserID: new(last.ID), User: last}).View()
+	peer := (&types.Node{ID: 3, UserID: new(other.ID), User: other}).View()
+	orphan := (&types.Node{ID: 4}).View()
+	missingUser := (&types.Node{ID: 5, UserID: new(first.ID)}).View()
+	tagged := (&types.Node{ID: 6, Tags: []string{"tag:server"}}).View()
+	taggedCreator := (&types.Node{
+		ID: 7, Tags: []string{"tag:server"}, UserID: new(first.ID), User: first,
+	}).View()
+	zeroUser := (&types.Node{ID: 8, User: &types.User{}}).View()
+
+	for _, tt := range []struct {
+		name  string
+		node  types.NodeView
+		peers []types.NodeView
+	}{
+		{name: "nil_peers", node: node},
+		{name: "empty_peers", node: node, peers: []types.NodeView{}},
+		{name: "unowned_requester", node: orphan, peers: []types.NodeView{peer}},
+		{name: "missing_requester_user", node: missingUser, peers: []types.NodeView{peer}},
+		{name: "invalid_peer_after_unowned_requester", node: orphan, peers: []types.NodeView{{}}},
+		{name: "invalid_owner_peers", node: node, peers: []types.NodeView{orphan, missingUser}},
+		{name: "same_owner", node: node, peers: []types.NodeView{node, node, node}},
+		{name: "last_peer_wins", node: node, peers: []types.NodeView{peer, node, duplicate}},
+		{name: "reverse_duplicate_order", node: node, peers: []types.NodeView{duplicate, peer, node}},
+		{name: "zero_id_and_no_user_id", node: zeroUser, peers: []types.NodeView{peer, node}},
+		{name: "tagged_requester", node: tagged},
+		{name: "tagged_requester_with_creator", node: taggedCreator},
+		{name: "tagged_peers", node: node, peers: []types.NodeView{tagged, taggedCreator}},
+		{
+			name: "mixed_unsorted_owners", node: node,
+			peers: []types.NodeView{taggedCreator, peer, orphan, zeroUser, tagged, duplicate},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			checkUserProfilesOriginal(t, tt.node, views.SliceOf(tt.peers))
+		})
+	}
+
+	require.Equal(t, []tailcfg.UserProfile{
+		{
+			ID:            7,
+			LoginName:     last.Email,
+			DisplayName:   last.DisplayName,
+			ProfilePicURL: last.ProfilePicURL,
+		},
+		{ID: 100, LoginName: "100", DisplayName: "100"},
+	}, generateUserProfiles(node, views.SliceOf([]types.NodeView{peer, node, duplicate})))
+	require.Equal(t, []tailcfg.UserProfile{
+		{
+			ID:          types.TaggedDevicesUserID,
+			LoginName:   "tagged-devices",
+			DisplayName: "Tagged Devices",
+		},
+	}, generateUserProfiles(taggedCreator, views.SliceOf([]types.NodeView{tagged})))
+	require.Nil(t, generateUserProfiles(orphan, views.SliceOf([]types.NodeView{peer})))
+
+	for _, tt := range []struct {
+		name  string
+		node  types.NodeView
+		peers []types.NodeView
+	}{
+		{name: "invalid_requester"},
+		{name: "invalid_peer", node: node, peers: []types.NodeView{{}}},
+		{name: "invalid_peer_after_valid", node: node, peers: []types.NodeView{peer, {}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			peers := views.SliceOf(tt.peers)
+
+			require.Panics(t, func() { generateUserProfilesOriginal(tt.node, peers) })
+			require.Panics(t, func() { generateUserProfiles(tt.node, peers) })
+			require.Panics(t, func() { generateUserProfilesPointerMap(tt.node, peers) })
+			require.Panics(t, func() { generateUserProfiles(tt.node, peers) })
+		})
+	}
+}
+
+func TestGenerateUserProfilesFallbacksMatchOriginal(t *testing.T) {
+	for _, id := range []uint{0, 99, 100, 101, ^uint(0)} {
+		for mask := range 32 {
+			t.Run(fmt.Sprintf("ID=%d/fields=%02d", id, mask), func(t *testing.T) {
+				u := &types.User{
+					ID:                 id,
+					ProfilePicURL:      "https://example.com/avatar",
+					ProviderIdentifier: sql.NullString{Valid: mask&8 != 0},
+				}
+
+				if mask&1 != 0 {
+					u.Email = "email@example.com"
+				}
+
+				if mask&2 != 0 {
+					u.Name = "username"
+				}
+
+				if mask&4 != 0 {
+					u.ProviderIdentifier.String = "https://issuer.example.com/subject"
+				}
+
+				if mask&16 != 0 {
+					u.DisplayName = "Display Name"
+				}
+
+				node := (&types.Node{User: u}).View()
+				checkUserProfilesOriginal(t, node, views.Slice[types.NodeView]{})
+
+				tagged := (&types.Node{Tags: []string{"tag:server"}}).View()
+				checkUserProfilesOriginal(
+					t,
+					tagged,
+					views.SliceOf([]types.NodeView{node}),
+				)
+			})
+		}
+	}
+}
+
+func userProfilesFixture(
+	peerCount, ownerCount int,
+	names string,
+) (types.NodeView, views.Slice[types.NodeView]) {
+	users := make([]types.User, ownerCount)
+	for i := range users {
+		users[i].ID = uint(i + 1000)
+		if names == "named" {
+			users[i].Name = fmt.Sprintf("user-%d", i)
+			users[i].Email = fmt.Sprintf("user-%d@example.com", i)
+			users[i].DisplayName = fmt.Sprintf("User %d", i)
+		}
+
+		users[i].ProfilePicURL = "https://example.com/avatar"
+	}
+
+	peers := make([]types.NodeView, peerCount)
+	for i := range peers {
+		u := &users[i%ownerCount]
+		peers[i] = (&types.Node{UserID: new(u.ID), User: u}).View()
+	}
+
+	return (&types.Node{UserID: new(users[0].ID), User: &users[0]}).View(), views.SliceOf(
+		peers,
+	)
+}
+
+func TestGenerateUserProfilesTailnetsMatchOriginal(t *testing.T) {
+	for _, peerCount := range []int{8, 128, 1024, 8192} {
+		for _, ownerCount := range []int{1, peerCount} {
+			for _, names := range []string{"named", "numeric"} {
+				t.Run(
+					fmt.Sprintf("peers=%d/owners=%d/%s", peerCount, ownerCount, names),
+					func(t *testing.T) {
+						node, peers := userProfilesFixture(peerCount, ownerCount, names)
+						checkUserProfilesOriginal(t, node, peers)
+					},
+				)
+			}
+		}
+	}
+}
+
+func BenchmarkGenerateUserProfiles(b *testing.B) {
+	for _, peerCount := range []int{8, 128, 1024, 8192} {
+		for _, ownerCount := range []int{1, peerCount} {
+			for _, names := range []string{"named", "numeric"} {
+				b.Run(
+					fmt.Sprintf("peers=%d/owners=%d/%s", peerCount, ownerCount, names),
+					func(b *testing.B) {
+						node, peers := userProfilesFixture(peerCount, ownerCount, names)
+						require.Equal(
+							b,
+							generateUserProfilesOriginal(node, peers),
+							generateUserProfiles(node, peers),
+						)
+						require.Equal(
+							b,
+							generateUserProfilesPointerMap(node, peers),
+							generateUserProfiles(node, peers),
+						)
+
+						b.Run("frozen-original", func(b *testing.B) {
+							b.ReportAllocs()
+
+							for b.Loop() {
+								_ = generateUserProfilesOriginal(node, peers)
+							}
+						})
+						b.Run("current", func(b *testing.B) {
+							b.ReportAllocs()
+
+							for b.Loop() {
+								_ = generateUserProfiles(node, peers)
+							}
+						})
+						b.Run("pointer-map", func(b *testing.B) {
+							b.ReportAllocs()
+
+							for b.Loop() {
+								_ = generateUserProfilesPointerMap(node, peers)
+							}
+						})
+						b.Run("value-map", func(b *testing.B) {
+							b.ReportAllocs()
+
+							for b.Loop() {
+								_ = generateUserProfiles(node, peers)
+							}
+						})
+					},
+				)
+			}
+		}
+	}
+}
+
+// Frozen from d00f135bf before selected capability snapshots; only names and cmp alias differ.
+func (b *MapResponseBuilder) buildTailPeersCapMapsReference(peers views.Slice[types.NodeView]) ([]*tailcfg.Node, error) {
+	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
+	if !ok {
+		return nil, ErrNodeNotFoundMapper
+	}
+
+	// [State.RoutesForPeer] needs the unreduced matchers: every rule where the
+	// node is source or destination, not only the [State.FilterForNode] rules
+	// where it is destination.
+	matchers, err := b.mapper.state.MatchersForNode(node)
+	if err != nil {
+		return nil, err
+	}
+
+	// Snapshot the per-node policy CapMap once per peer-list build
+	// instead of locking the policy manager per peer. The per-call
+	// path used to take pm.mu N times for an N-peer response.
+	allCapMaps := b.mapper.state.NodeCapMaps()
+
+	// Build tail nodes with per-peer via-aware route function.
+	tailPeers := make([]*tailcfg.Node, 0, peers.Len())
+
+	for _, peer := range peers.All() {
+		// Pass the peer's policy CapMap as selfPolicyCaps so per-peer
+		// address-shape rules (today: disable-ipv4) apply consistently
+		// in the viewer's netmap. The CapMap merge into tn.CapMap is
+		// overwritten by the PeerCapMap call below; only the address
+		// filtering side-effect inside TailNode survives.
+		tn, err := peer.TailNode(b.capVer, func(_ types.NodeID) []netip.Prefix {
+			return b.mapper.state.RoutesForPeer(node, peer, matchers)
+		}, b.mapper.cfg, allCapMaps[peer.ID()])
+		if err != nil {
+			// One peer with invalid data (e.g. an empty or over-long
+			// GivenName that fails GetFQDN) must not blank out the map for
+			// every node that can see it. Drop the offending peer, log it
+			// with the identity an operator needs to fix it, and keep
+			// building from the remaining valid peers.
+			log.Warn().Caller().
+				Err(err).
+				Uint64(zf.NodeID, peer.ID().Uint64()).
+				Str(zf.NodeHostname, peer.Hostname()).
+				Uint64("map.viewer.node.id", b.nodeID.Uint64()).
+				Msgf("dropping peer %d from map response: invalid node data; fix with `headscale nodes rename %d <name>`", peer.ID(), peer.ID())
+
+			continue
+		}
+
+		// [tailcfg.Node.CapMap] on a peer carries the small set of
+		// caps the Tailscale client reads from the peer view rather
+		// than the self view (suggest-exit-node, dns-subdomain-resolve
+		// — see [tailcfg.NodeAttrSuggestExitNode] and
+		// [tailcfg.NodeAttrDNSSubdomainResolve]).
+		// The Tailscale-hosted control plane stamps these only when
+		// the peer satisfies the cap's emission condition; every other
+		// cap stays off the peer view, leaving CapMap empty for most
+		// peers. [policyv2.PeerCapMap] encodes those conditions.
+		tn.CapMap = policyv2.PeerCapMap(peer, allCapMaps[peer.ID()])
+
+		tailPeers = append(tailPeers, tn)
+	}
+
+	// Peers is always returned sorted by Node.ID.
+	slices.SortStableFunc(tailPeers, func(a, b *tailcfg.Node) int {
+		return stdcmp.Compare(a.ID, b.ID)
+	})
+
+	return tailPeers, nil
+}
+
+func (b *MapResponseBuilder) withPeersCapMapsReference(peers views.Slice[types.NodeView]) *MapResponseBuilder {
+	tailPeers, err := b.buildTailPeersCapMapsReference(peers)
+	if err != nil {
+		b.addError(err)
+		return b
+	}
+
+	b.resp.Peers = tailPeers
+
+	return b
+}
+
+func (m *mapper) fullMapResponseCapMapsReference(
+	nodeID types.NodeID,
+	capVer tailcfg.CapabilityVersion,
+) (*tailcfg.MapResponse, error) {
+	peers := m.state.ListPeers(nodeID)
+
+	return m.NewMapResponseBuilder(nodeID).
+		WithDebugType(fullResponseDebug).
+		WithCapabilityVersion(capVer).
+		WithSelfNode().
+		WithDERPMap().
+		WithDomain().
+		WithCollectServicesDisabled().
+		WithDebugConfig().
+		WithSSHPolicy().
+		WithDNSConfig().
+		WithUserProfiles(peers).
+		WithPacketFilters().
+		withPeersCapMapsReference(peers).
+		Build()
+}
+
+// A star policy gives the viewer all peers without retaining a dense N² peer map.
+func capMapsMapperFixture(tb testing.TB, n int, attrs string) (*mapper, []types.NodeView) {
+	tb.Helper()
+
+	p4 := netip.MustParsePrefix("100.64.0.0/10")
+	p6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type:   types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{Path: tb.TempDir() + "/caps.db"},
+		},
+		PrefixV4: &p4, PrefixV6: &p6,
+		IPAllocation: types.IPAllocationStrategySequential,
+		BaseDomain:   "headscale.test",
+		Policy:       types.PolicyConfig{Mode: types.PolicyModeDB},
+		Tuning: types.Tuning{
+			NodeStoreBatchSize:    state.TestBatchSize,
+			NodeStoreBatchTimeout: state.TestBatchTimeout,
+		},
+	}
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(tb, err)
+
+	user := database.CreateUserForTest("capuser")
+	nodes := make(types.Nodes, n)
+	ip4, ip6 := netip.MustParseAddr("100.64.0.1"), netip.MustParseAddr("fd7a:115c:a1e0::1")
+
+	for i := range nodes {
+		name := fmt.Sprintf("capnode%d", i+1)
+
+		nodes[i] = &types.Node{
+			ID: types.NodeID(i + 1), Hostname: name, GivenName: name,
+			UserID: &user.ID, User: user,
+			IPv4: new(ip4), IPv6: new(ip6),
+			Hostinfo: &tailcfg.Hostinfo{},
+		}
+		if i%8 == 1 {
+			routes := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")}
+			nodes[i].ApprovedRoutes = routes
+			nodes[i].Hostinfo.RoutableIPs = routes
+		}
+
+		ip4, ip6 = ip4.Next(), ip6.Next()
+	}
+
+	require.NoError(tb, database.DB.Omit("User").CreateInBatches(nodes, 100).Error)
+	_, err = database.SetPolicy(`{
+		"acls":[{"action":"accept","src":["100.64.0.1"],"dst":["*:*"]}],
+		"nodeAttrs":` + attrs + `}`)
+	require.NoError(tb, err)
+	require.NoError(tb, database.Close())
+
+	s, err := state.NewState(cfg)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, s.Close()) })
+	s.SetDERPMap(&tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}})
+	stored := s.ListNodes().AsSlice()
+	slices.SortFunc(stored, func(a, b types.NodeView) int { return stdcmp.Compare(a.ID(), b.ID()) })
+	require.Len(tb, stored, n)
+
+	return &mapper{state: s, cfg: cfg}, stored
+}
+
+func TestBuildTailPeersCapMapsReference(t *testing.T) {
+	for _, attrs := range []struct {
+		name, policy string
+	}{
+		{"empty", `[]`},
+		{"partial", `[{"target":["100.64.0.2"],"attr":["disable-ipv4","suggest-exit-node"]}]`},
+		{"all", `[{"target":["*"],"attr":["disable-ipv4","suggest-exit-node"]}]`},
+	} {
+		t.Run(attrs.name, func(t *testing.T) {
+			m, nodes := capMapsMapperFixture(t, 5, attrs.policy)
+			duplicate := nodes[1].AsStruct()
+			duplicate.GivenName = "same-id-different-name"
+			missing := nodes[2].AsStruct()
+			missing.ID = 999
+			invalid := nodes[3].AsStruct()
+
+			invalid.GivenName = ""
+			for _, selection := range []struct {
+				name  string
+				peers []types.NodeView
+			}{
+				{"nil", nil},
+				{"empty", []types.NodeView{}},
+				{"one", nodes[1:2]},
+				{"full", nodes[1:]},
+				{"missing", []types.NodeView{missing.View()}},
+				{"duplicates", []types.NodeView{nodes[3], duplicate.View(), nodes[1], nodes[2], nodes[1]}},
+				{"invalid-name", []types.NodeView{invalid.View(), nodes[1]}},
+			} {
+				t.Run(selection.name, func(t *testing.T) {
+					peers := views.SliceOf(selection.peers)
+					before, err := json.Marshal(m.state.NodeCapMaps())
+					require.NoError(t, err)
+
+					builder := m.NewMapResponseBuilder(nodes[0].ID()).WithCapabilityVersion(tailcfg.CurrentCapabilityVersion)
+					want, wantErr := builder.buildTailPeersCapMapsReference(peers)
+					got, gotErr := builder.buildTailPeers(peers)
+					require.Equal(t, wantErr, gotErr)
+					require.Equal(t, want, got, "nil/empty, ordering, duplicates, routes and peer caps must match")
+					require.NotNil(t, got)
+
+					for _, peer := range got {
+						if peer.ID == nodes[1].ID().NodeID() {
+							require.Contains(t, peer.CapMap, nodecap.SuggestExitNode)
+
+							if attrs.name != "empty" {
+								require.Equal(t, []netip.Prefix{netip.PrefixFrom(nodes[1].IPv6().Get(), 128)}, peer.Addresses)
+								require.NotContains(t, peer.CapMap, nodecap.Cap("disable-ipv4"), "self caps must not leak into the peer view")
+							}
+						}
+
+						if peer.CapMap != nil {
+							peer.CapMap["caller-only"] = nil
+							delete(peer.CapMap, nodecap.SuggestExitNode)
+						}
+					}
+
+					after, err := json.Marshal(m.state.NodeCapMaps())
+					require.NoError(t, err)
+					require.Equal(t, before, after, "rendering must not mutate manager-owned inner maps")
+
+					again, err := builder.buildTailPeers(peers)
+					require.NoError(t, err)
+					require.Equal(t, want, again, "output mutations must not affect later builds")
+				})
+			}
+
+			builder := m.NewMapResponseBuilder(999)
+			want, wantErr := builder.buildTailPeersCapMapsReference(views.SliceOf(nodes))
+			got, gotErr := builder.buildTailPeers(views.SliceOf(nodes))
+			require.Equal(t, want, got)
+			require.Equal(t, wantErr, gotErr)
+			require.ErrorIs(t, gotErr, ErrNodeNotFoundMapper)
+
+			for _, pol := range []string{
+				"",
+				`{"nodeAttrs":[{"target":["*"],"attr":["randomize-client-port"]}]}`,
+				`{"randomizeClientPort":true}`,
+			} {
+				if pol != "" {
+					_, err := m.state.SetPolicy([]byte(pol))
+					require.NoError(t, err)
+				}
+
+				want, err := m.fullMapResponseCapMapsReference(nodes[0].ID(), tailcfg.CurrentCapabilityVersion)
+				require.NoError(t, err)
+				got, err := m.fullMapResponse(nodes[0].ID(), tailcfg.CurrentCapabilityVersion)
+				require.NoError(t, err)
+
+				want.ControlTime, got.ControlTime = nil, nil
+				require.Equal(t, want, got)
+			}
+		})
+	}
+}
+
+var (
+	capMapsBuilderBenchmarkSink  []*tailcfg.Node
+	capMapsResponseBenchmarkSink *tailcfg.MapResponse
+)
+
+func BenchmarkBuildTailPeersCapMaps(b *testing.B) {
+	previousLevel := zerolog.GlobalLevel()
+
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	b.Cleanup(func() { zerolog.SetGlobalLevel(previousLevel) })
+
+	for _, n := range []int{100, 1000, 10000} {
+		for _, attrs := range []struct{ name, policy string }{
+			{"empty", `[]`},
+			{"partial", `[{"target":["100.64.0.2"],"attr":["disable-ipv4"]}]`},
+			{"all", `[{"target":["*"],"attr":["disable-ipv4"]}]`},
+		} {
+			b.Run(fmt.Sprintf("N%d/%s", n, attrs.name), func(b *testing.B) {
+				m, nodes := capMapsMapperFixture(b, n, attrs.policy)
+				builder := m.NewMapResponseBuilder(nodes[0].ID()).WithCapabilityVersion(tailcfg.CurrentCapabilityVersion)
+
+				allPeers := views.SliceOf(nodes[1:])
+				for _, k := range []int{0, 1, 8, allPeers.Len()} {
+					peers := allPeers.Slice(0, k)
+					b.Run(fmt.Sprintf("K%d/reference", k), func(b *testing.B) {
+						b.ReportAllocs()
+
+						for b.Loop() {
+							var err error
+
+							capMapsBuilderBenchmarkSink, err = builder.buildTailPeersCapMapsReference(peers)
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+					})
+					b.Run(fmt.Sprintf("K%d/selected", k), func(b *testing.B) {
+						b.ReportAllocs()
+
+						for b.Loop() {
+							var err error
+
+							capMapsBuilderBenchmarkSink, err = builder.buildTailPeers(peers)
+							if err != nil {
+								b.Fatal(err)
+							}
+						}
+					})
+				}
+
+				b.Run("fullresponse/reference", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						var err error
+
+						capMapsResponseBenchmarkSink, err = m.fullMapResponseCapMapsReference(nodes[0].ID(), tailcfg.CurrentCapabilityVersion)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+				b.Run("fullresponse/selected", func(b *testing.B) {
+					b.ReportAllocs()
+
+					for b.Loop() {
+						var err error
+
+						capMapsResponseBenchmarkSink, err = m.fullMapResponse(nodes[0].ID(), tailcfg.CurrentCapabilityVersion)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
 			})
 		}
 	}

@@ -246,9 +246,12 @@ func NewPolicyManager(b []byte, users []types.User, nodes views.Slice[types.Node
 // pm is written, so a caller that restores its own input on error leaves pm
 // as it was, and a retry with the same input recompiles.
 func (pm *PolicyManager) updateLocked() (bool, error) {
+	// One tag index serves every resolution in this compile.
+	pol := pm.pol.withNodesByTag(pm.nodes)
+
 	// Compile all grants once. Both global and per-node filter
 	// rules are derived from these compiled grants.
-	grants := pm.pol.compileGrants(pm.users, pm.nodes)
+	grants := pol.compileGrants(pm.users, pm.nodes)
 
 	relayTargetIPs, err := collectRelayTargetIPs(grants)
 	if err != nil {
@@ -258,12 +261,12 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	// Order matters, tags might be used in autoapprovers, so we need to ensure
 	// that the map for tag owners is resolved before resolving autoapprovers.
 	// TODO(kradalby): Order might not matter after #2417
-	tagMap, err := resolveTagOwners(pm.pol, pm.users, pm.nodes)
+	tagMap, err := resolveTagOwners(pol, pm.users, pm.nodes)
 	if err != nil {
 		return false, fmt.Errorf("resolving tag owners map: %w", err)
 	}
 
-	autoMap, exitSet, err := resolveAutoApprovers(pm.pol, pm.users, pm.nodes)
+	autoMap, exitSet, err := resolveAutoApprovers(pol, pm.users, pm.nodes)
 	if err != nil {
 		return false, fmt.Errorf("resolving auto approvers map: %w", err)
 	}
@@ -279,7 +282,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 
 	var nodeAttrs map[types.NodeID]tailcfg.NodeCapMap
 	if refreshNodeAttrs {
-		nodeAttrs, err = pm.pol.compileNodeAttrs(pm.users, pm.nodes)
+		nodeAttrs, err = pol.compileNodeAttrs(pm.users, pm.nodes)
 		if err != nil {
 			return false, fmt.Errorf("compiling nodeAttrs: %w", err)
 		}
@@ -693,6 +696,8 @@ func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 // up with doing the full work for every node O(n^2), while this will reduce
 // the list as we see relationships while building the map, making it
 // O(n^2/2) in the end, but with less work per node.
+//
+//nolint:gocyclo // global and autogroup:self paths, each with a per-node matcher index
 func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[types.NodeID][]types.NodeID {
 	if pm == nil {
 		return nil
@@ -719,18 +724,75 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 	if !pm.needsPerNodeFilter {
 		ret := make(map[types.NodeID][]types.NodeID, nodes.Len())
 
+		// A matcher lets a reach b when a satisfies its source side and b
+		// its destination side, exactly as [types.Node.CanAccess] tests
+		// them, and each side depends on one node only. So evaluate both
+		// sides once per node, as bitsets over pm.matchers, instead of
+		// once per pair: a can reach b iff a's source set and b's
+		// destination set intersect. That turns the O(n^2 * matchers)
+		// scan into O(n * matchers) set lookups plus O(n^2) word ANDs.
+		// Bit k of a set stands for pm.matchers[k]: it lives in word k/64
+		// at position k%64, so 64 matchers fit in one uint64.
+		words := (len(pm.matchers) + 63) / 64 //nolint:mnd
+		ids := make([]types.NodeID, nodes.Len())
+		srcOf := make([][]uint64, nodes.Len()) // nil: source of no matcher
+		dstOf := make([][]uint64, nodes.Len()) // nil: destination of no matcher
+
+		for i, n := range nodes.All() {
+			ids[i] = n.ID()
+			if !n.Valid() {
+				continue
+			}
+
+			ips, ri := n.IPs(), routeInfo[n.ID()]
+			routed := len(ri.subnet) > 0
+
+			for k := range pm.matchers {
+				m := &pm.matchers[k]
+
+				if m.SrcsContainsIPs(ips...) || (routed && m.SrcsOverlapsPrefixes(ri.subnet...)) {
+					if srcOf[i] == nil {
+						srcOf[i] = make([]uint64, words)
+					}
+
+					srcOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+				}
+
+				if m.DestsContainsIP(ips...) || (routed && m.DestsOverlapsPrefixes(ri.subnet...)) ||
+					(ri.isExit && m.DestsIsTheInternet()) {
+					if dstOf[i] == nil {
+						dstOf[i] = make([]uint64, words)
+					}
+
+					dstOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+				}
+			}
+		}
+
+		canAccess := func(src, dst []uint64) bool {
+			if src == nil || dst == nil {
+				return false
+			}
+
+			for w := range src {
+				if src[w]&dst[w] != 0 {
+					return true
+				}
+			}
+
+			return false
+		}
+
 		// Build the map of all peers according to the matchers.
-		for i := range nodes.Len() {
-			for j := i + 1; j < nodes.Len(); j++ {
-				if nodes.At(i).ID() == nodes.At(j).ID() {
+		for i := range ids {
+			for j := i + 1; j < len(ids); j++ {
+				if ids[i] == ids[j] {
 					continue
 				}
 
-				ri, rj := routeInfo[nodes.At(i).ID()], routeInfo[nodes.At(j).ID()]
-				if nodes.At(i).CanAccessWithRoutes(pm.matchers, nodes.At(j), ri.subnet, rj.subnet, rj.isExit) ||
-					nodes.At(j).CanAccessWithRoutes(pm.matchers, nodes.At(i), rj.subnet, ri.subnet, ri.isExit) {
-					ret[nodes.At(i).ID()] = append(ret[nodes.At(i).ID()], nodes.At(j).ID())
-					ret[nodes.At(j).ID()] = append(ret[nodes.At(j).ID()], nodes.At(i).ID())
+				if canAccess(srcOf[i], dstOf[j]) || canAccess(srcOf[j], dstOf[i]) {
+					ret[ids[i]] = append(ret[ids[i]], ids[j])
+					ret[ids[j]] = append(ret[ids[j]], ids[i])
 				}
 			}
 		}
@@ -2009,10 +2071,9 @@ func (pm *PolicyManager) refreshNodeAttrsLocked(newMap map[types.NodeID]tailcfg.
 	}
 }
 
-// NodeCapMap returns the policy-derived CapMap for the given node, or
-// nil when the node has no nodeAttrs entries that target it. The
-// returned map is a defensive clone — caller mutations cannot reach
-// the manager-owned cache.
+// NodeCapMap returns compiled policy capabilities for the given node, or nil
+// when none target it. The map is a defensive clone; its values are shared
+// and read-only.
 func (pm *PolicyManager) NodeCapMap(id types.NodeID) tailcfg.NodeCapMap {
 	if pm == nil {
 		return nil
@@ -2032,11 +2093,9 @@ func (pm *PolicyManager) NodeCapMap(id types.NodeID) tailcfg.NodeCapMap {
 	return out
 }
 
-// NodeCapMaps returns a snapshot of the per-node policy CapMap. The
-// mapper calls this once per request to amortise lock acquisitions
-// over a peer-loop instead of taking the lock per peer. The returned
-// map is a fresh container; the inner [tailcfg.NodeCapMap] values are
-// shared with the manager and must be treated as read-only.
+// NodeCapMaps snapshots every node's policy CapMap. The outer map is
+// caller-owned; inner maps are shared with the manager and read-only.
+// NodeCapMapsForPeers limits copying when fewer peers are requested.
 func (pm *PolicyManager) NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap {
 	if pm == nil {
 		return nil
@@ -2047,6 +2106,36 @@ func (pm *PolicyManager) NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap {
 
 	out := make(map[types.NodeID]tailcfg.NodeCapMap, len(pm.nodeAttrsMap))
 	maps.Copy(out, pm.nodeAttrsMap)
+
+	return out
+}
+
+// NodeCapMapsForPeers snapshots requested peer caps under one lock. It may
+// include unselected entries when copying the whole compiled table is less work.
+// The outer map is caller-owned; inner maps are shared and read-only.
+// Empty selections or no compiled policy capabilities return nil; missing IDs read nil.
+func (pm *PolicyManager) NodeCapMapsForPeers(peers views.Slice[types.NodeView]) map[types.NodeID]tailcfg.NodeCapMap {
+	if pm == nil || peers.Len() == 0 {
+		return nil
+	}
+
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	if len(pm.nodeAttrsMap) == 0 {
+		return nil
+	}
+
+	out := make(map[types.NodeID]tailcfg.NodeCapMap, min(peers.Len(), len(pm.nodeAttrsMap)))
+	if peers.Len() >= len(pm.nodeAttrsMap) {
+		maps.Copy(out, pm.nodeAttrsMap)
+	} else {
+		for _, peer := range peers.All() {
+			if caps, ok := pm.nodeAttrsMap[peer.ID()]; ok {
+				out[peer.ID()] = caps
+			}
+		}
+	}
 
 	return out
 }

@@ -78,6 +78,12 @@ nodes.peer.imports = [ inputs.headscale.nixosModules.testkit-peer ];
 See `nix/README.md` for the full contract, recipes for tsnet and non-Go
 clients, and how to run the same setup without Nix.
 
+### TLS certificates for nodes
+
+`tailscale cert` and HTTPS with `tailscale serve` now work. Headscale publishes
+the ACME DNS-01 challenge through a built-in DNS provider: `acmedns`,
+`cloudflare`, `gigahost`, `hetzner`, `powerdns` or `rfc2136`. `dns.base_domain` must be a public domain you control. [#3554](https://github.com/juanfont/headscale/pull/3554)
+
 ### BREAKING
 
 #### Database
@@ -100,6 +106,9 @@ clients, and how to run the same setup without Nix.
 - `dns.extra_records_path` must end in `.json`, `.hujson`, `.yaml` or `.yml`; the extension picks the format
 - A `derp.paths` file that decodes to no regions now stops headscale from starting instead of being silently ignored
 - `unix_socket_permission` must be a quoted octal string no higher than `"0777"`, e.g. `"0770"`; an unquoted number or an invalid value now stops headscale from starting instead of silently using `0700` [#3540](https://github.com/juanfont/headscale/pull/3540)
+- `tls_cert_path`, `tls_key_path`, `tls_letsencrypt_*`, `acme_url` and `acme_email` are deprecated in favour of `tls.cert_path`, `tls.key_path` and `tls.acme.*` [#3554](https://github.com/juanfont/headscale/pull/3554)
+  - The old keys continue to work, with a warning, but will be removed in a future release
+- Headscale's own ACME certificate is managed by CertMagic instead of autocert; the first start registers a new ACME account and obtains a new certificate in `tls.acme.cache_dir`, which now defaults to `/var/lib/headscale/cache` [#3554](https://github.com/juanfont/headscale/pull/3554)
 
 #### CLI
 
@@ -110,14 +119,15 @@ clients, and how to run the same setup without Nix.
 
 - `settings.ephemeral_node_inactivity_timeout` is removed; set `settings.node.ephemeral.inactivity_timeout`, which headscale reads instead
 - `settings.dns.split` is removed; headscale never read it, set `settings.dns.nameservers.split`
+- `settings.tls_*` options move to `settings.tls.*`; old `settings.tls_*` values still work [#3554](https://github.com/juanfont/headscale/pull/3554)
 
 ### Changes
 
+- PostgreSQL connection settings are assembled into a `postgres://` URL with proper escaping, so a password (or host, user, database name) containing spaces, quotes or other reserved characters no longer truncates the DSN [#3477](https://github.com/juanfont/headscale/pull/3477)
 - Expiring or deleting a non-existent pre-auth key now returns an error instead of silently succeeding [#3324](https://github.com/juanfont/headscale/pull/3324)
 - Improve systemd service file hardening [#3341](https://github.com/juanfont/headscale/pull/3341)
 - Fix `headscale users destroy`/`rename` reporting "multiple users match query" when no user matches; an ambiguous match now lists the matching users [#3476](https://github.com/juanfont/headscale/pull/3476)
 - Deleting a user that still owns nodes now lists the nodes (ID and hostname) that must be deleted first [#3475](https://github.com/juanfont/headscale/pull/3475)
-- Headscale now requires Go 1.27 to build
 - `headscale preauthkeys create --user` accepts a user name as well as an ID
 - `derp.paths` files may be Tailscale JSON or HuJSON DERP maps as well as YAML
 - `dns.extra_records_path` files may be HuJSON or YAML as well as JSON
@@ -128,7 +138,37 @@ clients, and how to run the same setup without Nix.
 
 - A node re-registering with a spent, expired or revoked pre-auth key is now rejected if it expired or changed node key while the re-registration was in flight [#3525](https://github.com/juanfont/headscale/pull/3525)
 - DERP client verification (the embedded DERP server and the `/verify` endpoint) looks up the node key directly instead of scanning every node on each connection [#3520](https://github.com/juanfont/headscale/pull/3520)
+- Renaming a node now stores the name in lowercase; a node renamed with uppercase letters before gets no certificate name until it is renamed again [#3554](https://github.com/juanfont/headscale/pull/3554)
+- Add `dns.certificates.enabled` and `dns.certificates.zone` to let nodes get TLS certificates [#3554](https://github.com/juanfont/headscale/pull/3554)
+- Add `dns.challenge.provider`, `dns.challenge.propagation_timeout` and `dns.challenge.resolvers` for ACME DNS-01 challenges [#3554](https://github.com/juanfont/headscale/pull/3554)
+- The v2 tailnet setting `httpsEnabled` reports `dns.certificates.enabled` [#3554](https://github.com/juanfont/headscale/pull/3554)
+- `tls.acme.challenge_type` accepts `DNS-01`, using `dns.challenge.provider` [#3554](https://github.com/juanfont/headscale/pull/3554)
 - Fix the unix socket being created `0700` instead of the documented `0770` when `unix_socket_permission` is unset. The socket grants full admin access without authentication, so members of its group gain that access; check who is in it before upgrading [#3540](https://github.com/juanfont/headscale/pull/3540)
+- Map sessions that fall behind during update bursts are no longer dropped; a session is only closed once it stops reading or a newer session of the same node replaces it [#3575](https://github.com/juanfont/headscale/pull/3575)
+- Node joins and deletions under churn, especially in tailnets with many tags, no longer stall registrations, map updates and API requests; ephemeral nodes are cleaned up within seconds instead of minutes [#3575](https://github.com/juanfont/headscale/pull/3575)
+- Shutdown keeps the LastSeen of connected nodes: it waits for their map sessions to close before closing the database [#3575](https://github.com/juanfont/headscale/pull/3575)
+- Deleting an ephemeral node no longer logs a spurious `ephemeral node deletion failed` error later [#3575](https://github.com/juanfont/headscale/pull/3575)
+
+## 0.29.6 (2026-10-24)
+
+**Minimum supported Tailscale client version: v1.80.0**
+
+### Security
+
+- Build with Go 1.27.3 to reject certificate chains containing the compromised eMudhra intermediate keys (CVE-2026-111943) [Go #82345](https://github.com/golang/go/issues/82345)
+- Update and pin the normal and debug container bases to images whose CA bundles no longer include `emSign ECC Root CA - G3` [#3579](https://github.com/juanfont/headscale/issues/3579)
+- Update `golang.org/x/net` to v0.60.0, `golang.org/x/text` to v0.42.0 and gRPC to v1.83.2 to address HTTP/2 denial-of-service and text-processing vulnerabilities ([x/net](https://pkg.go.dev/vuln/GO-2026-6617), [x/text](https://pkg.go.dev/vuln/GO-2026-6629), [gRPC](https://pkg.go.dev/vuln/GO-2026-6348))
+
+Custom builds must be rebuilt with Go 1.27.3 or newer to receive the certificate-chain protection.
+
+### Changes
+
+- Speed up peer-map construction on large tailnets by finding each node's matching rules once, instead of checking every pair of nodes against every rule [#3556](https://github.com/juanfont/headscale/pull/3556)
+- Build the peer map once per policy write instead of twice, and skip the rebuild when reloading an unchanged policy [#3557](https://github.com/juanfont/headscale/pull/3557)
+- Reduce work when broadcasting map updates by avoiding repeated recipient filtering [#3568](https://github.com/juanfont/headscale/pull/3568)
+- Avoid `INTERNAL_ERROR` stream errors when a node logs out or is deleted, or when Headscale shuts down; writes already in progress have a short grace period to finish, while clients that stop reading are still disconnected [#3575](https://github.com/juanfont/headscale/pull/3575)
+- Return database-open errors instead of risking a panic or returning a partially initialized database handle [#3496](https://github.com/juanfont/headscale/pull/3496)
+- Update the Tailscale dependency to v1.102.0 for Go 1.27 JSON compatibility in SSH check responses
 
 ## 0.29.5 (2026-10-13)
 
