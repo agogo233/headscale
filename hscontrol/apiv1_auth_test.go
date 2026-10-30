@@ -38,7 +38,7 @@ func seedAuthRequest(
 			Hostinfo:   &tailcfg.Hostinfo{Hostname: hostname},
 		}
 
-		app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData))
+		require.NoError(t, app.state.SetAuthCacheEntry(authID, types.NewRegisterAuthRequest(regData)))
 	}
 }
 
@@ -150,7 +150,7 @@ func TestAPIV1AuthApprove(t *testing.T) {
 
 		authID := types.MustAuthID()
 		authReq := types.NewAuthRequest()
-		h.app.state.SetAuthCacheEntry(authID, authReq)
+		require.NoError(t, h.app.state.SetAuthCacheEntry(authID, authReq))
 
 		body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
 		res := h.callHuma(http.MethodPost, "/api/v1/auth/approve", body)
@@ -185,7 +185,7 @@ func TestAPIV1AuthReject(t *testing.T) {
 
 		authID := types.MustAuthID()
 		authReq := types.NewAuthRequest()
-		h.app.state.SetAuthCacheEntry(authID, authReq)
+		require.NoError(t, h.app.state.SetAuthCacheEntry(authID, authReq))
 
 		body := fmt.Appendf(nil, `{"authId":%q}`, authID.String())
 		res := h.callHuma(http.MethodPost, "/api/v1/auth/reject", body)

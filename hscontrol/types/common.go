@@ -4,6 +4,7 @@ package types
 //go:generate go run tailscale.com/cmd/viewer --type=User,Node,PreAuthKey,Credential
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime"
@@ -22,9 +23,10 @@ const (
 
 // Common errors.
 var (
-	ErrCannotParsePrefix   = errors.New("cannot parse prefix")
-	ErrInvalidAuthIDLength = errors.New("auth ID has invalid length")
-	ErrInvalidAuthIDPrefix = errors.New("auth ID has invalid prefix")
+	ErrCannotParsePrefix           = errors.New("cannot parse prefix")
+	ErrInvalidAuthIDLength         = errors.New("auth ID has invalid length")
+	ErrInvalidAuthIDPrefix         = errors.New("auth ID has invalid prefix")
+	ErrRegistrationPayloadTooLarge = errors.New("registration payload exceeds size limit")
 )
 
 const (
@@ -109,7 +111,7 @@ type PendingRegistrationConfirmation struct {
 
 // AuthRequest represents a pending authentication request from a user or a
 // node. It carries the minimum data needed to either complete a node
-// registration (regData populated) or an SSH check-mode auth (sshBinding
+// registration (regData or regDataJSON populated) or an SSH check-mode auth (sshBinding
 // populated), and signals the verdict via the finished channel. The closed
 // flag guards [AuthRequest.FinishAuth] against double-close.
 //
@@ -117,13 +119,13 @@ type PendingRegistrationConfirmation struct {
 // have a single canonical instance even when stored in caches that
 // internally copy values.
 type AuthRequest struct {
-	// regData is populated for node-registration flows (interactive web
-	// or OIDC). It carries the cached registration payload that the
-	// auth callback uses to promote this request into a real node.
-	//
-	// nil for non-registration flows. Use [AuthRequest.RegistrationData] to read it
-	// safely.
+	// regData holds the caller's registration payload until PrepareForCache
+	// replaces it with owned serialized data and releases the original pointer.
 	regData *RegistrationData
+
+	// regDataJSON is immutable and bounded by MaxRegistrationPayloadBytes.
+	// RegistrationData decodes a fresh copy without retaining the decoded graph.
+	regDataJSON string
 
 	// sshBinding is populated for SSH check-mode flows. It captures the
 	// (src, dst) node pair the request was minted for so the follow-up
@@ -147,6 +149,10 @@ type AuthRequest struct {
 
 	finished chan AuthVerdict
 	closed   *atomic.Bool
+
+	// waiter is closed once a newer request parks on this session; see
+	// [AuthRequest.Park].
+	waiter atomic.Pointer[chan struct{}]
 }
 
 // NewAuthRequest creates a pending auth request with no payload, suitable
@@ -161,7 +167,8 @@ func NewAuthRequest() *AuthRequest {
 
 // NewRegisterAuthRequest creates a pending auth request carrying the
 // minimal [RegistrationData] for a node-registration flow. The data is
-// stored by pointer; callers must not mutate it after handing it off.
+// stored by pointer until [AuthRequest.PrepareForCache] detaches it; callers
+// must not mutate it until preparation finishes.
 func NewRegisterAuthRequest(data *RegistrationData) *AuthRequest {
 	return &AuthRequest{
 		regData:   data,
@@ -169,6 +176,31 @@ func NewRegisterAuthRequest(data *RegistrationData) *AuthRequest {
 		closed:    &atomic.Bool{},
 		createdAt: time.Now(),
 	}
+}
+
+// PrepareForCache replaces the registration payload with an owned serialized
+// value of at most [MaxRegistrationPayloadBytes]. It must run before publishing
+// the request to the cache. Serialization and size errors leave it unchanged;
+// callers must reject admission on error. Repeated calls and non-registration
+// requests are no-ops.
+func (rn *AuthRequest) PrepareForCache() error {
+	if rn.regData == nil {
+		return nil
+	}
+
+	data, err := json.Marshal(rn.regData)
+	if err != nil {
+		return fmt.Errorf("serializing pending registration: %w", err)
+	}
+
+	if len(data) > MaxRegistrationPayloadBytes {
+		return fmt.Errorf("%w: limit %d bytes", ErrRegistrationPayloadTooLarge, MaxRegistrationPayloadBytes)
+	}
+
+	rn.regDataJSON = string(data)
+	rn.regData = nil
+
+	return nil
 }
 
 // NewSSHCheckAuthRequest creates a pending auth request bound to a
@@ -187,15 +219,27 @@ func NewSSHCheckAuthRequest(src, dst NodeID) *AuthRequest {
 	}
 }
 
-// RegistrationData returns the cached registration payload. It panics if
+// RegistrationData returns the original registration payload before preparation,
+// or a fresh decoded copy after [AuthRequest.PrepareForCache]. It panics if
 // called on an [AuthRequest] that was not created via
 // [NewRegisterAuthRequest].
 func (rn *AuthRequest) RegistrationData() *RegistrationData {
-	if rn.regData == nil {
+	if rn.regData != nil {
+		return rn.regData
+	}
+
+	if rn.regDataJSON == "" {
 		panic("RegistrationData can only be used in registration requests")
 	}
 
-	return rn.regData
+	var data RegistrationData
+
+	err := json.Unmarshal([]byte(rn.regDataJSON), &data)
+	if err != nil {
+		panic(fmt.Sprintf("decoding prepared registration: %v", err))
+	}
+
+	return &data
 }
 
 // SSHCheckBinding returns the (src, dst) node pair an SSH check-mode
@@ -212,7 +256,7 @@ func (rn *AuthRequest) SSHCheckBinding() *SSHCheckBinding {
 // IsRegistration reports whether this auth request carries registration
 // data (i.e. it was created via [NewRegisterAuthRequest]).
 func (rn *AuthRequest) IsRegistration() bool {
-	return rn.regData != nil
+	return rn.regData != nil || rn.regDataJSON != ""
 }
 
 // IsSSHCheck reports whether this auth request is bound to an SSH
@@ -270,6 +314,22 @@ func (rn *AuthRequest) FinishAuth(verdict AuthVerdict) {
 
 func (rn *AuthRequest) WaitForAuth() <-chan AuthVerdict {
 	return rn.finished
+}
+
+// Park makes the caller the one request waiting on [AuthRequest.WaitForAuth]
+// and returns a channel that is closed once a newer caller takes its place.
+// [AuthRequest.FinishAuth] hands out one verdict, so a session needs one
+// waiter. The newest wins, so a client that reconnected is not kept out by
+// its own dead request. Parked requests are then bounded by the sessions in
+// the auth cache, not by how many requests clients send.
+func (rn *AuthRequest) Park() <-chan struct{} {
+	waiter := make(chan struct{})
+
+	if prev := rn.waiter.Swap(&waiter); prev != nil {
+		close(*prev)
+	}
+
+	return waiter
 }
 
 type AuthVerdict struct {

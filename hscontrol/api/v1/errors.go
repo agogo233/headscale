@@ -6,6 +6,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/types"
 	"gorm.io/gorm"
 )
 
@@ -19,6 +20,13 @@ func mapError(msg string, err error) error {
 	}
 
 	switch {
+	case errors.Is(err, types.ErrRegistrationPayloadTooLarge):
+		return huma.Error413RequestEntityTooLarge(msg, err)
+
+	case errors.Is(err, state.ErrAuthCacheFull),
+		errors.Is(err, state.ErrAuthCacheClosed):
+		return huma.Error503ServiceUnavailable(msg, err)
+
 	case errors.Is(err, gorm.ErrRecordNotFound),
 		errors.Is(err, state.ErrNodeNotFound),
 		errors.Is(err, state.ErrNodeNotInNodeStore),
@@ -36,6 +44,8 @@ func mapError(msg string, err error) error {
 		errors.Is(err, state.ErrNodeIsTagged),
 		errors.Is(err, state.ErrNodeIPv4Invalid),
 		errors.Is(err, state.ErrNodeIPv4CannotSwap),
+		errors.Is(err, types.ErrExpiryOutOfRange),
+		errors.Is(err, types.ErrHostinfoTooLarge),
 		errors.Is(err, db.ErrUserStillHasNodes),
 		errors.Is(err, db.ErrUserNotUnique),
 		errors.Is(err, db.ErrCannotChangeOIDCUser),
@@ -44,7 +54,8 @@ func mapError(msg string, err error) error {
 		return huma.Error400BadRequest(msg, err)
 
 	case errors.Is(err, state.ErrNodeKeyInUse),
-		errors.Is(err, state.ErrAmbiguousNodeOwnership):
+		errors.Is(err, state.ErrAmbiguousNodeOwnership),
+		errors.Is(err, state.ErrAuthCacheEntryExists):
 		return huma.Error409Conflict(msg, err)
 
 	default:
