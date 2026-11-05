@@ -28,6 +28,7 @@ arpitjain099
 bobelev
 chibanglw
 christian-heusel
+cjstate
 ckiee
 codethief
 cure
@@ -35,6 +36,7 @@ dmeremyanin
 dotlambda
 dotwee
 dragetd
+ducnhan123-co
 e-zk
 edvardvb
 enoperm
@@ -115,6 +117,7 @@ serhii-matsyshyn
 sfllaw
 shurshun
 slackingveteran
+soymgomez soymgomez
 spymobilfon
 stavros-k
 stblassitude

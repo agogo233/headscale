@@ -20,6 +20,7 @@ import (
 	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/types/change"
 	"tailscale.com/net/memnet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
@@ -38,6 +39,7 @@ type TestServer struct {
 	ln         net.Listener
 	httpServer *http.Server
 	st         *state.State
+	cfg        *types.Config
 }
 
 // ServerOption configures a [TestServer].
@@ -56,6 +58,7 @@ type serverConfig struct {
 	magicDNSDomain        string
 	dnsResolvers          []string
 	certProvider          hsdns.Provider
+	prefixV4              netip.Prefix
 }
 
 func defaultServerConfig() *serverConfig {
@@ -65,6 +68,7 @@ func defaultServerConfig() *serverConfig {
 		batcherWorkers:   1,
 		ephemeralTimeout: 30 * time.Second,
 		taildropEnabled:  true,
+		prefixV4:         netip.MustParsePrefix("100.64.0.0/10"),
 	}
 }
 
@@ -123,6 +127,11 @@ func WithMagicDNS(domain string) ServerOption {
 	return func(c *serverConfig) { c.magicDNSDomain = domain }
 }
 
+// WithPrefixV4 sets prefixes.v4, the range node IPv4 addresses come from.
+func WithPrefixV4(p netip.Prefix) ServerOption {
+	return func(c *serverConfig) { c.prefixV4 = p }
+}
+
 // WithCertificates enables node certificates (dns.certificates) with
 // provider publishing the challenges. It needs [WithMagicDNS]; the
 // propagation check is off because the provider is not real DNS.
@@ -155,7 +164,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 
 	tmpDir := tb.TempDir()
 
-	prefixV4 := netip.MustParsePrefix("100.64.0.0/10")
+	prefixV4 := sc.prefixV4
 	prefixV6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
 
 	cfg := types.Config{
@@ -280,6 +289,7 @@ func NewServer(tb testing.TB, opts ...ServerOption) *TestServer {
 		ln:         ln,
 		httpServer: httpServer,
 		st:         app.GetState(),
+		cfg:        &cfg,
 	}
 
 	tb.Cleanup(ts.Close)
@@ -310,6 +320,15 @@ func (s *TestServer) Close() {
 // so that [TestClient] dialers can be wired to it.
 func (s *TestServer) MemNet() *memnet.Network {
 	return s.memNet
+}
+
+// SetExtraRecords replaces the extra DNS records and sends them to every
+// node, as a reload of dns.extra_records_path does. The server needs
+// [WithMagicDNS] or [WithDNSResolvers], which give it a DNS config to hold
+// them.
+func (s *TestServer) SetExtraRecords(records []tailcfg.DNSRecord) {
+	s.cfg.SetExtraRecords(records)
+	s.App.Change(change.ExtraRecords())
 }
 
 // CreateUser creates a test user and returns it.
@@ -391,9 +410,17 @@ func (s *TestServer) CreateRegisteredNode(tb testing.TB, owner *types.User, host
 	tb.Helper()
 
 	node := s.st.CreateRegisteredNodeForTest(owner, hostname...)
-	// CreateRegisteredNodeForTest sets UserID but leaves the User association
-	// unloaded; the device response renders the owner login, so attach it.
+	// CreateRegisteredNodeForTest sets UserID and AuthKeyID but leaves the
+	// associations unloaded; the device response renders the owner login and,
+	// once tagged, the login that made its key, so attach both.
 	node.User = owner
+
+	pak, err := s.st.GetPreAuthKeyByID(*node.AuthKeyID)
+	if err != nil {
+		tb.Fatalf("servertest: GetPreAuthKeyByID: %v", err)
+	}
+
+	node.AuthKey = pak.AsCredential()
 
 	return s.st.PutNodeInStoreForTest(*node)
 }

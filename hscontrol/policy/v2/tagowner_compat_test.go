@@ -26,31 +26,24 @@ import (
 // <test_id>/<step>/<function>. A listed check that matches fails, so a fix
 // must delete its entry.
 var tagOwnerSkipReasons = map[string]string{
-	"tag-owner-chain/u-re-relogin/NodeCanHaveTag": tagOwnedThroughTag,
-
-	"tag-owner-chain/t-top-join/TagOwnedByTags":        tagReachedTwoHops,
-	"tag-owner-chain/C-base-mint-top/TagOwnedByTags":   tagReachedTwoHops,
-	"tag-owner-chain/C-base-mint-dtop/TagOwnedByTags":  tagReachedTwoHops,
 	"tag-owner-chain/C-two-mint-subset/TagOwnedByTags": clientTagSubset,
 }
 
-const (
-	tagOwnedThroughTag = "TAG_OWNED_THROUGH_TAG: headscale lets a user's node apply a tag whose owner is a tag the user owns; SaaS gives a user only the tags it owns directly"
-	tagReachedTwoHops  = "TAG_REACHED_TWO_HOPS: headscale lets a tagged credential apply a tag any number of ownership steps away; SaaS allows only tags its own tags own directly"
-	clientTagSubset    = "CLIENT_TAG_SUBSET: headscale lets an OAuth client mint a key with a subset of its tags; SaaS needs that subset owned by the client's tags"
-)
+const clientTagSubset = "CLIENT_TAG_SUBSET: headscale lets an OAuth client mint a key with a subset of its tags; SaaS needs that subset owned by the client's tags"
 
 // TestTagOwnerChainCompat compares each SaaS verdict on a tag request with
-// the policy function headscale asks on that path:
+// the policy function headscale asks for that request:
 //   - a join with a user's untagged key and requested tags: UserCanHaveTag,
 //     and NodeCanHaveTag for a node the policy does not know yet;
 //   - a relogin of the user's existing node with requested tags:
 //     NodeCanHaveTag for that node;
-//   - a join with a tagged key, and an OAuth client's key mint:
-//     TagOwnedByTags with the credential's tags.
+//   - an OAuth client's key mint: TagOwnedByTags with the client's tags.
 //
-// The user's own mints have no verdict: as a member his API key could not
-// mint at all.
+// Only a login without a key asks the first two: a key login never asks the
+// policy about requested tags. So TestReauthCompat in ../../servertest also
+// replays the joins through registration, and checks a tagged key's joins
+// only there. The user's own mints have no verdict: as a member his API key
+// could not mint at all.
 func TestTagOwnerChainCompat(t *testing.T) {
 	t.Parallel()
 
@@ -132,16 +125,12 @@ func TestTagOwnerChainCompat(t *testing.T) {
 				}
 
 			case a.Kind == "join" && a.RequestTags != nil:
-				tags := *a.RequestTags
-				want := tagsGranted(t, step, a.Node, tags)
-
-				if owners, tagged := credentialTags[a.Key]; tagged {
-					rows = append(rows, row{step.Name, "TagOwnedByTags", want, func() bool {
-						return ownedByTags(pm, tags, owners)
-					}})
-
+				if _, tagged := credentialTags[a.Key]; tagged {
 					continue
 				}
+
+				tags := *a.RequestTags
+				want := tagsGranted(t, step, a.Node, tags)
 
 				user := keyUsers[a.Key]
 				require.NotNil(t, user, "%s: join with unknown key %s", step.Name, a.Key)

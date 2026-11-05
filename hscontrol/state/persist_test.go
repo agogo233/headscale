@@ -1,11 +1,18 @@
 package state
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"maps"
+	"net/http"
 	"net/netip"
+	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,8 +21,10 @@ import (
 
 	"github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/policy"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
+	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,6 +32,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
+	"zombiezen.com/go/postgrestest"
 )
 
 // persistTestSetup pre-creates a sqlite database on disk with a single
@@ -87,6 +97,87 @@ func persistTestConfig(dbPath string) *types.Config {
 			NodeStoreBatchSize:    TestBatchSize,
 			NodeStoreBatchTimeout: TestBatchTimeout,
 		},
+	}
+}
+
+func TestLoadedDuplicateNamesAreResolvedInMemory(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
+		{Name: "grafana." + cfg.BaseDomain, Type: "A", Value: "100.64.0.100"},
+	}}
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("loaded-name-user")
+	long := strings.Repeat("a", 63)
+	stored := []string{"db", "db", "DB", "", "grafana", "db-1", "x", "x", "x-1", long, strings.ToUpper(long)}
+	want := []string{"db", "db-2", "DB-3", "", "grafana", "db-1", "x", "x-2", "x-1", long, strings.ToUpper(long[:61]) + "-1"}
+
+	ids := make([]types.NodeID, 0, len(stored))
+	for _, name := range stored {
+		node := database.CreateNodeForTest(user)
+		require.NoError(t, database.DB.Model(&types.Node{}).Where("id = ?", node.ID).
+			Update("given_name", name).Error)
+		ids = append(ids, node.ID)
+	}
+
+	require.NoError(t, database.Close())
+
+	for range 2 {
+		s, err := NewState(cfg)
+		require.NoError(t, err)
+
+		for i, id := range ids {
+			node, ok := s.GetNodeByID(id)
+			require.True(t, ok)
+			assert.Equal(t, want[i], node.GivenName())
+
+			row, err := s.db.GetNodeByID(id)
+			require.NoError(t, err)
+			assert.Equal(t, stored[i], row.GivenName,
+				"startup must not write the repair")
+		}
+
+		require.NoError(t, s.Close())
+	}
+}
+
+func TestRegistrationPersistsResolvedGivenName(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	s, err := NewState(persistTestConfig(dbPath))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	user := s.CreateUserForTest("registration-name-user")
+	pak, err := s.CreatePreAuthKey(user.TypedID(), true, false, nil, nil)
+	require.NoError(t, err)
+
+	want := []string{"db", "db-1", "node"}
+	ids := make([]types.NodeID, 0, len(want))
+
+	for i, hostname := range []string{"db", "db", "!!!"} {
+		node, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+			Auth:     &tailcfg.RegisterResponseAuth{AuthKey: pak.Key},
+			NodeKey:  key.NewNode().Public(),
+			Hostinfo: &tailcfg.Hostinfo{Hostname: hostname},
+		}, key.NewMachine().Public())
+		require.NoError(t, err)
+
+		ids = append(ids, node.ID())
+		require.Equal(t, want[i], node.GivenName())
+		row, err := s.db.GetNodeByID(node.ID())
+		require.NoError(t, err)
+		assert.Equal(t, want[i], row.GivenName)
+	}
+
+	require.NoError(t, s.Close())
+
+	reopened := persistTestReopen(t, dbPath)
+	for i, id := range ids {
+		node, ok := reopened.GetNodeByID(id)
+		require.True(t, ok)
+		assert.Equal(t, want[i], node.GivenName())
 	}
 }
 
@@ -438,8 +529,9 @@ func TestReauthPreservesEndpointsWhenClientOmitsThem(t *testing.T) {
 // TestReauthChange covers the decision both re-auth paths share: a keys-only
 // relogin must be an incremental peer patch (so the tailscale client takes its
 // fast patch path), never a whole-node add (which strands a re-keyed,
-// momentarily-endpoint-less peer disco-deaf); a policy change forces a full
-// recompute; a new node is a whole-node add.
+// momentarily-endpoint-less peer disco-deaf); a relogin peers read as before
+// sends nothing; a policy change forces a full recompute; a new node is a
+// whole-node add.
 func TestReauthChange(t *testing.T) {
 	n := types.Node{
 		ID:       7,
@@ -448,24 +540,28 @@ func TestReauthChange(t *testing.T) {
 	}
 	node := n.View()
 
-	relogin := reauthChange(node, true, false)
-	assert.Len(t, relogin.PeerPatches, 1, "relogin must be a peer patch")
-	assert.Empty(t, relogin.PeersChanged, "relogin must not be a whole-node add")
+	keys := reauthChange(node, reloginKeys, false)
+	assert.Len(t, keys.PeerPatches, 1, "relogin must be a peer patch")
+	assert.Empty(t, keys.PeersChanged, "relogin must not be a whole-node add")
 
-	added := reauthChange(node, false, false)
+	assert.True(t, reauthChange(node, reloginNone, false).IsEmpty(),
+		"a relogin peers read as before must send nothing")
+
+	added := reauthChange(node, reloginWhole, false)
 	assert.Empty(t, added.PeerPatches)
 	assert.Len(t, added.PeersChanged, 1, "a new node must be a whole-node add")
 
-	pol := reauthChange(node, true, true)
+	pol := reauthChange(node, reloginKeys, true)
 	assert.Empty(t, pol.PeerPatches, "a policy change must not be a peer patch")
 	assert.Empty(t, pol.PeersChanged)
 	assert.False(t, pol.IsEmpty(), "a policy change must be non-empty")
 }
 
-// TestOnlyKeysChanged covers which relogins may ride the key-rotation patch:
+// TestReloginChanged covers which relogins may ride the key-rotation patch:
 // one that flips Expired or changes Hostinfo peers read must not, as
-// [tailcfg.PeerChange] carries neither (#3531).
-func TestOnlyKeysChanged(t *testing.T) {
+// [tailcfg.PeerChange] carries neither (#3531); one on the same keys and
+// expiry needs nothing at all.
+func TestReloginChanged(t *testing.T) {
 	now := time.Now()
 	past, future := now.Add(-time.Minute), now.Add(time.Hour)
 
@@ -485,20 +581,27 @@ func TestOnlyKeysChanged(t *testing.T) {
 	withOSVersion.OSVersion = "6.1"
 	withService.Services = []tailcfg.Service{{Proto: tailcfg.PeerAPI4, Port: 4242}}
 
+	same := node(future, hi)
+	renewedNode := same.AsStruct()
+	renewedNode.Expiry = new(future.Add(time.Hour))
+	renewed := renewedNode.View()
+
 	tests := []struct {
 		name          string
 		before, after types.NodeView
-		want          bool
+		want          relogin
 	}{
-		{name: "keys", before: node(future, hi), after: node(future, hi), want: true},
-		{name: "hostinfo peers do not read", before: node(future, hi), after: node(future, withOSVersion), want: true},
-		{name: "un-expired", before: node(past, hi), after: node(future, hi)},
-		{name: "hostinfo peers read", before: node(future, hi), after: node(future, withService)},
+		{name: "keys", before: node(future, hi), after: node(future, hi), want: reloginKeys},
+		{name: "hostinfo peers do not read", before: node(future, hi), after: node(future, withOSVersion), want: reloginKeys},
+		{name: "un-expired", before: node(past, hi), after: node(future, hi), want: reloginWhole},
+		{name: "hostinfo peers read", before: node(future, hi), after: node(future, withService), want: reloginWhole},
+		{name: "same keys", before: same, after: same, want: reloginNone},
+		{name: "same keys, new expiry", before: same, after: renewed, want: reloginKeys},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, onlyKeysChanged(tt.before, tt.after, now))
+			assert.Equal(t, tt.want, reloginChanged(tt.before, tt.after, now))
 		})
 	}
 }
@@ -612,6 +715,66 @@ func TestDeleteNodeTwiceReleasesAddressOnce(t *testing.T) {
 	require.ErrorIs(t, err, db.ErrCouldNotAllocateIP)
 }
 
+func TestPersistDuringDeleteDoesNotResurrectNode(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	s.nodeStore.Stop()
+
+	entered, release := make(chan struct{}), make(chan struct{})
+
+	var enteredOnce sync.Once
+
+	s.nodeStore = NewNodeStore(
+		types.Nodes{node.AsStruct()},
+		func(nodes []types.NodeView) map[types.NodeID][]types.NodeID {
+			if len(nodes) == 0 {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+			}
+
+			return nil
+		},
+		TestBatchSize,
+		TestBatchTimeout,
+	)
+	s.nodeStore.Start()
+
+	var releaseOnce sync.Once
+
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	deleteDone := make(chan error, 1)
+
+	go func() {
+		_, err := s.DeleteNode(node)
+		deleteDone <- err
+	}()
+
+	<-entered
+
+	persistDone := make(chan error, 1)
+
+	go func() {
+		_, err := s.persistNode(node)
+		persistDone <- err
+	}()
+
+	select {
+	case err := <-persistDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Error("persist blocked behind the NodeStore delete")
+	}
+
+	_, err := s.db.GetNodeByID(nodeID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-deleteDone)
+}
+
 func TestDeleteNodeKeepsStoreOnDBFailure(t *testing.T) {
 	_, s, nodeID := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
@@ -640,7 +803,19 @@ func TestDeleteNodeKeepsStoreOnDBFailure(t *testing.T) {
 }
 
 func TestDeleteNodeReturnsRemovalOnPolicyFailure(t *testing.T) {
-	_, s, nodeID := persistTestSetup(t)
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("persist-user")
+	nodeID := database.CreateRegisteredNodeForTest(user, "persist-node").ID
+	peerID := database.CreateRegisteredNodeForTest(user, "persist-peer").ID
+
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
 	node, ok := s.GetNodeByID(nodeID)
@@ -660,11 +835,13 @@ func TestDeleteNodeReturnsRemovalOnPolicyFailure(t *testing.T) {
 
 	cs, err := s.DeleteNode(node)
 	require.ErrorIs(t, err, errInjectedPolicyNodeUpdate)
-	require.NotEmpty(t, cs)
-	assert.Equal(t, []types.NodeID{nodeID}, cs[0].PeersRemoved,
-		"a committed deletion must still notify peers and stop the node's session")
+	require.GreaterOrEqual(t, len(cs), 2)
 	assert.Equal(t, []types.NodeID{nodeID}, cs[0].DeletedNodes,
 		"a committed deletion must identify the session to stop")
+	assert.Equal(t, peerID, cs[1].TargetNode,
+		"a committed deletion must still notify peers")
+	assert.Equal(t, []types.NodeID{nodeID}, cs[1].PeersRemoved,
+		"a committed deletion must still notify peers")
 
 	_, ok = s.GetNodeByID(nodeID)
 	assert.False(t, ok, "a committed deletion must remove the in-memory node")
@@ -1206,45 +1383,230 @@ func TestFailedPersistPolicyChangeSurvivesDroppedChange(t *testing.T) {
 		failedC.Type(), retryC.Type())
 }
 
-// TestReloadPolicyReturnsChangesOnAutoApproveFailure covers a policy reload
-// whose route auto-approval fails to persist. The NodeStore write already
-// fed the approved routes to the policy manager, so no later write sees the
-// policy move again; the reload must return its changes with the error for
-// the caller to publish.
-func TestReloadPolicyReturnsChangesOnAutoApproveFailure(t *testing.T) {
-	_, s, nodeID := persistTestSetup(t)
+// TestReloadPolicyOverlappingWrites has a second policy write complete after
+// the reload of the first one loaded its document and before it installs it.
+// The first reload must not put the older document back over the newer one.
+func TestReloadPolicyOverlappingWrites(t *testing.T) {
+	_, s, _ := persistTestSetup(t)
 	t.Cleanup(func() { _ = s.Close() })
 
-	route := netip.MustParsePrefix("10.9.0.0/24")
-	_, ok := s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
-		n.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: []netip.Prefix{route}}
-	})
-	require.True(t, ok)
+	const (
+		first  = `{"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}`
+		second = `{"acls": [{"action": "accept", "src": ["persist-user@"], "dst": ["persist-user@:22"]}]}`
+	)
 
-	_, err := s.db.SetPolicy(`{
-		"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}],
-		"autoApprovers": {"routes": {"10.9.0.0/24": ["persist-user@"]}}
-	}`)
+	_, err := s.SetPolicyInDB(second)
+	require.NoError(t, err)
+	_, err = s.ReloadPolicy()
 	require.NoError(t, err)
 
-	require.NoError(t, s.db.DB.Callback().Update().Before("gorm:update").
-		Register("fail_node_update", func(tx *gorm.DB) {
-			if tx.Statement.Table == "nodes" {
-				_ = tx.AddError(errInjectedNodeUpdate)
+	want, _ := s.Filter()
+
+	_, err = s.SetPolicyInDB(first)
+	require.NoError(t, err)
+
+	var reads atomic.Int32
+
+	written := make(chan struct{})
+
+	require.NoError(t, s.db.DB.Callback().Query().After("gorm:query").
+		Register("write_after_load", func(tx *gorm.DB) {
+			if tx.Statement.Table != "policies" || reads.Add(1) != 1 {
+				return
+			}
+
+			go func() {
+				defer close(written)
+
+				_, err := s.SetPolicyInDB(second)
+				assert.NoError(t, err)
+				_, err = s.ReloadPolicy()
+				assert.NoError(t, err)
+			}()
+
+			// Give the second write time to finish, unless the reload
+			// blocks it.
+			select {
+			case <-written:
+			case <-time.After(200 * time.Millisecond):
 			}
 		}))
-	t.Cleanup(func() { _ = s.db.DB.Callback().Update().Remove("fail_node_update") })
+	t.Cleanup(func() { _ = s.db.DB.Callback().Query().Remove("write_after_load") })
 
-	cs, err := s.ReloadPolicy()
-	require.ErrorIs(t, err, errInjectedNodeUpdate)
+	_, err = s.ReloadPolicy()
+	require.NoError(t, err)
+	<-written
 
-	approved, ok := s.GetNodeByID(nodeID)
-	require.True(t, ok)
-	require.Contains(t, approved.ApprovedRoutes().AsSlice(), route,
-		"the NodeStore holds the approval the database write lost")
+	got, _ := s.Filter()
+	assert.Equal(t, want, got, "the policy in force must be the one stored last")
+}
 
-	assert.True(t, slices.ContainsFunc(cs, func(c change.Change) bool { return c.IncludePolicy }),
-		"the reload must return its policy change with the error: %v", cs)
+// TestUpdatePolicyStoreFailure refuses the write at the database and checks
+// the live policy was not changed by it.
+func TestUpdatePolicyStoreFailure(t *testing.T) {
+	_, s, _ := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	const (
+		open = `{"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}`
+		ssh  = `{"acls": [{"action": "accept", "src": ["persist-user@"], "dst": ["persist-user@:22"]}]}`
+	)
+
+	_, _, err := s.UpdatePolicy([]byte(ssh))
+	require.NoError(t, err)
+
+	before, _ := s.Filter()
+
+	require.NoError(t,
+		s.db.DB.Exec("ALTER TABLE policies RENAME TO policies_away").Error)
+
+	_, _, err = s.UpdatePolicy([]byte(open))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrInvalidPolicy)
+
+	after, _ := s.Filter()
+	assert.Equal(t, before, after, "an unstored policy must not be installed")
+}
+
+// TestPostgresUpdatePolicyConcurrentWrites runs a second write while the
+// first one's insert is not yet committed. Pruning cannot see that row, so
+// unless writers are serialised up to the install, it outlives the newer one.
+func TestPostgresUpdatePolicyConcurrentWrites(t *testing.T) {
+	srv, err := postgrestest.Start(t.Context())
+	if err != nil {
+		t.Skipf("start postgres: %s", err)
+	}
+
+	t.Cleanup(srv.Cleanup)
+
+	dsn, err := srv.CreateDatabase(t.Context())
+	require.NoError(t, err)
+
+	u, err := url.Parse(dsn)
+	require.NoError(t, err)
+
+	pass, _ := u.User.Password()
+	port, err := strconv.Atoi(u.Port())
+	require.NoError(t, err)
+
+	cfg := persistTestConfig("")
+	cfg.Database = types.DatabaseConfig{
+		Type: types.DatabasePostgres,
+		Postgres: types.PostgresConfig{
+			Host: u.Hostname(),
+			Port: port,
+			Name: strings.TrimLeft(u.Path, "/"),
+			User: u.User.Username(),
+			Pass: pass,
+			Ssl:  "disable",
+		},
+	}
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	const (
+		first  = `{"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}`
+		second = `{"acls": [{"action": "accept", "src": ["*"], "dst": ["*:22"]}]}`
+	)
+
+	_, _, err = s.UpdatePolicy([]byte(second))
+	require.NoError(t, err)
+
+	want, _ := s.Filter()
+
+	var creates atomic.Int32
+
+	written := make(chan struct{})
+
+	require.NoError(t, s.db.DB.Callback().Create().After("gorm:create").
+		Register("write_while_storing", func(tx *gorm.DB) {
+			if tx.Statement.Table != "policies" || creates.Add(1) != 1 {
+				return
+			}
+
+			go func() {
+				defer close(written)
+
+				_, _, err := s.UpdatePolicy([]byte(second))
+				assert.NoError(t, err)
+			}()
+
+			// Give the second write time to finish, unless the first
+			// write blocks it.
+			select {
+			case <-written:
+			case <-time.After(200 * time.Millisecond):
+			}
+		}))
+	t.Cleanup(func() {
+		_ = s.db.DB.Callback().Create().Remove("write_while_storing")
+	})
+
+	_, _, err = s.UpdatePolicy([]byte(first))
+	require.NoError(t, err)
+	<-written
+
+	var rows int64
+	require.NoError(t,
+		s.db.DB.Unscoped().Model(&types.Policy{}).Count(&rows).Error)
+	assert.Equal(t, int64(1), rows, "only the current policy may be stored")
+
+	stored, err := s.GetPolicy()
+	require.NoError(t, err)
+	assert.JSONEq(t, second, stored.Data, "the write that ran last is stored")
+
+	got, _ := s.Filter()
+	assert.Equal(t, want, got, "the policy in force must be the one stored")
+}
+
+// TestReloadPolicyEmpty: with no policy configured a reload has nothing to
+// install; an emptied policy file is refused. Both keep the live policy.
+func TestReloadPolicyEmpty(t *testing.T) {
+	const pol = `{"acls": [{"action": "accept", "src": ["persist-user@"], "dst": ["persist-user@:22"]}]}`
+
+	t.Run("no policy configured", func(t *testing.T) {
+		_, s, _ := persistTestSetup(t)
+		t.Cleanup(func() { _ = s.Close() })
+
+		_, err := s.SetPolicy([]byte(pol))
+		require.NoError(t, err)
+
+		before, _ := s.Filter()
+
+		_, err = s.ReloadPolicy()
+		require.NoError(t, err)
+
+		after, _ := s.Filter()
+		assert.Equal(t, before, after)
+	})
+
+	t.Run("empty policy file", func(t *testing.T) {
+		_, s, _ := persistTestSetup(t)
+		t.Cleanup(func() { _ = s.Close() })
+
+		s.cfg.Policy = types.PolicyConfig{
+			Mode: types.PolicyModeFile,
+			Path: filepath.Join(t.TempDir(), "policy.hujson"),
+		}
+
+		require.NoError(t, os.WriteFile(s.cfg.Policy.Path, []byte(pol), 0o600))
+
+		_, err := s.ReloadPolicy()
+		require.NoError(t, err)
+
+		before, _ := s.Filter()
+
+		// os.ReadFile gives an empty, non-nil slice here.
+		require.NoError(t, os.WriteFile(s.cfg.Policy.Path, nil, 0o600))
+
+		_, err = s.ReloadPolicy()
+		require.ErrorIs(t, err, policyv2.ErrPolicyEmpty)
+
+		after, _ := s.Filter()
+		assert.Equal(t, before, after)
+	})
 }
 
 // TestNodeWriteChangeWhenPolicyRefreshFails fails both the NodeStore
@@ -1355,6 +1717,328 @@ func TestBackfillNodeIPsSurvivesConcurrentPersist(t *testing.T) {
 	dbNode, err := s.db.GetNodeByID(nodeID)
 	require.NoError(t, err)
 	assert.Nil(t, dbNode.IPv6, "database kept the removed IPv6 address")
+}
+
+// nameSkipReasons lists checks of [TestNodeNameReplayCompat] where headscale
+// differs from SaaS, keyed <test_id>/<step>/<node or action index>/<check>.
+// A listed check that matches fails, so a fix must delete its entry.
+var nameSkipReasons = map[string]string{
+	"names/N11/pdb/label":   adminNameFollowsHostname,
+	"names/N11/pdb/reopen":  adminNameFollowsHostname,
+	"names/N11b/pdb/label":  adminNameFollowsHostname,
+	"names/N11b/pdb/reopen": adminNameFollowsHostname,
+	"names/N12a/pdb/label":  adminNameFollowsHostname,
+	"names/N12a/pdb/reopen": adminNameFollowsHostname,
+	"names/N12b/pdb/label":  adminNameFollowsHostname,
+	"names/N12b/pdb/reopen": adminNameFollowsHostname,
+	"names/N13/pdb/label":   adminNameFollowsHostname,
+	"names/N13/pdb/reopen":  adminNameFollowsHostname,
+}
+
+const (
+	adminNameFollowsHostname = "ADMIN_NAME_FOLLOWS_HOSTNAME: an admin name equal to the hostname's label counts as derived from it, so a hostname change replaces it; SaaS keeps an admin name across hostname changes"
+)
+
+// TestNodeNameReplayCompat replays the names capture through State: joins by
+// pre-auth key with no map request after them, restarts and hostname changes
+// as map requests, renames and deletes. After each step every device's label
+// must be SaaS's, in the NodeStore and as a restart would load it from the
+// database, since SaaS never changes a label without a cause.
+//
+// Test data source: ../servertest/testdata/steps/names.hujson, loaded by
+// name; TestNodeNameCompat in ../servertest replays it with clients.
+func TestNodeNameReplayCompat(t *testing.T) {
+	c, err := testcapture.Read(filepath.Join("..", "servertest", "testdata", "steps", "names.hujson"))
+	require.NoError(t, err)
+
+	s, err := NewState(persistTestConfig(t.TempDir() + "/headscale.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	// SaaS keys and admin calls act as the tailnet's admin.
+	adminName, _, _ := strings.Cut(c.Tailnet, "@")
+	admin := s.CreateUserForTest(adminName)
+
+	type replayNode struct {
+		id       types.NodeID
+		machine  key.MachinePublic
+		nodeKey  key.NodePublic
+		hostinfo *tailcfg.Hostinfo
+	}
+
+	keys := map[string]string{}
+	nodes := map[string]*replayNode{}
+	evaluated := map[string]bool{}
+
+	for _, step := range c.Steps {
+		outcomes := map[int]string{}
+
+		for i, a := range step.Actions {
+			switch {
+			case a.Kind == "policy":
+				_, err := s.SetPolicy([]byte(strings.ReplaceAll(string(a.Body), c.Tailnet, adminName+"@")))
+				require.NoError(t, err, "%s: policy", step.Name)
+
+			case a.Kind == "api" && a.Method == http.MethodPost && a.Path == "/tailnet/-/keys":
+				var body struct {
+					Capabilities struct {
+						Devices struct {
+							Create struct {
+								Tags []string `json:"tags"`
+							} `json:"create"`
+						} `json:"devices"`
+					} `json:"capabilities"`
+				}
+				require.NoError(t, json.Unmarshal(a.Body, &body), "%s: key body", step.Name)
+
+				pak, err := s.CreatePreAuthKey(admin.TypedID(), true, false, nil, body.Capabilities.Devices.Create.Tags)
+				require.NoError(t, err, "%s: mint %s", step.Name, a.Key)
+
+				keys[a.Key] = pak.Key
+
+			case a.Kind == "join":
+				n := &replayNode{
+					machine:  key.NewMachine().Public(),
+					nodeKey:  key.NewNode().Public(),
+					hostinfo: &tailcfg.Hostinfo{Hostname: a.Hostname},
+				}
+				if a.RequestTags != nil {
+					n.hostinfo.RequestTags = *a.RequestTags
+				}
+
+				nv, _, err := s.HandleNodeFromPreAuthKey(tailcfg.RegisterRequest{
+					Auth:     &tailcfg.RegisterResponseAuth{AuthKey: keys[a.Key]},
+					NodeKey:  n.nodeKey,
+					Hostinfo: n.hostinfo.Clone(),
+				}, n.machine)
+				require.NoError(t, err, "%s: join %s", step.Name, a.Node)
+
+				n.id = nv.ID()
+				nodes[a.Node] = n
+
+			case a.Kind == "restart", a.Kind == "set_hostname":
+				// A restarted tailscaled polls with a new disco key.
+				n := nodes[a.Node]
+				if a.Kind == "set_hostname" {
+					n.hostinfo.Hostname = a.Hostname
+				}
+
+				_, err := s.UpdateNodeFromMapRequest(n.id, tailcfg.MapRequest{
+					NodeKey:  n.nodeKey,
+					DiscoKey: key.NewDisco().Public(),
+					Hostinfo: n.hostinfo.Clone(),
+				})
+				require.NoError(t, err, "%s: %s %s", step.Name, a.Kind, a.Node)
+
+			case a.Kind == "retire", a.Kind == "api" && a.Method == http.MethodDelete:
+				alias := a.Node
+				if alias == "" {
+					alias = captureDeviceAlias(a.Path)
+				}
+
+				nv, ok := s.GetNodeByID(nodes[alias].id)
+				require.True(t, ok, "%s: delete of a missing %s", step.Name, alias)
+
+				_, err := s.DeleteNode(nv)
+				require.NoError(t, err, "%s: delete %s", step.Name, alias)
+
+			case a.Kind == "api" && strings.HasSuffix(a.Path, "/name"):
+				var body struct {
+					Name string `json:"name"`
+				}
+				require.NoError(t, json.Unmarshal(a.Body, &body), "%s: rename body", step.Name)
+
+				_, _, err := s.RenameNode(nodes[captureDeviceAlias(a.Path)].id, body.Name)
+				outcomes[i] = renameOutcome(err == nil)
+
+			case a.Kind == "kill", a.Kind == "wait",
+				a.Kind == "api" && (a.Method == http.MethodGet || strings.HasPrefix(a.Path, "/tailnet/-/dns/")):
+				// A killed daemon only stops polling; reads change nothing,
+				// and DNS comes from the config.
+
+			default:
+				t.Fatalf("%s: no replay for %s %s %s", step.Name, a.Kind, a.Method, a.Path)
+			}
+		}
+
+		devices, ok := captureDevices(t, step)
+		if !ok {
+			continue
+		}
+
+		reopened := reopenLabels(t, s)
+
+		t.Run(step.Name, func(t *testing.T) {
+			prefix := c.TestID + "/" + step.Name + "/"
+
+			var listed, live []string
+
+			for _, d := range devices {
+				alias := captureDeviceAlias(d.ID)
+				n, ok := nodes[alias]
+				require.True(t, ok, "%s never joined", alias)
+
+				listed = append(listed, alias)
+				want, _, _ := strings.Cut(d.Name, ".")
+
+				got := "absent"
+				if nv, ok := s.GetNodeByID(n.id); ok {
+					got = nv.GivenName()
+				}
+
+				reload, ok := reopened[n.id]
+				if !ok {
+					reload = "absent"
+				}
+
+				nameCheck(t, prefix, alias+"/label", want, got, evaluated)
+				nameCheck(t, prefix, alias+"/reopen", want, reload, evaluated)
+			}
+
+			for alias, n := range nodes {
+				if _, ok := s.GetNodeByID(n.id); ok {
+					live = append(live, alias)
+				}
+			}
+
+			slices.Sort(listed)
+			slices.Sort(live)
+			nameCheck(t, prefix, "devices", strings.Join(listed, " "), strings.Join(live, " "), evaluated)
+
+			for _, i := range slices.Sorted(maps.Keys(outcomes)) {
+				want := renameOutcome(step.Actions[i].Status == http.StatusOK)
+				nameCheck(t, prefix, strconv.Itoa(i)+"/outcome", want, outcomes[i], evaluated)
+			}
+		})
+	}
+
+	for k := range nameSkipReasons {
+		if !evaluated[k] {
+			t.Errorf("skip entry %q names no check", k)
+		}
+	}
+}
+
+// nameCheck compares one check against SaaS. A check listed in
+// nameSkipReasons is skipped while it differs and fails once it matches.
+func nameCheck(t *testing.T, prefix, name, want, got string, evaluated map[string]bool) {
+	t.Helper()
+
+	key := prefix + name
+	evaluated[key] = true
+
+	t.Run(name, func(t *testing.T) {
+		reason, listed := nameSkipReasons[key]
+
+		switch {
+		case listed && got == want:
+			t.Errorf("matches SaaS; delete the skip entry %q (%s)", key, reason)
+		case listed:
+			t.Skip(reason)
+		default:
+			assert.Equal(t, want, got)
+		}
+	})
+}
+
+func renameOutcome(accepted bool) string {
+	if accepted {
+		return "accepted"
+	}
+
+	return "refused"
+}
+
+// captureDevices decodes the step's last device-list read.
+func captureDevices(t *testing.T, step testcapture.Step) ([]struct{ ID, Name string }, bool) {
+	t.Helper()
+
+	for _, a := range slices.Backward(step.Actions) {
+		if a.Kind != "api" || a.Method != http.MethodGet || !strings.HasPrefix(a.Path, "/tailnet/-/devices") {
+			continue
+		}
+
+		var out struct {
+			Devices []struct{ ID, Name string } `json:"devices"`
+		}
+		require.NoError(t, json.Unmarshal(a.Response, &out), "%s: %s", step.Name, a.Path)
+
+		return out.Devices, true
+	}
+
+	return nil, false
+}
+
+// captureDeviceAlias extracts x from "{device:x}" or "/device/{device:x}/...".
+func captureDeviceAlias(s string) string {
+	_, rest, _ := strings.Cut(s, "{device:")
+	alias, _, _ := strings.Cut(rest, "}")
+
+	return alias
+}
+
+// reopenLabels returns each node's label as a restart would load it: from a
+// State opened on a copy of s's database.
+func reopenLabels(t *testing.T, s *State) map[types.NodeID]string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "copy.db")
+	require.NoError(t, s.db.DB.Exec("VACUUM INTO ?", path).Error)
+
+	reopened, err := NewState(persistTestConfig(path))
+	require.NoError(t, err)
+
+	defer reopened.Close()
+
+	out := map[types.NodeID]string{}
+	for _, nv := range reopened.ListNodes().All() {
+		out[nv.ID()] = nv.GivenName()
+	}
+
+	return out
+}
+
+// TestBringNodeExpiryForwardDecidesInWriter: a client's earlier expiry is
+// checked against the node as the writer holds it, so an admin expiry that
+// lands after the caller read the node is not pushed back, and a node key
+// the node no longer holds changes nothing.
+func TestBringNodeExpiryForwardDecidesInWriter(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	read, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	_, _, err := s.SetNodeExpiry(nodeID, nil)
+	require.NoError(t, err)
+
+	soon := time.Now().Add(time.Hour).Truncate(time.Second)
+	node, _, err := s.BringNodeExpiryForward(nodeID, read.NodeKey(), soon)
+	require.NoError(t, err)
+	require.True(t, node.Expiry().Valid(), "an earlier expiry turns expiry on")
+	assert.True(t, soon.Equal(node.Expiry().Get()))
+
+	_, _, err = s.BringNodeExpiryForward(nodeID, read.NodeKey(), soon.Add(time.Minute))
+	require.ErrorIs(t, err, ErrExpiryExtension, "a later expiry")
+
+	_, _, err = s.BringNodeExpiryForward(nodeID, key.NewNode().Public(), soon.Add(-time.Minute))
+	require.ErrorIs(t, err, ErrExpiryExtension, "another node key")
+
+	past := time.Now().Add(-time.Minute).Truncate(time.Second)
+	_, _, err = s.SetNodeExpiry(nodeID, &past)
+	require.NoError(t, err)
+
+	_, _, err = s.BringNodeExpiryForward(nodeID, read.NodeKey(), soon.Add(-time.Minute))
+	require.ErrorIs(t, err, ErrExpiryExtension, "the admin expiry is earlier")
+
+	current, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.True(t, current.IsExpired(), "the admin expiry stands")
+
+	stored, err := s.db.GetNodeByID(nodeID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.Expiry)
+	assert.True(t, past.Equal(*stored.Expiry))
 }
 
 // TestSetNodeExpiryRejectsUnencodableExpiry proves an admin cannot store a key
@@ -1791,4 +2475,349 @@ func TestReauthReplacesReportedTags(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, want, row.Hostinfo.RequestTags)
 	}
+}
+
+func TestUpdateUserClearsColumns(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	userID := types.UserID(node.UserID().Get())
+	_, _, err := s.UpdateUser(userID, func(user *types.User) error {
+		user.DisplayName = "Display"
+		user.Email = "persist@example.com"
+		user.ProfilePicURL = "https://example.com/picture"
+
+		return nil
+	})
+	require.NoError(t, err)
+	_, _, err = s.RenameUser(userID, "renamed")
+	require.NoError(t, err)
+	user, err := s.GetUserByID(userID)
+	require.NoError(t, err)
+	assert.Equal(t, "Display", user.DisplayName)
+	assert.Equal(t, "persist@example.com", user.Email)
+	assert.Equal(t, "https://example.com/picture", user.ProfilePicURL)
+	_, _, err = s.UpdateUser(userID, func(user *types.User) error {
+		user.DisplayName = ""
+		user.Email = ""
+		user.ProfilePicURL = ""
+
+		return nil
+	})
+	require.NoError(t, err)
+	user, err = s.GetUserByID(userID)
+	require.NoError(t, err)
+	assert.Empty(t, user.DisplayName)
+	assert.Empty(t, user.Email)
+	assert.Empty(t, user.ProfilePicURL)
+	assert.Equal(t, "renamed", user.Name)
+}
+
+func TestUpdateUserRefreshesNodeCopies(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	original, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	userID := types.UserID(original.UserID().Get())
+	user, err := s.GetUserByID(userID)
+	require.NoError(t, err)
+
+	_, ok = s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+		n.AuthKey = &types.Credential{ID: 1, UserID: new(user.ID), User: user.Clone()}
+	})
+	require.True(t, ok)
+
+	tagged := s.nodeStore.PutNode(types.Node{
+		ID: nodeID + 1, Hostname: "tagged", Tags: []string{"tag:server"},
+		MachineKey: key.NewMachine().Public(), NodeKey: key.NewNode().Public(),
+		AuthKey: &types.Credential{ID: 2, UserID: new(user.ID), User: user.Clone()},
+	})
+	other, _, err := s.CreateUser(types.User{Name: "other"})
+	require.NoError(t, err)
+
+	otherNode := s.nodeStore.PutNode(types.Node{
+		ID: nodeID + 2, Hostname: "other", UserID: new(other.ID), User: other.Clone(),
+		MachineKey: key.NewMachine().Public(), NodeKey: key.NewNode().Public(),
+		AuthKey: &types.Credential{ID: 3, UserID: new(other.ID), User: other.Clone()},
+	})
+	before, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	_, c, err := s.RenameUser(userID, "renamed-user")
+	require.NoError(t, err)
+	assert.True(t, c.IncludeSelf)
+	assert.True(t, c.SendAllPeers)
+
+	updated, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Equal(t, "renamed-user", updated.User().Name())
+	assert.Equal(t, "renamed-user", updated.AuthKey().User().Name())
+	assert.Equal(t, "persist-user", before.User().Name())
+	assert.Equal(t, "persist-user", before.AuthKey().User().Name())
+
+	updatedTagged, ok := s.GetNodeByID(tagged.ID())
+	require.True(t, ok)
+	assert.True(t, updatedTagged.IsTagged())
+	assert.Equal(t, "renamed-user", updatedTagged.AuthKey().User().Name())
+	assert.Equal(t, "persist-user", tagged.AuthKey().User().Name())
+
+	unchanged, ok := s.GetNodeByID(otherNode.ID())
+	require.True(t, ok)
+	assert.Equal(t, "other", unchanged.User().Name())
+	assert.Equal(t, "other", unchanged.AuthKey().User().Name())
+
+	snapshot := s.nodeStore.data.Load()
+	_, c, err = s.RenameUser(userID, "renamed-user")
+	require.NoError(t, err)
+	assert.True(t, c.IsEmpty())
+	assert.Same(t, snapshot, s.nodeStore.data.Load(), "an unchanged user must not rebuild the snapshot")
+
+	_, c, err = s.UpdateUser(userID, func(user *types.User) error {
+		user.Provider = "updated-provider"
+		return nil
+	})
+	require.NoError(t, err)
+	assert.True(t, c.IsEmpty(), "a non-profile column does not need a full map update")
+
+	updated, ok = s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Equal(t, "updated-provider", updated.User().Provider())
+	assert.Equal(t, "updated-provider", updated.AuthKey().User().Provider())
+}
+
+type blockingSetUsersPolicyManager struct {
+	policy.PolicyManager
+
+	blocked atomic.Bool
+	reached chan struct{}
+	resume  <-chan struct{}
+	last    []types.User
+}
+
+func (pm *blockingSetUsersPolicyManager) SetUsers(users []types.User) (bool, bool, error) {
+	if !pm.blocked.Swap(true) {
+		close(pm.reached)
+		<-pm.resume
+	}
+
+	pm.last = users
+
+	return pm.PolicyManager.SetUsers(users)
+}
+
+func TestUpdateUserPublishesInOrder(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	user := node.User().AsStruct()
+	userID := types.UserID(user.ID)
+	_, ok = s.nodeStore.UpdateNode(nodeID, func(n *types.Node) {
+		n.AuthKey = &types.Credential{ID: 1, UserID: new(user.ID), User: user.Clone()}
+	})
+	require.True(t, ok)
+
+	resume := make(chan struct{})
+
+	releaseFirst := sync.OnceFunc(func() { close(resume) })
+	defer releaseFirst()
+
+	pm := &blockingSetUsersPolicyManager{
+		PolicyManager: s.polMan,
+		reached:       make(chan struct{}),
+		resume:        resume,
+	}
+	s.polMan = pm
+
+	update := func(name string) error {
+		_, _, err := s.UpdateUser(userID, func(u *types.User) error {
+			u.Name = name
+			u.Email = name + "@example.com"
+			u.DisplayName = name + " display"
+			u.ProfilePicURL = "https://example.com/" + name
+
+			return nil
+		})
+
+		return err
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- update("first-user") }()
+
+	// The first update pauses after its commit, inside the policy user update.
+	<-pm.reached
+
+	var secondErr error
+
+	secondDone := make(chan struct{})
+
+	go func() {
+		secondErr = update("latest-user")
+
+		close(secondDone)
+	}()
+
+	// Give the second update time to overtake the paused first one.
+	select {
+	case <-secondDone:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseFirst()
+	require.NoError(t, <-firstDone)
+	<-secondDone
+	require.NoError(t, secondErr)
+
+	stored, err := s.GetUserByID(userID)
+	require.NoError(t, err)
+	assert.Equal(t, "latest-user", stored.Name)
+
+	require.Len(t, pm.last, 1)
+	assert.Equal(t, stored.Name, pm.last[0].Name, "policy users must follow the database")
+
+	updated, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Equal(t, stored.Name, updated.User().Name())
+	assert.Equal(t, stored.Name, updated.AuthKey().User().Name())
+	assert.Equal(t, stored.TailscaleUserProfile(), updated.User().TailscaleUserProfile())
+	assert.Equal(t, stored.TailscaleUserProfile(), updated.AuthKey().User().TailscaleUserProfile())
+}
+
+func TestUserListPublishesInOrder(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	resume := make(chan struct{})
+
+	releaseFirst := sync.OnceFunc(func() { close(resume) })
+	defer releaseFirst()
+
+	pm := &blockingSetUsersPolicyManager{
+		PolicyManager: s.polMan,
+		reached:       make(chan struct{}),
+		resume:        resume,
+	}
+	s.polMan = pm
+
+	createDone := make(chan error, 1)
+
+	go func() {
+		_, _, err := s.CreateUser(types.User{Name: "created-user"})
+		createDone <- err
+	}()
+
+	// The creation pauses holding a user list read before the rename commits.
+	<-pm.reached
+
+	var renameErr error
+
+	renameDone := make(chan struct{})
+
+	go func() {
+		_, _, renameErr = s.RenameUser(types.UserID(node.User().ID()), "renamed-user")
+
+		close(renameDone)
+	}()
+
+	select {
+	case <-renameDone:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseFirst()
+	require.NoError(t, <-createDone)
+	<-renameDone
+	require.NoError(t, renameErr)
+
+	names := make([]string, 0, len(pm.last))
+	for _, user := range pm.last {
+		names = append(names, user.Name)
+	}
+
+	assert.ElementsMatch(t, []string{"renamed-user", "created-user"}, names,
+		"policy users must follow the database")
+}
+
+var errSetUsersTest = errors.New("set users failed")
+
+type failingSetUsersPolicyManager struct {
+	policy.PolicyManager
+}
+
+func (failingSetUsersPolicyManager) SetUsers([]types.User) (bool, bool, error) {
+	return false, false, errSetUsersTest
+}
+
+func TestUpdateUserRefreshesNodeCopiesWhenPolicyUpdateFails(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	node, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+
+	s.polMan = failingSetUsersPolicyManager{PolicyManager: s.polMan}
+
+	_, _, err := s.RenameUser(types.UserID(node.User().ID()), "renamed-user")
+	require.ErrorIs(t, err, errSetUsersTest)
+
+	updated, ok := s.GetNodeByID(nodeID)
+	require.True(t, ok)
+	assert.Equal(t, "renamed-user", updated.User().Name(),
+		"the committed row and its cached copy must agree")
+}
+
+func TestUserNameCollisionDoesNotBlockCreationOrRestart(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := persistTestConfig(dbPath)
+	database, err := db.NewHeadscaleDatabase(cfg)
+	require.NoError(t, err)
+
+	user := database.CreateUserForTest("dup")
+	node := database.CreateRegisteredNodeForTest(user, "duplicate-name-node")
+	_, err = database.SetPolicy(`{
+		"acls": [],
+		"nodeAttrs": [{"target":["dup@"], "attr":["randomize-client-port"]}]
+	}`)
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if s != nil {
+			_ = s.Close()
+		}
+	})
+	require.NotEmpty(t, s.polMan.NodeCapMap(node.ID))
+
+	created, _, err := s.CreateUser(types.User{
+		Name:               "dup",
+		Provider:           "oidc",
+		ProviderIdentifier: sql.NullString{String: "https://idp.example/second", Valid: true},
+	})
+	require.NoError(t, err, "a colliding user must not prevent user creation")
+	require.NotNil(t, created)
+
+	_, _, err = s.CreateUser(types.User{Name: "later"})
+	require.NoError(t, err, "a previous collision must not prevent later user creation")
+	assert.Empty(t, s.polMan.NodeCapMap(node.ID))
+	require.NoError(t, s.Close())
+	s = nil
+
+	reopened := persistTestReopen(t, dbPath)
+	users, err := reopened.ListAllUsers()
+	require.NoError(t, err)
+	require.Len(t, users, 3)
+	require.Empty(t, reopened.polMan.NodeCapMap(node.ID))
 }

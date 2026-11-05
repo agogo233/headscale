@@ -224,21 +224,25 @@ func TestAPIV1AuthListPending(t *testing.T) {
 		h := newAPIV1Harness(t)
 
 		authID := types.MustAuthID()
-		// seedAuthRequest creates the user (id 1) and the cached request.
-		seedAuthRequest("alice", authID,
-			key.NewMachine().Public(), key.NewNode().Public(), key.NewDisco().Public(),
-			"pending-node",
-		)(t, h.app)
+		h.app.state.CreateUserForTest("alice")
 
-		// Attach the resolved OIDC identity so the list item carries a user.
-		req, ok := h.app.state.GetAuthCacheEntry(authID)
-		require.True(t, ok)
-		req.SetPendingConfirmation(&types.PendingRegistrationConfirmation{UserID: 1})
-		req.RegistrationData().Hostinfo = &tailcfg.Hostinfo{
-			OS:          "linux",
-			OSVersion:   "6.1.0",
-			RoutableIPs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
+		// The registration payload is serialized when the request enters the
+		// cache, so the hostinfo must be part of the seeded data.
+		regData := &types.RegistrationData{
+			MachineKey: key.NewMachine().Public(),
+			NodeKey:    key.NewNode().Public(),
+			DiscoKey:   key.NewDisco().Public(),
+			Hostname:   "pending-node",
+			Hostinfo: &tailcfg.Hostinfo{
+				Hostname:    "pending-node",
+				OS:          "linux",
+				OSVersion:   "6.1.0",
+				RoutableIPs: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
+			},
 		}
+		req := types.NewRegisterAuthRequest(regData)
+		req.SetPendingConfirmation(&types.PendingRegistrationConfirmation{UserID: 1})
+		require.NoError(t, h.app.state.SetAuthCacheEntry(authID, req))
 
 		res := h.callHuma(http.MethodGet, "/api/v1/auth/pending", nil)
 		require.Equal(t, http.StatusOK, res.status)

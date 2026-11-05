@@ -407,7 +407,7 @@ func TestChange_IsBroadcastPolicyChange(t *testing.T) {
 		want bool
 	}{
 		{name: "policy change", c: PolicyChange(), want: true},
-		{name: "self-update recompute", c: originUpdate, want: false},
+		{name: "self-update recompute", c: originUpdate, want: true},
 		{name: "targeted recompute", c: targeted, want: false},
 		{name: "online patch", c: NodeOnline(1), want: false},
 		{name: "full update", c: FullUpdate(), want: false},
@@ -422,9 +422,9 @@ func TestChange_IsBroadcastPolicyChange(t *testing.T) {
 }
 
 func TestDedupePolicyChanges(t *testing.T) {
-	// originRecompute is a runtime recompute carrying node-specific payload
-	// (OriginNode), so it is not the canonical broadcast PolicyChange and must
-	// never be coalesced away.
+	// originRecompute is a runtime recompute stamped with the node that caused
+	// it, as a tag write returns it. The mapper renders it like any other
+	// recompute, so it must coalesce like any other.
 	originRecompute := PolicyChange()
 	originRecompute.OriginNode = 7
 
@@ -451,10 +451,10 @@ func TestDedupePolicyChanges(t *testing.T) {
 		{
 			name: "peer patches survive between collapsed policy changes",
 			changes: []Change{
-				NodeOnline(1), PolicyChange(), NodeOnline(2), PolicyChange(), NodeOffline(3),
+				NodeOnline(1), PolicyChange(), NodeOnline(2), PolicyChange(), NodeOffline(3, time.Time{}),
 			},
 			want: []Change{
-				NodeOnline(1), PolicyChange(), NodeOnline(2), NodeOffline(3),
+				NodeOnline(1), PolicyChange(), NodeOnline(2), NodeOffline(3, time.Time{}),
 			},
 		},
 		{
@@ -463,14 +463,14 @@ func TestDedupePolicyChanges(t *testing.T) {
 			want:    []Change{PolicyChange(), NodeAdded(5)},
 		},
 		{
-			name:    "recompute carrying OriginNode is kept alongside the canonical one",
+			name:    "recompute carrying OriginNode collapses into the canonical one",
 			changes: []Change{PolicyChange(), originRecompute, PolicyChange()},
-			want:    []Change{PolicyChange(), originRecompute},
+			want:    []Change{PolicyChange()},
 		},
 		{
-			name:    "non-canonical recomputes are not collapsed",
+			name:    "recomputes carrying OriginNode collapse to one",
 			changes: []Change{originRecompute, originRecompute},
-			want:    []Change{originRecompute, originRecompute},
+			want:    []Change{originRecompute},
 		},
 		{
 			name:    "changes without any recompute are unchanged",
@@ -514,8 +514,8 @@ func TestCoalescePeerDeltas(t *testing.T) {
 		},
 		{
 			name:    "patches for peers sent whole are dropped, others kept in order",
-			changes: []Change{NodeOnline(4), NodeAdded(2), NodeOffline(4), NodeOnline(2)},
-			want:    []Change{merged([]types.NodeID{2}, patch(NodeOnline(4)), patch(NodeOffline(4)))},
+			changes: []Change{NodeOnline(4), NodeAdded(2), NodeOffline(4, time.Time{}), NodeOnline(2)},
+			want:    []Change{merged([]types.NodeID{2}, patch(NodeOnline(4)), patch(NodeOffline(4, time.Time{})))},
 		},
 		{
 			name: "runs do not cross other changes",
@@ -529,7 +529,7 @@ func TestCoalescePeerDeltas(t *testing.T) {
 		{
 			name: "deletions fold into one removal ahead of the tick",
 			changes: []Change{
-				NodeAdded(2), NodeRemoved(5), NodeOnline(3), PolicyChange(), NodeRemoved(4), NodeAdded(6),
+				NodeAdded(2), NodeRemoved(5, self)[1], NodeOnline(3), PolicyChange(), NodeRemoved(4, self)[1], NodeAdded(6),
 			},
 			want: []Change{
 				{Reason: "node removed", PeersRemoved: []types.NodeID{4, 5}, DeletedNodes: []types.NodeID{4, 5}},
@@ -622,7 +622,7 @@ func TestCoalescePeerDeltasHoistsOnlyDeletions(t *testing.T) {
 			want, ok := hoists[field.Name]
 			require.True(t, ok, "field %s is not classified", field.Name)
 
-			c := NodeRemoved(2)
+			c := NodeRemoved(2, self)[1]
 			setNonZero(t, reflect.ValueOf(&c).Elem().FieldByIndex(field.Index), self)
 
 			assert.Equal(t, want, c.isDeletion())
@@ -710,10 +710,21 @@ func TestPeersRemoved(t *testing.T) {
 }
 
 func TestNodeRemoved(t *testing.T) {
-	r := NodeRemoved(42)
-	assert.Equal(t, "node removed", r.Reason)
-	assert.Equal(t, []types.NodeID{42}, r.PeersRemoved)
-	assert.Equal(t, []types.NodeID{42}, r.DeletedNodes)
+	rs := NodeRemoved(42, 7, 9)
+	require.Len(t, rs, 3)
+	assert.Equal(t, "node removed", rs[0].Reason)
+	assert.Equal(t, types.NodeID(42), rs[0].TargetNode,
+		"the teardown reaches no other node")
+	assert.Empty(t, rs[0].PeersRemoved)
+	assert.Equal(t, []types.NodeID{42}, rs[0].DeletedNodes)
+
+	for i, peer := range []types.NodeID{7, 9} {
+		assert.Equal(t, peer, rs[i+1].TargetNode)
+		assert.Equal(t, []types.NodeID{42}, rs[i+1].PeersRemoved)
+		assert.Equal(t, []types.NodeID{42}, rs[i+1].DeletedNodes,
+			"a peer's removal folds with the tick's other deletions")
+		assert.True(t, rs[i+1].isDeletion())
+	}
 }
 
 func TestPeerPatched(t *testing.T) {
@@ -929,13 +940,16 @@ func TestNodeOnlineOfflineForSubnetRouter(t *testing.T) {
 	view := router.View()
 	require.True(t, view.IsSubnetRouter(), "test node must be a subnet router")
 
+	seen := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC)
+
 	tests := []struct {
 		name       string
 		got        Change
 		wantOnline bool
+		wantSeen   *time.Time
 	}{
 		{name: "online", got: NodeOnline(view.ID()), wantOnline: true},
-		{name: "offline", got: NodeOffline(view.ID()), wantOnline: false},
+		{name: "offline", got: NodeOffline(view.ID(), seen), wantOnline: false, wantSeen: &seen},
 	}
 
 	for _, tt := range tests {
@@ -954,6 +968,7 @@ func TestNodeOnlineOfflineForSubnetRouter(t *testing.T) {
 
 			require.NotNil(t, patch.Online)
 			assert.Equal(t, tt.wantOnline, *patch.Online)
+			assert.Equal(t, tt.wantSeen, patch.LastSeen)
 		})
 	}
 }
