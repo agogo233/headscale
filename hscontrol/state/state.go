@@ -1413,7 +1413,7 @@ func (s *State) validateNodeIPv4(ip netip.Addr) error {
 		return fmt.Errorf("%w: %s is not an IPv4 address", ErrNodeIPv4Invalid, ip)
 	}
 
-	prefix := s.cfg.PrefixV4
+	prefix := s.cfg.Prefixes.V4
 	if prefix == nil {
 		return fmt.Errorf("%w: no IPv4 prefix is configured", ErrNodeIPv4Invalid)
 	}
