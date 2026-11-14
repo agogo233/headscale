@@ -12,6 +12,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/netmap"
@@ -1081,6 +1082,73 @@ func TestGrantViaExitNodeInternetVisibility(t *testing.T) {
 			}
 
 			return false
+		})
+}
+
+// TestGrantViaTwoExitGrantsWithACL verifies that a viewer matching two
+// via exit grants with different tags sees both exit nodes, even when a
+// non-via rule from the same viewer overlaps the exit routes. An exit
+// node no via grant names stays hidden.
+func TestGrantViaTwoExitGrantsWithACL(t *testing.T) {
+	t.Parallel()
+
+	srv := servertest.NewServer(t)
+	alice := srv.CreateUser(t, "alice")
+
+	changed, err := srv.State().SetPolicy([]byte(`{
+		"groups": {"group:eng": ["alice@"]},
+		"tagOwners": {"tag:exit-a": [], "tag:exit-b": [], "tag:exit-c": []},
+		"grants": [
+			{
+				"src": ["group:eng"],
+				"dst": ["autogroup:internet"],
+				"ip": ["*"],
+				"via": ["tag:exit-a"]
+			},
+			{
+				"src": ["autogroup:member"],
+				"dst": ["autogroup:internet"],
+				"ip": ["*"],
+				"via": ["tag:exit-b"]
+			}
+		],
+		"acls": [
+			{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:exit-b:*"]},
+			{"action": "accept", "src": ["group:eng"], "dst": ["tag:exit-a:*"]},
+			{"action": "accept", "src": ["autogroup:member"], "dst": ["tag:exit-c:*"]}
+		]
+	}`))
+	require.NoError(t, err)
+
+	if changed {
+		changes, err := srv.State().ReloadPolicy()
+		require.NoError(t, err)
+		srv.App.Change(changes...)
+	}
+
+	laptop := servertest.NewClient(t, srv, "alice-laptop",
+		servertest.WithUser(alice))
+
+	// exit-c first, so its routes are out before the condition can hold.
+	for _, name := range []string{"exit-c", "exit-a", "exit-b"} {
+		exit := servertest.NewClient(t, srv, name,
+			servertest.WithUser(alice),
+			servertest.WithTags("tag:"+name))
+		advertiseRoutes(t, exit, tsaddr.ExitRoutes())
+
+		_, routeChange, err := srv.State().SetApprovedRoutes(
+			findNodeID(t, srv, name), tsaddr.ExitRoutes())
+		require.NoError(t, err)
+		srv.App.Change(routeChange)
+	}
+
+	laptop.WaitForCondition(t, "alice-laptop sees exit-a and exit-b as exit nodes, not exit-c",
+		15*time.Second,
+		func(nm *netmap.NetworkMap) bool {
+			_, seesC := peerByHostname(nm, "exit-c")
+
+			return peerOffersExit("exit-a")(nm) && peerOffersExit("exit-b")(nm) &&
+				seesC && !peerOffersExit("exit-c")(nm)
 		})
 }
 

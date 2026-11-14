@@ -199,6 +199,10 @@ func (h *Headscale) NoiseUpgradeHandler(
 		r.Route("/webclient", func(r chi.Router) {})
 
 		r.Post("/c2n", ns.NotImplementedHandler)
+
+		// c2n response endpoint: receives the HTTP response a node produced for a
+		// c2n [tailcfg.PingRequest]. Only the target node's Noise session may answer.
+		r.Post("/c2n-response", ns.C2NResponseHandler)
 	})
 
 	// Serve returns once the listener is drained; the connection outlives it.
@@ -319,6 +323,63 @@ func (ns *noiseServer) NotImplementedHandler(writer http.ResponseWriter, req *ht
 // so this is a no-op that discards the body and returns 204.
 func (ns *noiseServer) UpdateHealthHandler(writer http.ResponseWriter, req *http.Request) {
 	io.Copy(io.Discard, req.Body)
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+// maxC2NResponseBytes bounds the c2n response body a node may send. The
+// responses headscale asks for are small JSON documents.
+const maxC2NResponseBytes = 64 << 10
+
+// C2NResponseHandler handles the POST a node makes with the HTTP response
+// to a c2n [tailcfg.PingRequest]. The c2n ID is unguessable, and the
+// response is only accepted over the Noise session of the node the
+// request was sent to.
+func (ns *noiseServer) C2NResponseHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	c2nID := req.URL.Query().Get("id")
+	if c2nID == "" {
+		http.Error(writer, "missing c2n ID", http.StatusBadRequest)
+		return
+	}
+
+	nodeID, ok := ns.headscale.state.C2NTarget(c2nID)
+	if !ok {
+		http.Error(writer, "unknown or expired c2n request", http.StatusNotFound)
+		return
+	}
+
+	nv, ok := ns.headscale.state.GetNodeByID(nodeID)
+	if !ok {
+		httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", nil))
+		return
+	}
+
+	err := machineKeyMismatch(nv, ns.machineKey)
+	if err != nil {
+		httpError(writer, err)
+		return
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(writer, req.Body, maxC2NResponseBytes))
+	if err != nil {
+		status := http.StatusBadRequest
+
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			status = http.StatusRequestEntityTooLarge
+		}
+
+		httpError(writer, NewHTTPError(status, "reading c2n response", err))
+
+		return
+	}
+
+	if !ns.headscale.state.CompleteC2N(c2nID, body) {
+		http.Error(writer, "unknown or expired c2n request", http.StatusNotFound)
+		return
+	}
+
 	writer.WriteHeader(http.StatusNoContent)
 }
 
@@ -765,35 +826,12 @@ func (ns *noiseServer) PollNetMapHandler(
 
 	nv, err := ns.getAndValidateNode(mapRequest)
 	if err != nil {
-		// The node is gone, but the client does not know that. Tailscale
-		// clients treat every non-200 on the map path the same way and retry
-		// forever with loggedIn still set; only a self node whose KeyExpiry is
-		// in the past drives them to NeedsLogin. There is no MapResponse field
-		// that says "deleted", so reuse the expiry signal headscale already
-		// sends for expired nodes.
-		// See: https://github.com/juanfont/headscale/issues/3410
-		if errors.Is(err, errNodeNotInStore) && mapRequest.Stream {
-			expired := &tailcfg.MapResponse{
-				Node: &tailcfg.Node{
-					Key: mapRequest.NodeKey,
-					// Zero means that the key does not expire. Use a fixed,
-					// ancient non-zero value so this remains expired even when
-					// the client's clock is substantially behind the server.
-					KeyExpiry: time.Unix(1, 0).UTC(),
-					Expired:   true,
-				},
-				// This frame opens the stream in place of the initial map.
-				Debug: ns.headscale.cfg.TailcfgDebug(),
-			}
-
-			err = writeMapResponse(writer, mapRequest.Compress, true, expired)
-			if err != nil {
-				log.Error().Caller().Err(err).Msg("noise map handler: failed to write expired response for deleted node")
-			}
-
-			return
-		}
-
+		// A deleted node gets a bare 404, as Tailscale's control server sends;
+		// clients since 1.106 read it as removal and go to NeedsLogin. Do not
+		// answer with a netmap: clients reset their map backoff on every netmap,
+		// so one followed by the end of the stream is retried within
+		// milliseconds, forever.
+		// See: https://github.com/juanfont/headscale/issues/3688
 		httpError(writer, err)
 
 		return
@@ -834,6 +872,8 @@ func (ns *noiseServer) PollNetMapHandler(
 	// A repeated JSON key can leave a short slice backed by a larger array.
 	mapRequest.Hostinfo = mapRequest.Hostinfo.Clone()
 	mapRequest.DebugFlags = nil
+
+	ns.recordLastControlAddress(nv, req.RemoteAddr)
 
 	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, nv)
 	sess.log.Trace().Caller().Msg("a node sending a MapRequest with Noise protocol")
@@ -877,7 +917,7 @@ func (ns *noiseServer) SetDNSHandler(writer http.ResponseWriter, req *http.Reque
 
 	nv, ok := ns.headscale.state.GetNodeByNodeKey(setDNS.NodeKey)
 	if !ok {
-		httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", errNodeNotInStore))
+		httpError(writer, NewHTTPError(http.StatusNotFound, "node not found", nil))
 
 		return
 	}
@@ -1028,6 +1068,16 @@ func (ns *noiseServer) RegistrationHandler(
 
 		resp, err := ns.headscale.handleRegister(req.Context(), registerRequest, ns.machineKey)
 		if err != nil {
+			// The client only retries, so this is the operator's one sign of a refused node.
+			e := log.Warn().Err(err).
+				Str(zf.MachineKey, ns.machineKey.ShortString()).
+				Str(zf.NodeKey, registerRequest.NodeKey.ShortString())
+			if registerRequest.Hostinfo != nil {
+				e = e.Str(zf.Hostname, registerRequest.Hostinfo.Hostname)
+			}
+
+			e.Msg("registration refused")
+
 			if httpErr, ok := errors.AsType[HTTPError](err); ok {
 				// Keep permanent errors in HTTP 200 so controlclient surfaces RegisterResponse.Error.
 				if httpErr.Code == http.StatusServiceUnavailable {
@@ -1062,17 +1112,14 @@ func (ns *noiseServer) RegistrationHandler(
 	}
 }
 
-// errNodeNotInStore distinguishes an unknown NodeKey from a NodeKey presented
-// by the wrong machine key. Both are answered with 404, but only the former
-// means the node is gone and its client should re-authenticate.
-var errNodeNotInStore = errors.New("node not found")
-
 // getAndValidateNode retrieves the node from the in-memory NodeStore using the
 // NodeKey and validates that it matches the MachineKey from the Noise session.
+// Its 404s end a client's session: clients read a map 404 as removal from the
+// tailnet, so a node that still exists must never be answered with one.
 func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
 	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)
 	if !ok {
-		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", errNodeNotInStore)
+		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", nil)
 	}
 
 	// Validate that the MachineKey in the Noise session matches the one associated with the NodeKey.
@@ -1081,4 +1128,19 @@ func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.
 	}
 
 	return nv, nil
+}
+
+// recordLastControlAddress stores the outer request's resolved client address
+// once the node's keys are validated. Failing to store it must not fail the
+// poll.
+func (ns *noiseServer) recordLastControlAddress(node types.NodeView, remoteAddr string) {
+	addr, ok := parsePeerAddr(remoteAddr)
+	if !ok {
+		return
+	}
+
+	err := ns.headscale.state.SetLastControlAddress(node.ID(), addr)
+	if err != nil {
+		log.Error().Err(err).EmbedObject(node).Msg("could not persist node control connection address")
+	}
 }

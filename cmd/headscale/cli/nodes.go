@@ -55,6 +55,10 @@ func init() {
 	nodeCmd.AddCommand(approveRoutesCmd)
 
 	nodeCmd.AddCommand(backfillNodeIPsCmd)
+
+	updateClientCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
+	mustMarkRequired(updateClientCmd, "identifier")
+	nodeCmd.AddCommand(updateClientCmd)
 }
 
 var nodeCmd = &cobra.Command{
@@ -256,6 +260,46 @@ var renameNodeCmd = &cobra.Command{
 
 		return printOutput(cmd, resp.JSON200.Node, "Node renamed")
 	}),
+}
+
+// updateClientTimeout outlasts the server's wait for the node's answer,
+// which the default cli.timeout does not.
+const updateClientTimeout = 15 * time.Second
+
+var updateClientCmd = &cobra.Command{
+	Use:   "update-client",
+	Short: "Update the Tailscale client of a connected node",
+	Long: `Ask a connected node to update its Tailscale client to the newest
+release on its track.
+
+The node must allow remote updates ("tailscale set --auto-update") on a
+platform that can update itself. As on Tailscale, a node that does not,
+is not connected, or refuses is answered "not found".
+The command returns once the update has started, not when it has finished.`,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		identifier, _ := cmd.Flags().GetUint64("identifier")
+
+		_, client, cancel, err := newV2Client()
+		if err != nil {
+			return err
+		}
+		defer cancel()
+
+		ctx, cancelWait := context.WithTimeout(context.Background(), updateClientTimeout)
+		defer cancelWait()
+
+		resp, err := client.UpdateDeviceClientWithResponse(ctx, strconv.FormatUint(identifier, util.Base10))
+		if err != nil {
+			return fmt.Errorf("updating node client: %w", err)
+		}
+
+		err = v2Error(resp.HTTPResponse.StatusCode, resp.Body)
+		if err != nil {
+			return err
+		}
+
+		return printOutput(cmd, struct{}{}, "Client update started")
+	},
 }
 
 var deleteNodeCmd = &cobra.Command{

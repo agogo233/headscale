@@ -3,10 +3,13 @@ version: 2
 before:
   hooks:
     - go mod vendor
+    - bash tools/release-generate.sh
 
 release:
   prerelease: auto
   draft: true
+  extra_files:
+    - glob: ./release-assets/headscale-nixos-options.nix
   header: |
     ## Upgrade
 
@@ -26,6 +29,8 @@ builds:
       - linux_arm64
     flags:
       - -mod=readonly
+      # Log callers and panic traces name module paths, not the CI checkout.
+      - -trimpath
     hooks:
       pre: bash tools/release-check.sh
       post: bash tools/release-check.sh "{{ .Path }}"
@@ -71,7 +76,7 @@ nfpms:
     formats:
       - deb
     contents:
-      - src: ./config-example.yaml
+      - src: ./release-assets/config-example.yaml
         dst: /etc/headscale/config.yaml
         type: config|noreplace
         file_info:
@@ -80,7 +85,7 @@ nfpms:
         dst: /usr/lib/systemd/system/headscale.service
       - dst: /var/lib/headscale
         type: dir
-      - src: ./config-example.yaml
+      - src: ./release-assets/config-example.yaml
         dst: /usr/share/doc/headscale/examples/config-example.yaml
       - src: LICENSE
         dst: /usr/share/doc/headscale/copyright

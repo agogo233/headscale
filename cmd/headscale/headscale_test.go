@@ -1,80 +1,59 @@
 package main
 
 import (
-	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/juanfont/headscale/hscontrol/config"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// writeExample writes the generated example as config.yaml in a new
+// directory, which it returns.
+func writeExample(t *testing.T) string {
+	t.Helper()
+
+	d := config.Default()
+
+	out, err := config.GenerateExample(&d, config.ExampleOptions{Docs: true})
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), out, 0o600))
+
+	return dir
+}
+
 func TestConfigFileLoading(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	path, err := os.Getwd()
+	l, err := config.Load(filepath.Join(writeExample(t), "config.yaml"), true, nil)
 	require.NoError(t, err)
 
-	cfgFile := filepath.Join(tmpDir, "config.yaml")
-
-	// Symlink the example config file
-	err = os.Symlink(
-		filepath.Clean(path+"/../../config-example.yaml"),
-		cfgFile,
-	)
-	require.NoError(t, err)
-
-	// Load example config, it should load without validation errors
-	err = types.LoadConfig(cfgFile, true)
-	require.NoError(t, err)
-
-	// Test that config file was interpreted correctly
-	assert.Equal(t, "http://127.0.0.1:8080", viper.GetString("server_url"))
-	assert.Equal(t, "127.0.0.1:8080", viper.GetString("listen_addr"))
-	assert.Equal(t, "127.0.0.1:9090", viper.GetString("metrics_listen_addr"))
-	assert.Equal(t, "sqlite", viper.GetString("database.type"))
-	assert.Equal(t, "/var/lib/headscale/db.sqlite", viper.GetString("database.sqlite.path"))
-	assert.Empty(t, viper.GetString("tls.acme.hostname"))
-	assert.Equal(t, ":http", viper.GetString("tls.acme.http_listen"))
-	assert.Equal(t, "HTTP-01", viper.GetString("tls.acme.challenge_type"))
-	mode, err := util.ParseFileMode(viper.GetString("unix_socket_permission"))
-	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o770), mode)
-	assert.False(t, viper.GetBool("logtail.enabled"))
+	assertDefaultConfig(t, l.Config)
 }
 
 func TestConfigLoading(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	path, err := os.Getwd()
+	l, err := config.Load(writeExample(t), false, nil)
 	require.NoError(t, err)
 
-	// Symlink the example config file
-	err = os.Symlink(
-		filepath.Clean(path+"/../../config-example.yaml"),
-		filepath.Join(tmpDir, "config.yaml"),
-	)
-	require.NoError(t, err)
+	assertDefaultConfig(t, l.Config)
+}
 
-	// Load example config, it should load without validation errors
-	err = types.LoadConfig(tmpDir, false)
-	require.NoError(t, err)
+// assertDefaultConfig checks the example loaded as the defaults it prints.
+func assertDefaultConfig(t *testing.T, cfg *types.Config) {
+	t.Helper()
 
-	// Test that config file was interpreted correctly
-	assert.Equal(t, "http://127.0.0.1:8080", viper.GetString("server_url"))
-	assert.Equal(t, "127.0.0.1:8080", viper.GetString("listen_addr"))
-	assert.Equal(t, "127.0.0.1:9090", viper.GetString("metrics_listen_addr"))
-	assert.Equal(t, "sqlite", viper.GetString("database.type"))
-	assert.Equal(t, "/var/lib/headscale/db.sqlite", viper.GetString("database.sqlite.path"))
-	assert.Empty(t, viper.GetString("tls.acme.hostname"))
-	assert.Equal(t, ":http", viper.GetString("tls.acme.http_listen"))
-	assert.Equal(t, "HTTP-01", viper.GetString("tls.acme.challenge_type"))
-	mode, err := util.ParseFileMode(viper.GetString("unix_socket_permission"))
-	require.NoError(t, err)
-	assert.Equal(t, fs.FileMode(0o770), mode)
-	assert.False(t, viper.GetBool("logtail.enabled"))
+	want := config.Default()
+	if diff := cmp.Diff(&want, cfg,
+		cmpopts.EquateEmpty(),
+		cmpopts.EquateComparable(netip.Prefix{}),
+		cmpopts.IgnoreFields(types.Config{}, "ConfigDir"),
+		cmpopts.IgnoreUnexported(types.Config{}),
+	); diff != "" {
+		t.Errorf("example loads as (-default +loaded):\n%s", diff)
+	}
 }

@@ -78,6 +78,10 @@ type AuthProviderOIDC struct {
 	authCacheRegistrations atomic.Int64
 	authCache              *expirable.LRU[string, AuthInfo]
 
+	// userMu makes the lookup and create in [AuthProviderOIDC.createOrUpdateUserFromClaim]
+	// atomic, so concurrent first logins of one identity share a single user.
+	userMu sync.Mutex
+
 	oidcProvider *oidc.Provider
 	oauth2Config *oauth2.Config
 }
@@ -87,17 +91,18 @@ func NewAuthProviderOIDC(
 	h *Headscale,
 	serverURL string,
 	cfg *types.OIDCConfig,
+	clientSecret string, // cfg.ClientSecret, resolved
 ) (*AuthProviderOIDC, error) {
-	var err error
-	// grab oidc config if it hasn't been already
-	oidcProvider, err := oidc.NewProvider(ctx, cfg.Issuer)
+	// Use the caller's context (bounded, see app.go) so a slow or unreachable
+	// issuer fails discovery within the timeout instead of hanging startup.
+	oidcProvider, err := oidc.NewProvider(ctx, string(cfg.Issuer))
 	if err != nil {
 		return nil, fmt.Errorf("creating OIDC provider from issuer config: %w", err)
 	}
 
 	oauth2Config := &oauth2.Config{
 		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
+		ClientSecret: clientSecret,
 		Endpoint:     oidcProvider.Endpoint(),
 		RedirectURL:  oidcCallbackURL(serverURL),
 		Scopes:       cfg.Scope,
@@ -646,6 +651,9 @@ func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 		newUser bool
 		c       change.Change
 	)
+
+	a.userMu.Lock()
+	defer a.userMu.Unlock()
 
 	user, err = a.h.state.GetUserByOIDCIdentifier(claims.Identifier())
 	if err != nil && !errors.Is(err, db.ErrUserNotFound) {

@@ -89,6 +89,21 @@ var viaCompatTests = []struct {
 	{"via-grant-v90", "port via and capability without via as two grants, non-via primary"},
 	{"via-grant-v91", "port and capability via in one grant, non-via primary"},
 	{"via-grant-v92", "port via with an empty capability map"},
+	{"via-grant-v93", "one member in two via exit grants, plus rules to each via exit node"},
+	{"via-grant-v94", "v93 with a user source"},
+	{"via-grant-v95", "one member in two via exit grants, no other rule"},
+	{"via-grant-v96", "one member in two via exit grants, plus a rule to a private subnet"},
+	{"via-grant-v97", "one member in two via exit grants, plus a rule to everything"},
+	{"via-grant-v98", "via exit steering plus a capability grant to *"},
+	{"via-grant-v99", "via exit steering plus a member capability grant to a public address"},
+	{"via-grant-v100", "approved exit nodes, only a member capability grant to a public address"},
+	{"via-grant-v101", "approved exit nodes, only a member capability grant to a private address"},
+	{"via-grant-v103", "unapproved exit nodes, only a member capability grant to a public address"},
+	{"via-grant-v104", "approved exit nodes, only a member capability grant to the wildcard"},
+	{"via-grant-v105", "a grant and an ACL with the same sources but different IPProto"},
+	{"via-grant-v106", "rule order across grants sharing sources"},
+	{"via-grant-v107", "two via grants from one source through one router"},
+	{"via-grant-v108", "a grant and an ACL with the same sources and IPProto"},
 }
 
 // routesMapCompatTests lists routes captures replayed through the mapper.
@@ -121,6 +136,9 @@ var routesMapCompatTests = []struct {
 	{"routes-exit-family-private", "private destinations keep the subnet without exit routes"},
 	{"routes-exit-family-public-ip", "one public destination offers both exit route families"},
 	{"routes-exit-family-wildcard", "wildcard destinations offer both exit route families"},
+	{"routes-exit-offer-no-rules", "a policy without rules offers exit routes"},
+	{"routes-exit-offer-empty-acls", "an empty acls list offers no exit node"},
+	{"routes-exit-offer-empty-grants", "an empty grants list offers no exit node"},
 }
 
 // aclMapCompatTests lists ACL captures replayed through the mapper, with only

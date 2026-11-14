@@ -44,9 +44,6 @@ type PolicyManager struct {
 	nodes views.Slice[types.NodeView]
 	// nodesByID indexes nodes; see [PolicyManager.cacheableLocked].
 	nodesByID map[types.NodeID]types.NodeView
-	// nodeAddrs is every node's addresses, for
-	// [policyutil.ReduceFilterRules].
-	nodeAddrs *netipx.IPSet
 
 	// resolvedPol is pol with its tags indexed and its groups resolved
 	// against users and nodes, see [Policy.withNodesByTag] and
@@ -335,7 +332,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	pm.resolvedPol = pol
 	pm.compiledGrants = grants
 	pm.userNodeIdx = buildUserNodeIndex(pm.nodes)
-	pm.nodeAddrs = nodeAddrSet(pm.nodes)
+	precomputeSelfRules(pm.compiledGrants, pm.userNodeIdx)
 	pm.needsPerNodeFilter = hasPerNodeGrants(pm.compiledGrants)
 	pm.viaTargetTags = collectViaTargetTags(pm.compiledGrants)
 	pm.relayTargetIPs = relayTargetIPs
@@ -791,6 +788,23 @@ func warnMalformedNextDNSAttrs(pol *Policy) {
 		Msg("nextdns attrs have no effect: a profile must match [A-Za-z0-9._-]{1,64}")
 }
 
+// DERPMap returns the policy's derpMap, nil without one. Callers must not
+// modify it.
+func (pm *PolicyManager) DERPMap() *tailcfg.DERPMap {
+	if pm == nil {
+		return nil
+	}
+
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	if pm.pol == nil {
+		return nil
+	}
+
+	return pm.pol.DERPMap
+}
+
 // Filter returns the current filter rules for the entire tailnet and the associated matchers.
 func (pm *PolicyManager) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 	if pm == nil {
@@ -855,6 +869,7 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 		ids := make([]types.NodeID, nodes.Len())
 		srcOf := make([][]uint64, nodes.Len()) // nil: source of no matcher
 		dstOf := make([][]uint64, nodes.Len()) // nil: destination of no matcher
+		capSrc := make([]bool, nodes.Len())
 
 		for i, n := range nodes.All() {
 			ids[i] = n.ID()
@@ -873,6 +888,7 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 					}
 
 					srcOf[i][k/64] |= 1 << (k % 64) //nolint:mnd
+					capSrc[i] = capSrc[i] || m.CapDestsIsTheInternet()
 				}
 
 				if matcherReachesDestination(m, ips, ri.subnet, ri.isExit) {
@@ -910,7 +926,12 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 				if linked || sameUser(nodes.At(i), nodes.At(j)) {
 					ret[ids[i]] = append(ret[ids[i]], ids[j])
 					ret[ids[j]] = append(ret[ids[j]], ids[i])
+
+					continue
 				}
+
+				addCapSourceOnExit(ret, ids[i], ids[j], capSrc[i], routeInfo[ids[j]].isExit)
+				addCapSourceOnExit(ret, ids[j], ids[i], capSrc[j], routeInfo[ids[i]].isExit)
 			}
 		}
 
@@ -925,9 +946,15 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 	// Reduced rules only show destinations where the node is the target,
 	// but peer relationships require the full bidirectional access rules.
 	nodeMatchers := make(map[types.NodeID][]matcher.Match, nodes.Len())
+	capSrc := make(map[types.NodeID]bool, nodes.Len())
+
 	for _, node := range nodes.All() {
-		unreduced := pm.peerRulesForNodeLocked(node)
-		nodeMatchers[node.ID()] = matcher.MatchesFromFilterRules(unreduced)
+		ms := pm.nodeMatchersLocked(node, viaPeerRule)
+		nodeMatchers[node.ID()] = ms
+		capSrc[node.ID()] = slices.ContainsFunc(ms, func(m matcher.Match) bool {
+			return m.CapDestsIsTheInternet() &&
+				matcherReachesSource(&m, node.IPs(), routeInfo[node.ID()].subnet)
+		})
 	}
 
 	// Check each node pair for peer relationships.
@@ -964,11 +991,29 @@ func (pm *PolicyManager) BuildPeerMap(nodes views.Slice[types.NodeView]) map[typ
 			if linked || sameUser(nodeI, nodeJ) {
 				ret[nodeI.ID()] = append(ret[nodeI.ID()], nodeJ.ID())
 				ret[nodeJ.ID()] = append(ret[nodeJ.ID()], nodeI.ID())
+
+				continue
 			}
+
+			addCapSourceOnExit(ret, nodeI.ID(), nodeJ.ID(), capSrc[nodeI.ID()], riJ.isExit)
+			addCapSourceOnExit(ret, nodeJ.ID(), nodeI.ID(), capSrc[nodeJ.ID()], riI.isExit)
 		}
 	}
 
 	return ret
+}
+
+// addCapSourceOnExit lists src on exit, and only there, when src is the
+// source of a capability to the internet. SaaS does this: the capability
+// carries no traffic, so src gets no exit route and does not list exit.
+func addCapSourceOnExit(
+	ret map[types.NodeID][]types.NodeID,
+	src, exit types.NodeID,
+	srcHasCap, isExit bool,
+) {
+	if srcHasCap && isExit {
+		ret[exit] = append(ret[exit], src)
+	}
 }
 
 func matcherReachesSource(m *matcher.Match, ips []netip.Addr, routes []netipx.IPRange) bool {
@@ -1011,12 +1056,16 @@ func (pm *PolicyManager) filterRulesForNodeLocked(
 	)
 }
 
-// peerRulesForNodeLocked returns the rules that decide a node's peers, see
-// [peerRulesForNode].
-func (pm *PolicyManager) peerRulesForNodeLocked(
+// nodeMatchersLocked returns the global matchers plus matchers for the self
+// and via rules node adds. Matchers do not depend on how rules merge, so the
+// global ones, parsed once per compile, are shared rather than re-parsed per
+// node.
+func (pm *PolicyManager) nodeMatchersLocked(
 	node types.NodeView,
-) []tailcfg.FilterRule {
-	return peerRulesForNode(pm.compiledGrants, node, pm.userNodeIdx)
+	viaRules func(*compiledGrant, types.NodeView) []tailcfg.FilterRule,
+) []matcher.Match {
+	return slices.Concat(pm.matchers,
+		nodeOnlyMatchers(pm.compiledGrants, node, pm.userNodeIdx, viaRules))
 }
 
 // filterForNodeLocked returns the filter rules for a specific node,
@@ -1045,13 +1094,10 @@ func (pm *PolicyManager) filterForNodeLocked(
 	if !pm.needsPerNodeFilter {
 		unreduced = pm.filter
 	} else {
-		unreduced = append(
-			pm.filterRulesForNodeLocked(node),
-			exitNodeSelfRules(pm.compiledGrants, node, pm.userNodeIdx)...,
-		)
+		unreduced = pm.filterRulesForNodeLocked(node)
 	}
 
-	reduced := policyutil.ReduceFilterRules(node, unreduced, pm.nodeAddrs)
+	reduced := policyutil.ReduceFilterRules(node, unreduced)
 	if pm.cacheableLocked(node) {
 		pm.filterRulesMap.Store(node.ID(), reduced)
 	}
@@ -1106,10 +1152,7 @@ func (pm *PolicyManager) MatchersForNode(node types.NodeView) ([]matcher.Match, 
 		return cached, nil
 	}
 
-	// For autogroup:self or via grants, derive matchers from
-	// the stored compiled grants for this specific node.
-	unreduced := pm.filterRulesForNodeLocked(node)
-	matchers := matcher.MatchesFromFilterRules(unreduced)
+	matchers := pm.nodeMatchersLocked(node, compileViaForNode)
 
 	if pm.cacheableLocked(node) {
 		pm.matchersForNodeMap.Store(node.ID(), matchers)
@@ -1838,10 +1881,12 @@ func (pm *PolicyManager) ViaRoutesForPeer(viewer, peer types.NodeView) types.Via
 			// A non-via grant covering routes that a via grant included
 			// defers to global HA primary election. Match by overlap so
 			// a broader or narrower regular dst still catches the
-			// routes the via grant added to Include.
+			// routes the via grant added to Include. Exit routes have no
+			// election, so deferring would only drop them.
 			for _, dstPrefix := range resolvedDstPrefixes[i] {
 				for _, p := range result.Include {
-					if grantCoversRoute(dstPrefix, p, reachesInternet) && !slices.Contains(result.UsePrimary, p) {
+					if !tsaddr.IsExitRoute(p) && dstPrefix.Overlaps(p) &&
+						!slices.Contains(result.UsePrimary, p) {
 						result.UsePrimary = append(result.UsePrimary, p)
 					}
 				}
@@ -1874,18 +1919,17 @@ func isPreferredViaPrimary(
 		(since.Equal(primarySince) && node.ID() < primaryID)
 }
 
-// Only a grant to the internet covers an exit route,
-// as [types.Node.CanAccessRoutes] decides.
-func grantCoversRoute(dst, route netip.Prefix, reachesInternet bool) bool {
-	return dst.Overlaps(route) && (reachesInternet || !tsaddr.IsExitRoute(route))
-}
-
 // grantReachesInternet reports whether a grant's destinations, resolved
 // to dsts, reach the internet by the test the grant's filter rule gets
 // ([matcher.Match.DestsIsTheInternet]). Neither the wildcard nor
 // autogroup:internet resolves to the internet here, so check those
-// aliases themselves.
+// aliases themselves. That test reads port destinations only, so an
+// app-only grant never reaches the internet.
 func grantReachesInternet(grant Grant, dsts []netip.Prefix) bool {
+	if len(grant.InternetProtocols) == 0 && len(grant.App) > 0 {
+		return false
+	}
+
 	internetAlias := slices.ContainsFunc(grant.Destinations, func(d Alias) bool {
 		if ag, ok := d.(*AutoGroup); ok {
 			return ag.Is(AutoGroupInternet)

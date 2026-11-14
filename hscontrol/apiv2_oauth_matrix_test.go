@@ -114,6 +114,7 @@ func TestAPIv2OAuthMatrix_Enforcement(t *testing.T) {
 
 	ops := []matrixOp{
 		{"getDevice", http.MethodGet, "/api/v2/device/1", scope.DevicesCoreRead, nil, false},
+		{"getDevicePostureAttributes", http.MethodGet, "/api/v2/device/1/attributes", scope.DevicesPostureAttributesRead, nil, false},
 		{"listDevices", http.MethodGet, "/api/v2/tailnet/-/devices", scope.DevicesCoreRead, nil, false},
 		{"deleteDevice", http.MethodDelete, "/api/v2/device/1", scope.DevicesCore, nil, false},
 		{"authorizeDevice", http.MethodPost, "/api/v2/device/1/authorized", scope.DevicesCore, map[string]any{}, false},
@@ -121,8 +122,10 @@ func TestAPIv2OAuthMatrix_Enforcement(t *testing.T) {
 		{"setDeviceName", http.MethodPost, "/api/v2/device/1/name", scope.DevicesCore, map[string]any{}, false},
 		{"setDeviceTags", http.MethodPost, "/api/v2/device/1/tags", scope.DevicesCore, map[string]any{}, false},
 		{"setDeviceKey", http.MethodPost, "/api/v2/device/1/key", scope.DevicesCore, map[string]any{}, false},
+		{"updateDeviceClient", http.MethodPost, "/api/v2/device/1/update-client", scope.DevicesCore, nil, false},
 		{"setDeviceRoutes", http.MethodPost, "/api/v2/device/1/routes", scope.DevicesRoutes, map[string]any{}, false},
 		{"getDeviceRoutes", http.MethodGet, "/api/v2/device/1/routes", scope.DevicesRoutesRead, nil, false},
+		{"getDeviceUpdateStatus", http.MethodGet, "/api/v2/device/1/update-status", scope.DevicesCoreRead, nil, false},
 		{"getACL", http.MethodGet, "/api/v2/tailnet/-/acl", scope.PolicyFileRead, nil, false},
 		{"setACL", http.MethodPost, "/api/v2/tailnet/-/acl", scope.PolicyFile, map[string]any{}, false},
 		{"getSettings", http.MethodGet, "/api/v2/tailnet/-/settings", scope.FeatureSettingsRead, nil, false},

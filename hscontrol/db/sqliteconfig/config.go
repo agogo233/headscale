@@ -5,6 +5,7 @@ package sqliteconfig
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 )
@@ -276,6 +277,7 @@ type Config struct {
 	Synchronous       Synchronous // synchronous mode (affects durability vs performance)
 	ForeignKeys       bool        // enable foreign key constraints (data integrity)
 	TxLock            TxLock      // transaction lock mode (affects write concurrency)
+	ReadOnly          bool        // open with SQLite's mode=ro
 }
 
 // Default returns the production configuration optimized for Headscale's usage patterns.
@@ -354,7 +356,9 @@ func (c *Config) ToURL() (string, error) {
 	if c.Path == ":memory:" {
 		baseURL = ":memory:"
 	} else {
-		baseURL = "file:" + c.Path
+		// SQLite ends a URI path at '?' or '#' and decodes '%'; escape so the
+		// configured path names the file literally.
+		baseURL = "file:" + (&url.URL{Path: c.Path}).EscapedPath()
 	}
 
 	// Build query parameters
@@ -388,6 +392,10 @@ func (c *Config) ToURL() (string, error) {
 
 	if c.ForeignKeys {
 		queryParts = append(queryParts, "_pragma=foreign_keys=ON")
+	}
+
+	if c.ReadOnly {
+		queryParts = append(queryParts, "mode=ro")
 	}
 
 	if len(queryParts) > 0 {

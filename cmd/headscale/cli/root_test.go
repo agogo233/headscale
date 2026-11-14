@@ -1,16 +1,24 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/juanfont/headscale/hscontrol/db"
-	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -341,16 +349,13 @@ func TestOfflineSetPolicyRunsTests(t *testing.T) {
 			name: "failing SSH test preserves stored policy",
 			policy: `{
   "acls": [{"action":"accept","src":["*"],"dst":["*:*"]}],
-  "ssh": [{"action":"accept","src":["alice@"],"dst":["autogroup:member"],"users":["root"]}],
-  "sshTests": [{"src":"bob@","dst":["autogroup:member"],"accept":["root"]}]
+  "ssh": [{"action":"accept","src":["alice@"],"dst":["autogroup:self"],"users":["root"]}],
+  "sshTests": [{"src":"bob@","dst":["alice@"],"accept":["root"]}]
 }`,
 			invalid: true,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-			t.Cleanup(viper.Reset)
-
 			dir := t.TempDir()
 			configPath := filepath.Join(dir, "config.yaml")
 			config := fmt.Sprintf(`server_url: https://headscale.example.com
@@ -369,12 +374,9 @@ dns:
   override_local_dns: false
 `, filepath.Join(dir, "headscale.db"))
 			require.NoError(t, os.WriteFile(configPath, []byte(config), 0o600))
-			require.NoError(t, types.LoadConfig(configPath, true))
+			useLoaded(t, configPath)
 
-			cfg, err := types.LoadServerConfig()
-			require.NoError(t, err)
-
-			database, err := db.NewHeadscaleDatabase(cfg)
+			database, err := db.NewHeadscaleDatabase(serverConfig())
 			require.NoError(t, err)
 
 			t.Cleanup(func() { _ = database.Close() })
@@ -415,4 +417,233 @@ dns:
 			}
 		})
 	}
+}
+
+// useLoaded loads path as initConfig does, until the test ends.
+func useLoaded(t *testing.T, path string) {
+	t.Helper()
+
+	l, err := loadConfig(path)
+	require.NoError(t, err)
+
+	old := loaded
+	loaded = l
+
+	t.Cleanup(func() { loaded = old })
+}
+
+func TestInitConfigSkippedLogLevel(t *testing.T) {
+	oldArgs, oldLevel := os.Args, zerolog.GlobalLevel()
+
+	t.Cleanup(func() {
+		os.Args = oldArgs
+
+		zerolog.SetGlobalLevel(oldLevel)
+	})
+
+	os.Args = []string{"headscale", "check", "policy", "-f", "p"}
+
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	initConfig()
+	require.Equal(t, zerolog.InfoLevel, zerolog.GlobalLevel(), "log.level's default, as with a config")
+}
+
+func TestLoadConfig(t *testing.T) {
+	dir := t.TempDir()
+	conf := func(name string) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte("server_url: https://"+name+"\n"), 0o600))
+
+		return p
+	}
+	flag, global, env := conf("flag.yaml"), conf("global.yaml"), conf("env.yaml")
+
+	tests := []struct {
+		name               string
+		path, cfgFile, env string
+		want               string
+	}{
+		{"path wins", flag, global, env, flag},
+		{"then -c", "", global, env, global},
+		{"then HEADSCALE_CONFIG", "", "", env, env},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HEADSCALE_CONFIG", tt.env)
+
+			old := cfgFile
+			cfgFile = tt.cfgFile
+
+			t.Cleanup(func() { cfgFile = old })
+
+			l, err := loadConfig(tt.path)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, l.File)
+		})
+	}
+}
+
+// TestCLIOnlyConfig: a file with only what client commands read, such as
+// ~/.config/headscale/config.yaml, serves them; check config reports what
+// the server lacks.
+func TestCLIOnlyConfig(t *testing.T) {
+	path := writeFile(t, t.TempDir(), "config.yaml", `cli:
+  address: headscale.example.com:443
+  api_key: abc
+unix_socket: /run/headscale/headscale.sock
+`)
+
+	useLoaded(t, path)
+
+	_, _, cancel, err := newHeadscaleCLIWithConfig()
+	require.NoError(t, err)
+	cancel()
+
+	_, err = runCheck(t, checkConfigCmd, path)
+	require.ErrorContains(t, err, "server_url")
+}
+
+// runHeadscale runs the CLI as main does, in a child process: loading a
+// config can exit it.
+func runHeadscale(t *testing.T, env []string, args ...string) (string, string, error) {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestHeadscaleProcess$") //nolint:gosec // this test binary
+
+	cmd.Env = append([]string{"HEADSCALE_TEST_ARGS=" + strings.Join(args, "\n")}, env...)
+
+	var stdout, stderr bytes.Buffer
+
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+
+	return stdout.String(), stderr.String(), err
+}
+
+// TestHeadscaleProcess is the child of runHeadscale.
+func TestHeadscaleProcess(t *testing.T) {
+	args := os.Getenv("HEADSCALE_TEST_ARGS")
+	if args == "" {
+		t.Skip("run by runHeadscale")
+	}
+
+	os.Args = append([]string{"headscale"}, strings.Split(args, "\n")...)
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, NoColor: true})
+
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+
+	Execute()
+	os.Exit(0)
+}
+
+// TestInitConfigWarnings: what loading warns about follows log.format, never
+// reaches stdout under machine output, and is reported with a load error.
+func TestInitConfigWarnings(t *testing.T) {
+	const warning = "unknown environment variable HEADSCALE_BOGUS"
+
+	env := []string{"HEADSCALE_BOGUS=1", "HEADSCALE_DISABLE_CHECK_UPDATES=true"}
+	dir := t.TempDir()
+	jsonLogs := writeFile(t, dir, "json.yaml", "log:\n  format: json\n")
+	invalid := writeFile(t, dir, "invalid.yaml", "bogus_key: 1\n")
+
+	// warnLine is the line holding the warning, as JSON when it is one.
+	warnLine := func(t *testing.T, out string) map[string]any {
+		t.Helper()
+
+		for l := range strings.SplitSeq(out, "\n") {
+			if strings.Contains(l, warning) {
+				var m map[string]any
+
+				_ = json.Unmarshal([]byte(l), &m)
+
+				return m
+			}
+		}
+
+		t.Fatalf("no %q in %q", warning, out)
+
+		return nil
+	}
+
+	t.Run("json log format", func(t *testing.T) {
+		stdout, stderr, err := runHeadscale(t, env, "-c", jsonLogs, "generate", "private-key")
+		require.NoError(t, err, stderr)
+		assert.Equal(t, "warn", warnLine(t, stdout+stderr)["level"])
+	})
+
+	// Every spelling Cobra accepts for --output.
+	for _, format := range []string{"json", "json-line", "yaml"} {
+		for _, flag := range [][]string{
+			{"-o", format}, {"--output", format}, {"--output=" + format}, {"-o=" + format}, {"-o" + format},
+		} {
+			t.Run("machine output "+strings.Join(flag, " "), func(t *testing.T) {
+				stdout, stderr, err := runHeadscale(t, env, append([]string{"-c", jsonLogs, "generate", "private-key"}, flag...)...)
+				require.NoError(t, err, stderr)
+
+				// JSON is YAML too; the result is one object.
+				var out map[string]string
+				require.NoError(t, yaml.Unmarshal([]byte(stdout), &out), stdout)
+				assert.Equal(t, []string{"private_key"}, slices.Collect(maps.Keys(out)))
+				assert.Equal(t, "warn", warnLine(t, stderr)["level"])
+			})
+		}
+	}
+
+	// version has its own --output, which shadows the root's.
+	for _, flag := range [][]string{{"-o", "json"}, {"--output=json"}} {
+		t.Run("version "+strings.Join(flag, " "), func(t *testing.T) {
+			stdout, stderr, err := runHeadscale(t, env, append([]string{"-c", jsonLogs, "version"}, flag...)...)
+			require.NoError(t, err, stderr)
+
+			var out map[string]any
+			require.NoError(t, json.Unmarshal([]byte(stdout), &out), stdout)
+			assert.Contains(t, out, "version")
+			assert.Equal(t, "warn", warnLine(t, stderr)["level"])
+		})
+	}
+
+	for _, output := range [][]string{nil, {"-o", "json"}} {
+		t.Run("load error "+strings.Join(output, " "), func(t *testing.T) {
+			stdout, stderr, err := runHeadscale(t, env, append([]string{"-c", invalid, "generate", "private-key"}, output...)...)
+			require.Error(t, err)
+			assert.Empty(t, stdout)
+			warnLine(t, stderr)
+			assert.Contains(t, stderr, "unknown configuration key bogus_key")
+			assert.NotContains(t, stderr, "panic")
+
+			// Reported as Execute reports any error, in the --output format.
+			if output == nil {
+				assert.Contains(t, stderr, "Error: loading config file "+invalid+": ")
+
+				return
+			}
+
+			_, obj, ok := strings.Cut(stderr, "{")
+			require.True(t, ok, stderr)
+
+			var out struct {
+				Error string `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal([]byte("{"+obj), &out), stderr)
+			assert.Contains(t, out.Error, "unknown configuration key bogus_key")
+		})
+	}
+}
+
+// TestClientCommandWithoutConfigFile: configuration from the environment
+// alone is complete, so a client command does not ask for a file.
+func TestClientCommandWithoutConfigFile(t *testing.T) {
+	env := []string{
+		"HOME=" + t.TempDir(),
+		"HEADSCALE_UNIX_SOCKET=" + filepath.Join(t.TempDir(), "absent.sock"),
+		"HEADSCALE_CLI_TIMEOUT=1s",
+		"HEADSCALE_DISABLE_CHECK_UPDATES=true",
+	}
+
+	_, stderr, err := runHeadscale(t, env, "users", "list")
+	require.Error(t, err, "no server listens on the socket")
+	assert.Contains(t, stderr, "listing users")
+	assert.NotContains(t, stderr, "loading config")
+	assert.NotContains(t, stderr, "no config file")
 }

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/config"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -24,9 +24,6 @@ import (
 const legacyPlaintextKey = "plaintextlegacykey0000000000000000000000000000"
 
 func TestSQLiteSameQueryInAndOutsideTransaction(t *testing.T) {
-	viper.Reset()
-	t.Cleanup(viper.Reset)
-
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	require.NoError(t, os.WriteFile(configPath, []byte(`
 server_url: https://example.com
@@ -41,14 +38,11 @@ database:
   type: sqlite3
   sqlite:
     path: headscale.db
-  gorm:
-    prepare_stmt: true
 `), 0o600))
-	require.NoError(t, types.LoadConfig(configPath, true))
-
-	cfg, err := types.LoadServerConfig()
+	l, err := config.Load(configPath, true, os.Environ())
 	require.NoError(t, err)
-	hsdb, err := NewHeadscaleDatabase(cfg)
+	require.NoError(t, config.Validate(l.Config))
+	hsdb, err := NewHeadscaleDatabase(l.Config)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, hsdb.Close()) })
 
@@ -752,22 +746,46 @@ func TestSQLiteMigrationAddsCreatedByToken(t *testing.T) {
 	assert.True(t, got.CreatedByToken)
 }
 
-// TestSQLiteRejectsPre029Database ensures a real pre-0.29 database is refused
-// rather than silently skipping the migrations that were removed.
+// TestSQLiteRejectsPre029Database ensures real pre-0.29 databases are refused
+// before anything is written, rather than silently skipping the migrations
+// that were removed.
 func TestSQLiteRejectsPre029Database(t *testing.T) {
-	dbPath := t.TempDir() + "/headscale_test.db"
-
-	err := createSQLiteFromSQLFile("testdata/sqlite_too_old/headscale_0.26.1_dump.sql", dbPath)
+	dumps, err := os.ReadDir("testdata/sqlite_too_old")
 	require.NoError(t, err)
 
-	_, err = NewHeadscaleDatabase(&types.Config{
-		Database: types.DatabaseConfig{
-			Type:   "sqlite3",
-			Sqlite: types.SqliteConfig{Path: dbPath},
-		},
-		Policy: types.PolicyConfig{Mode: types.PolicyModeDB},
-	})
-	require.ErrorIs(t, err, errDatabaseTooOld)
+	for _, dump := range dumps {
+		t.Run(dump.Name(), func(t *testing.T) {
+			dbPath := t.TempDir() + "/headscale_test.db"
+
+			err := createSQLiteFromSQLFile(filepath.Join("testdata/sqlite_too_old", dump.Name()), dbPath)
+			require.NoError(t, err)
+
+			schema := func() string {
+				raw, err := sql.Open("sqlite", dbPath)
+				require.NoError(t, err)
+
+				defer raw.Close()
+
+				var s string
+				require.NoError(t, raw.QueryRowContext(context.Background(),
+					"SELECT group_concat(sql, ';') FROM (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name)",
+				).Scan(&s))
+
+				return s
+			}
+			before := schema()
+
+			_, err = NewHeadscaleDatabase(&types.Config{
+				Database: types.DatabaseConfig{
+					Type:   "sqlite3",
+					Sqlite: types.SqliteConfig{Path: dbPath},
+				},
+				Policy: types.PolicyConfig{Mode: types.PolicyModeDB},
+			})
+			require.ErrorIs(t, err, errDatabaseTooOld)
+			assert.Equal(t, before, schema())
+		})
+	}
 }
 
 // TestSQLiteAllTestdataMigrations tests migration compatibility across all SQLite schemas
@@ -1099,10 +1117,93 @@ func TestOpenDBReturnsOpenError(t *testing.T) {
 			)
 
 			require.NotPanics(t, func() {
-				db, err = openDB(tt.cfg(t))
+				cfg := tt.cfg(t)
+				db, err = openDB(cfg, cfg.Sqlite.Path)
 			})
 			require.Error(t, err)
 			assert.Nil(t, db)
 		})
 	}
+}
+
+// TestSQLiteWriteAheadLog switches one database between modes, because SQLite
+// stores the journal mode in the file and turning WAL off has to undo it.
+func TestSQLiteWriteAheadLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "headscale.db")
+
+	open := func(wal bool) (string, int) {
+		t.Helper()
+
+		cfg := sqliteTestConfig(path)
+		cfg.Database.Sqlite.WriteAheadLog = wal
+
+		hsdb, err := NewHeadscaleDatabase(cfg)
+		require.NoError(t, err)
+
+		var (
+			mode        string
+			synchronous int
+		)
+
+		require.NoError(t, hsdb.DB.Raw("PRAGMA journal_mode").Scan(&mode).Error)
+		require.NoError(t, hsdb.DB.Raw("PRAGMA synchronous").Scan(&synchronous).Error)
+		require.NoError(t, hsdb.Close())
+
+		return mode, synchronous
+	}
+
+	const normal, full = 1, 2
+
+	mode, synchronous := open(true)
+	assert.Equal(t, "wal", mode)
+	assert.Equal(t, normal, synchronous)
+
+	mode, synchronous = open(false)
+	assert.Equal(t, "delete", mode)
+	assert.Equal(t, full, synchronous)
+
+	mode, _ = open(true)
+	assert.Equal(t, "wal", mode)
+}
+
+func TestLastControlAddressMigration(t *testing.T) {
+	dbPath := t.TempDir() + "/headscale.db"
+	cfg := &types.Config{
+		Database: types.DatabaseConfig{
+			Type: types.DatabaseSqlite,
+			Sqlite: types.SqliteConfig{
+				Path: dbPath,
+			},
+		},
+		Policy: types.PolicyConfig{Mode: types.PolicyModeDB},
+	}
+
+	database, err := NewHeadscaleDatabase(cfg)
+	require.NoError(t, err, "a fresh database must match schema.sql")
+	require.True(t, database.DB.Migrator().HasColumn(&types.Node{}, "last_control_address"))
+
+	user := database.CreateUserForTest("migration-user")
+	node := database.CreateRegisteredNodeForTest(user, "migration-node")
+	require.Nil(t, node.LastControlAddress)
+
+	result := database.DB.Exec(
+		"DELETE FROM migrations WHERE id = ?",
+		"202611041200-node-last-control-address",
+	)
+	require.NoError(t, result.Error)
+	require.Equal(t, int64(1), result.RowsAffected)
+	require.NoError(t,
+		database.DB.Exec("ALTER TABLE nodes DROP COLUMN last_control_address").Error)
+	require.False(t, database.DB.Migrator().HasColumn(&types.Node{}, "last_control_address"))
+	require.NoError(t, database.Close())
+
+	upgraded, err := NewHeadscaleDatabase(cfg)
+	require.NoError(t, err, "a database without last_control_address must upgrade")
+	t.Cleanup(func() { _ = upgraded.Close() })
+
+	require.True(t, upgraded.DB.Migrator().HasColumn(&types.Node{}, "last_control_address"))
+	reloaded, err := upgraded.GetNodeByID(node.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reloaded.LastControlAddress,
+		"existing nodes must receive NULL rather than an invented address")
 }

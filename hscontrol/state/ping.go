@@ -10,13 +10,20 @@ import (
 
 const pingIDLength = 16
 
+// clientUpdateWindow is how long a started client update reads as updating
+// while the node keeps its old version, so a failed update ends.
+const clientUpdateWindow = 10 * time.Minute
+
 // pingTracker correlates outgoing [tailcfg.PingRequest]s with incoming HEAD
 // callbacks. Entries have no server-side TTL: callers are responsible
 // for cleaning up via [pingTracker.cancel] or by reading from the response
-// channel within their own timeout.
+// channel within their own timeout. It also remembers the client updates
+// nodes started over c2n.
 type pingTracker struct {
 	mu      sync.Mutex
 	pending map[string]*pendingPing
+	c2n     map[string]*pendingC2N
+	updates map[types.NodeID]startedUpdate
 }
 
 type pendingPing struct {
@@ -25,9 +32,24 @@ type pendingPing struct {
 	responseCh chan time.Duration
 }
 
+// pendingC2N is a c2n [tailcfg.PingRequest] waiting for the node to POST
+// back the raw HTTP response produced by its c2n handler.
+type pendingC2N struct {
+	nodeID     types.NodeID
+	responseCh chan []byte
+}
+
+// startedUpdate is a client update a node started while running from.
+type startedUpdate struct {
+	from string
+	at   time.Time
+}
+
 func newPingTracker() *pingTracker {
 	return &pingTracker{
 		pending: make(map[string]*pendingPing),
+		c2n:     make(map[string]*pendingC2N),
+		updates: make(map[types.NodeID]startedUpdate),
 	}
 }
 
@@ -90,6 +112,95 @@ func (pt *pingTracker) drain() {
 		close(pp.responseCh)
 		delete(pt.pending, id)
 	}
+
+	for id, pc := range pt.c2n {
+		close(pc.responseCh)
+		delete(pt.c2n, id)
+	}
+}
+
+// registerC2N creates a pending c2n request for nodeID and returns a
+// unique ID and a channel that receives the raw HTTP response the node
+// sends back.
+func (pt *pingTracker) registerC2N(nodeID types.NodeID) (string, <-chan []byte) {
+	c2nID := rands.HexString(pingIDLength)
+	ch := make(chan []byte, 1)
+
+	pt.mu.Lock()
+	pt.c2n[c2nID] = &pendingC2N{
+		nodeID:     nodeID,
+		responseCh: ch,
+	}
+	pt.mu.Unlock()
+
+	return c2nID, ch
+}
+
+// c2nTarget returns the node a pending c2n request was sent to.
+func (pt *pingTracker) c2nTarget(c2nID string) (types.NodeID, bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	pc, ok := pt.c2n[c2nID]
+	if !ok {
+		return 0, false
+	}
+
+	return pc.nodeID, true
+}
+
+// completeC2N delivers body on the response channel and returns true.
+// Returns false if the c2nID is unknown (already completed or cancelled).
+func (pt *pingTracker) completeC2N(c2nID string, body []byte) bool {
+	pt.mu.Lock()
+
+	pc, ok := pt.c2n[c2nID]
+	if ok {
+		delete(pt.c2n, c2nID)
+	}
+	pt.mu.Unlock()
+
+	if !ok {
+		return false
+	}
+
+	pc.responseCh <- body
+
+	close(pc.responseCh)
+
+	return true
+}
+
+// cancelC2N removes a pending c2n request without completing it. Idempotent.
+func (pt *pingTracker) cancelC2N(c2nID string) {
+	pt.mu.Lock()
+	delete(pt.c2n, c2nID)
+	pt.mu.Unlock()
+}
+
+// updateStarted records that nodeID started a client update at now while
+// running version.
+func (pt *pingTracker) updateStarted(nodeID types.NodeID, version string, now time.Time) {
+	pt.mu.Lock()
+	pt.updates[nodeID] = startedUpdate{from: version, at: now}
+	pt.mu.Unlock()
+}
+
+// updating reports whether nodeID's started update still runs: the node
+// still runs version and the window has not passed. An ended update is
+// forgotten.
+func (pt *pingTracker) updating(nodeID types.NodeID, version string, now time.Time) bool {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	u, ok := pt.updates[nodeID]
+	if ok && u.from == version && now.Sub(u.at) < clientUpdateWindow {
+		return true
+	}
+
+	delete(pt.updates, nodeID)
+
+	return false
 }
 
 // RegisterPing tracks a pending ping and returns its ID and a channel
@@ -108,4 +219,42 @@ func (s *State) CompletePing(pingID string) bool {
 // CancelPing removes a pending ping. Idempotent.
 func (s *State) CancelPing(pingID string) {
 	s.pings.cancel(pingID)
+}
+
+// RegisterC2N tracks a pending c2n request to nodeID and returns its ID
+// and a channel for the node's raw HTTP response. Callers must defer
+// [State.CancelC2N] or read the channel within their own timeout; there
+// is no server-side TTL.
+func (s *State) RegisterC2N(nodeID types.NodeID) (string, <-chan []byte) {
+	return s.pings.registerC2N(nodeID)
+}
+
+// C2NTarget returns the node a pending c2n request was sent to, so the
+// response handler can check that the answer comes from that node.
+func (s *State) C2NTarget(c2nID string) (types.NodeID, bool) {
+	return s.pings.c2nTarget(c2nID)
+}
+
+// CompleteC2N delivers a c2n response. Returns true if the ID was known,
+// false otherwise.
+func (s *State) CompleteC2N(c2nID string, body []byte) bool {
+	return s.pings.completeC2N(c2nID, body)
+}
+
+// CancelC2N removes a pending c2n request. Idempotent.
+func (s *State) CancelC2N(c2nID string) {
+	s.pings.cancelC2N(c2nID)
+}
+
+// ClientUpdateStarted records that nodeID started a client update while
+// running version.
+func (s *State) ClientUpdateStarted(nodeID types.NodeID, version string) {
+	s.pings.updateStarted(nodeID, version, time.Now())
+}
+
+// ClientUpdating reports whether nodeID is still updating its client: it
+// started an update while running version, still runs it, and
+// [clientUpdateWindow] has not passed.
+func (s *State) ClientUpdating(nodeID types.NodeID, version string) bool {
+	return s.pings.updating(nodeID, version, time.Now())
 }

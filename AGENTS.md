@@ -159,6 +159,14 @@ headscale/
   Performance-critical.
 - `policy/` — `policy/v2/` is **the** policy implementation. The
   top-level `policy.go` is thin wrappers. There is no v1 directory.
+- `config/` — config code outside the `types.Config` struct: the loader
+  (`Load`: defaults, file, `HEADSCALE_*` environment; `Default`; `Marshal`;
+  the removed-keys table), `Validate` and `Warnings`, the checks behind
+  `headscale check` (`Files` lists every file a config names, with its
+  validator), `ReadPrivateKey` and the generators (`GenerateExample`,
+  `GenerateNixOptions`, `GenerateReference`). The schema and `ConfigError`
+  stay in `types`. It imports `types`; `types`, `derp`, `dns` and `policy`
+  must never import it.
 - `routes/`, `dns/`, `derp/`, `types/`, `util/`, `templates/`, `capver/`
   — routing, MagicDNS, relay, core types, helpers, client templates,
   capability versioning.
@@ -273,7 +281,7 @@ Key reminders:
 day. `bump plan` reports what is stale without touching anything; `bump verify`
 exits non-zero when the pins no longer agree.
 
-Three rules it encodes. A hand-written bump has to follow them too:
+Four rules it encodes. A hand-written bump has to follow them too:
 
 1. **`modernc.org/libc` moves only to the version `modernc.org/sqlite`
    requires**, and **`gvisor.dev/gvisor` only to the version `tailscale.com`
@@ -290,6 +298,13 @@ Three rules it encodes. A hand-written bump has to follow them too:
    command then downloads one, so `go build` succeeds locally. The nix builders
    set `GOTOOLCHAIN=local` and fail. `bump verify` reports the drift; the tool
    never edits the directive itself.
+4. **Actions are named by release tag; the commit lives in
+   `.github/workflows/actions.lock`.** After changing any `uses:`, in a workflow
+   or in `.github/actions/`, run `gh-actions-lock` (in the dev shell) and commit
+   the lockfile with it; GitHub runs the locked commit and the
+   `check-generated` workflow fails a stale lockfile. Same-repo actions are
+   written `$/.github/actions/...`, not `./`, so the lockfile covers what they
+   use. Never pass `--accept-moved`: a release tag that moved needs a human.
 
 The tool does not encode one more rule: the DNS providers (`github.com/libdns/*`)
 and `github.com/caddyserver/certmagic` must agree on the `github.com/libdns/libdns`
@@ -351,6 +366,14 @@ a broken one.
 - **Do not edit `gen/`** — it is regenerated from `proto/` by
   `make generate`.
 - **Proto changes + code changes should be two commits**, not one.
+- **`services.headscale.settings` options come only from
+  `nix/options.generated.nix`**, generated from `hscontrol/types/config.go`
+  by `go generate ./hscontrol/types/`. Never declare one in `nix/module.nix`:
+  the module only sets values, below `lib.mkDefault`.
+- **Do not edit the generated config files** —
+  `hscontrol/types/config_docs_generated.go`, `nix/options.generated.nix`,
+  `docs/ref/configuration-options.md` and `docs/ref/config-example.yaml`
+  come from `go generate ./hscontrol/types/`.
 - **The NixOS test kit is a public contract** consumed by other projects'
   NixOS tests: the "Contract" in `nix/README.md`, covering
   `nix/testkit.nix`, `nix/testkit-peer.nix`, the embedded DERP region

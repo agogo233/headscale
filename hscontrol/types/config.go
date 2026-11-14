@@ -1,99 +1,119 @@
 package types
 
+//go:generate go run ../../tools/configgen table . config_docs_generated.go
+//go:generate go run ../../tools/configgen/files ../..
+
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"maps"
 	"net"
 	"net/netip"
 	"net/url"
-	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
 	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/util"
-	"github.com/prometheus/common/model"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-	"github.com/spf13/viper"
-	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/util/dnsname"
-	"tailscale.com/util/set"
 )
 
 const (
-	PKCEMethodPlain string = "plain"
-	PKCEMethodS256  string = "S256"
+	// PKCEMethodPlain sends the verifier itself as the challenge. Use it
+	// only with a provider that does not support `S256`.
+	PKCEMethodPlain PKCEMethod = "plain"
+	// PKCEMethodS256 sends the base64url SHA-256 of the verifier as the
+	// challenge. Recommended.
+	PKCEMethodS256 PKCEMethod = "S256"
 
-	defaultNodeStoreBatchSize = 100
-
-	dnsDocsURL = "https://headscale.net/stable/ref/dns/"
+	providerKey = "dns.challenge.provider"
 )
 
 var (
-	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
-	errOIDCIssuerInvalid         = errors.New("oidc.issuer must be a valid http(s) URL")
-	errOIDCClientIDRequired      = errors.New("oidc.client_id is required when oidc.issuer is set")
-	errOIDCClientSecretRequired  = errors.New("oidc.client_secret or oidc.client_secret_path is required when oidc.issuer is set")
-	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
-	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
-	errTrustedProxyZeroRange     = errors.New("0.0.0.0/0 and ::/0 are not allowed")
+	errURLSyntax                 = errors.New("invalid URL syntax")
 	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
 	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
 )
 
-// defaultChallengeResolvers find a zone's nameservers when
+// DefaultBaseDomain is dns.base_domain's default. `.internal` is reserved
+// for private use and never delegated, so MagicDNS shadows no public name.
+const DefaultBaseDomain = "tailnet.internal"
+
+// DefaultChallengeResolvers find a zone's nameservers when
 // dns.challenge.resolvers is empty. The system resolver is not used: on a
 // host running MagicDNS it answers for base_domain itself instead of
 // asking the public zone.
-var defaultChallengeResolvers = []string{"1.1.1.1:53", "8.8.8.8:53"}
+func DefaultChallengeResolvers() []string {
+	return []string{"9.9.9.9:53", "149.112.112.112:53"}
+}
 
-type IPAllocationStrategy string
+// IPAllocationStrategy is how new node IPs are picked. "" decodes without
+// error to the zero value (unset).
+type IPAllocationStrategy string //nolint:recvcheck // UnmarshalText needs a pointer; the rest read the value
 
 const (
+	// IPAllocationStrategySequential takes the next free address after
+	// the last one handed out, and wraps around to reuse freed addresses.
 	IPAllocationStrategySequential IPAllocationStrategy = "sequential"
-	IPAllocationStrategyRandom     IPAllocationStrategy = "random"
+	// IPAllocationStrategyRandom picks a free address at random.
+	IPAllocationStrategyRandom IPAllocationStrategy = "random"
 )
 
-type PolicyMode string
+// PolicyMode is where the policy is stored. "" decodes without error to the
+// zero value (unset).
+type PolicyMode string //nolint:recvcheck // UnmarshalText needs a pointer; the rest read the value
 
 const (
-	PolicyModeDB   = "database"
-	PolicyModeFile = "file"
+	// PolicyModeDB keeps the policy in the database, set with `headscale
+	// policy set` or the API. `policy.path` is not read.
+	PolicyModeDB PolicyMode = "database"
+	// PolicyModeFile reads the policy from `policy.path`. Send headscale
+	// `SIGHUP` to reload it after an edit.
+	PolicyModeFile PolicyMode = "file"
 )
 
 // EphemeralConfig contains configuration for ephemeral node lifecycle.
 type EphemeralConfig struct {
 	// InactivityTimeout is how long an ephemeral node can be offline
-	// before it is automatically deleted.
-	InactivityTimeout time.Duration
+	// before it is automatically deleted. It must exceed 65s, the client
+	// keepalive plus a margin.
+	InactivityTimeout time.Duration `example:"\"1h\"" koanf:"inactivity_timeout"`
 }
 
 // HARouteConfig contains configuration for HA subnet router health probing.
+// When two or more nodes advertise the same route, each is pinged over
+// Noise. One that does not answer in time is marked unhealthy and, if
+// primary, hands that role to the next healthy node; it does not take it
+// back when it recovers.
 type HARouteConfig struct {
-	// ProbeInterval is how often HA subnet routers are probed.
-	// A zero or negative duration disables probing.
-	ProbeInterval time.Duration
+	// ProbeInterval is how often HA subnet routers are probed; a positive
+	// interval must be at least 2s. Zero or negative disables probing,
+	// and with it the `node.routes.ha.probe_timeout` rules.
+	ProbeInterval time.Duration `example:"\"30s\"" koanf:"probe_interval"`
 
 	// ProbeTimeout is the maximum time to wait for a probe response
-	// before declaring a node unhealthy. Must be less than [HARouteConfig.ProbeInterval].
-	ProbeTimeout time.Duration
+	// before declaring a node unhealthy; at least 1s and less than
+	// `node.routes.ha.probe_interval`.
+	ProbeTimeout time.Duration `example:"\"3s\"" koanf:"probe_timeout"`
 }
 
 // RouteConfig contains configuration for route behaviour.
 type RouteConfig struct {
-	HA HARouteConfig
+	// HA is health probing of HA subnet routers. When two or more nodes
+	// advertise the same route, headscale pings each over Noise and moves
+	// the route away from one that does not answer in time. See
+	// [High availability](https://headscale.net/stable/ref/routes/#high-availability).
+	HA HARouteConfig `koanf:"ha"`
 }
 
 // PreAuthKeysConfig contains configuration for pre-auth key lifecycle.
@@ -102,127 +122,419 @@ type PreAuthKeysConfig struct {
 	// v2 API's DELETE) is kept retrievable before the background collector
 	// hard-deletes it. Keys still backing a node are kept until the node is
 	// deleted. A zero or negative duration disables the collector.
-	RevokedRetention time.Duration
+	RevokedRetention time.Duration `example:"\"720h\"" koanf:"revoked_retention"`
 }
 
 // NodeConfig contains configuration for node lifecycle and expiry.
 type NodeConfig struct {
-	// Expiry is the default key expiry duration for non-tagged nodes.
-	// Applies to all registration methods (auth key, CLI, web, OIDC).
-	// Tagged nodes are exempt and never expire.
-	// A zero/negative duration means no default expiry (nodes never expire).
-	Expiry time.Duration
+	// Expiry is the key expiry given to a non-tagged node that registers
+	// without one, whatever the method (auth key, CLI, web, OIDC). An
+	// expiry the client asks for, `oidc.use_expiry_from_token` and an
+	// admin's `headscale nodes expire` still apply. Tagged nodes never get
+	// this default. Zero or negative disables the default.
+	Expiry time.Duration `example:"\"2160h\"" koanf:"expiry"`
 
-	// Ephemeral contains configuration for ephemeral node lifecycle.
-	Ephemeral EphemeralConfig
+	// Ephemeral covers ephemeral nodes, which register with an ephemeral
+	// auth key and are deleted once they have been offline for
+	// `node.ephemeral.inactivity_timeout`.
+	Ephemeral EphemeralConfig `koanf:"ephemeral"`
 
-	// Routes contains configuration for route behaviour.
-	Routes RouteConfig
+	// Routes covers the routes nodes advertise. See
+	// [Routes](https://headscale.net/stable/ref/routes/).
+	Routes RouteConfig `koanf:"routes"`
 }
 
-// Config contains the initial Headscale configuration.
-type Config struct {
-	ServerURL           string
-	Addr                string
-	MetricsAddr         string
-	TrustedProxies      []netip.Prefix
-	Node                NodeConfig
-	PreAuthKeys         PreAuthKeysConfig
-	PrefixV4            *netip.Prefix
-	PrefixV6            *netip.Prefix
-	IPAllocation        IPAllocationStrategy
-	NoisePrivateKeyPath string
-	BaseDomain          string
-	Log                 LogConfig
-	DisableUpdateCheck  bool
+// Config is the Headscale configuration, nested like the configuration
+// file; koanf tags name the keys. A duration needs a unit (30s, 3h, 90d),
+// except 0.
+type Config struct { //nolint:recvcheck // MarshalJSON reads a value, so a Config value is redacted too
+	// ServerURL is the URL clients connect to, with its `http://` or
+	// `https://` scheme, e.g. `https://headscale.example.com:443`. A
+	// trailing slash is trimmed on load. Its host must not be
+	// `dns.base_domain` or a name below it.
+	ServerURL string `example:"\"https://headscale.example.com\"" koanf:"server_url"`
 
-	Database DatabaseConfig
+	// Addr is the host:port the server listens on for clients, the API and
+	// the web pages. It serves HTTPS when `tls.cert_path` or
+	// `tls.acme.hostname` is set, plain HTTP otherwise. The default listens
+	// on every address, IPv4 and IPv6 alike.
+	Addr ListenAddr `example:"\"127.0.0.1:8080\"" koanf:"listen_addr"`
 
-	DERP DERPConfig
+	// MetricsAddr is the host:port serving `/metrics` and `/debug`; keep
+	// it private. Empty disables this listener.
+	MetricsAddr ListenAddr `example:"\"127.0.0.1:9090\"" koanf:"metrics_listen_addr"`
 
-	TLS TLSConfig
+	// UnixSocket is where the server serves the API without
+	// authentication, for the CLI on the same host. The CLI connects to it
+	// when `cli.address` is empty.
+	UnixSocket string `example:"\"/run/headscale/headscale.sock\"" koanf:"unix_socket" nix:"external"`
 
-	// DNSConfig is the headscale representation of the DNS configuration.
-	// It is kept in the config update for some settings that are
-	// not directly converted into a [tailcfg.DNSConfig].
-	DNSConfig DNSConfig
+	// UnixSocketPermission is the file mode of `unix_socket`, in quoted
+	// octal (`"0770"`): unquoted, YAML reads `0770` as the number 504.
+	UnixSocketPermission FileMode `example:"\"0660\"" koanf:"unix_socket_permission"`
 
-	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
-	// it can be used directly when sending Netmaps to clients.
-	TailcfgDNSConfig *tailcfg.DNSConfig
+	// TrustedProxies are the CIDRs of reverse proxies whose
+	// `True-Client-IP`, `X-Real-IP` and `X-Forwarded-For` headers are
+	// honoured. Empty ignores those headers. Set without a proxy in front,
+	// clients can spoof their source IP in logs and the v2 API.
+	TrustedProxies []netip.Prefix `example:"[\"192.0.2.10/32\",\"2001:db8::10/128\"]" koanf:"trusted_proxies"`
 
-	DNSChallenge DNSChallengeConfig
+	// DisableUpdateCheck skips the check for a newer headscale release
+	// that commands make at start.
+	DisableUpdateCheck bool `koanf:"disable_check_updates"`
 
-	UnixSocket           string
-	UnixSocketPermission fs.FileMode
+	// Noise is the Noise protocol (TS2021) clients connect over.
+	Noise NoiseConfig `koanf:"noise"`
 
-	OIDC OIDCConfig
+	// Prefixes are the IP ranges node addresses are allocated from. Keep at
+	// least one of `prefixes.v4` and `prefixes.v6`. Use the Tailscale
+	// ranges, `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, or ranges inside
+	// them: the client assumes them, and other ranges are unsupported.
+	Prefixes PrefixesConfig `koanf:"prefixes"`
 
-	LogTail    LogTailConfig
-	Taildrop   TaildropConfig
-	AutoUpdate AutoUpdateConfig
+	// Policy is where the access control policy is kept: in a file
+	// headscale reads, or in the database. See
+	// [Policy](https://headscale.net/stable/ref/policy/).
+	Policy PolicyConfig `koanf:"policy"`
 
-	CLI CLIConfig
+	// Log is headscale's own log output. See
+	// [Debugging](https://headscale.net/stable/ref/debug/#application-logging).
+	Log LogConfig `koanf:"log"`
 
-	Policy PolicyConfig
+	// Node covers node key expiry, ephemeral nodes and subnet routes.
+	Node NodeConfig `koanf:"node"`
 
-	Tuning Tuning
+	// PreAuthKeys covers the cleanup of revoked pre-auth keys. See
+	// [Pre authenticated key](https://headscale.net/stable/ref/registration/#pre-authenticated-key).
+	PreAuthKeys PreAuthKeysConfig `koanf:"preauth_keys"`
+
+	// DERP is the DERP map: the relay servers clients use when they cannot
+	// connect directly, from `derp.urls`, `derp.paths` and the embedded
+	// server in `derp.server`. A region replaces an earlier one with the
+	// same ID. See [DERP](https://headscale.net/stable/ref/derp/).
+	DERP DERPConfig `koanf:"derp"`
+
+	// Database is where headscale stores nodes, users and keys. SQLite is
+	// recommended; PostgreSQL is supported for legacy deployments only.
+	// `database.sqlite` is read only for SQLite, `database.postgres` only
+	// for PostgreSQL.
+	Database DatabaseConfig `koanf:"database"`
+
+	// DNSConfig is the DNS configuration sent to clients, MagicDNS
+	// included, and TLS certificates for nodes. Clients apply it only with
+	// `--accept-dns`, their default. See
+	// [DNS](https://headscale.net/stable/ref/dns/).
+	DNSConfig DNSConfig `koanf:"dns"`
+
+	// TLS is headscale's own HTTPS certificate on `listen_addr`: from the
+	// files `tls.cert_path` and `tls.key_path`, or from ACME in
+	// `tls.acme`, not both. Without either, the server speaks plain HTTP.
+	// See [TLS](https://headscale.net/stable/ref/tls/).
+	TLS TLSConfig `koanf:"tls"`
+
+	// OIDC is login through an OpenID Connect provider. Setting
+	// `oidc.issuer` turns it on and requires `oidc.client_id` and
+	// `oidc.client_secret`. See
+	// [OpenID Connect](https://headscale.net/stable/ref/oidc/).
+	OIDC OIDCConfig `koanf:"oidc"`
+
+	// LogTail is whether nodes send their logs to Tailscale.
+	LogTail LogTailConfig `koanf:"logtail"`
+
+	// Taildrop is Taildrop, Tailscale's file sharing between nodes.
+	Taildrop TaildropConfig `koanf:"taildrop"`
+
+	// AutoUpdate is the tailnet-wide default for client auto-updates.
+	AutoUpdate AutoUpdateConfig `koanf:"auto_update"`
+
+	// CLI is how the headscale CLI reaches the server: the local
+	// `unix_socket` without authentication, or a remote `cli.address`
+	// with `cli.api_key`. The CLI reads these keys from its own
+	// configuration, such as `~/.config/headscale/config.yaml`, or from
+	// `HEADSCALE_CLI_*` variables; the server does not read them, so on
+	// NixOS they do not belong in `services.headscale.settings`. See
+	// [Remote control](https://headscale.net/stable/ref/api/#remote-control).
+	CLI CLIConfig `koanf:"cli"`
+
+	// Tuning holds performance settings that rarely need changing.
+	Tuning Tuning `koanf:"tuning"`
+
+	// ConfigDir is where [Config.AbsPath] resolves relative paths: the
+	// configuration file's directory, or the working directory without
+	// one. Set by the loader or from Go; it cannot be set from a file.
+	ConfigDir string `json:"-" koanf:"-"`
+
+	// dns is nil until [Config.StartDNS].
+	dns *liveDNS
 }
 
+// NoiseConfig is the key of the Noise protocol clients connect over.
+type NoiseConfig struct {
+	// PrivateKeyPath is the file holding the Noise private key, which
+	// encrypts traffic between headscale and clients, relative to the
+	// configuration file. A missing file is created with a new key.
+	PrivateKeyPath string `example:"\"/opt/headscale/noise_private.key\"" koanf:"private_key_path" nix:"external"`
+}
+
+// PrefixesConfig are the ranges node IPs are allocated from. At least one
+// is required. Use the Tailscale ranges (100.64.0.0/10, fd7a:115c:a1e0::/48)
+// or subsets of them: the client assumes them, and breaks in subtle ways
+// outside them.
+type PrefixesConfig struct {
+	// V4 is the IPv4 range, e.g. `100.64.0.0/10`. Empty gives nodes no
+	// IPv4 address.
+	V4 *netip.Prefix `example:"\"100.64.0.0/24\"" koanf:"v4"`
+
+	// V6 is the IPv6 range, e.g. `fd7a:115c:a1e0::/48`. Empty gives nodes
+	// no IPv6 address.
+	V6 *netip.Prefix `example:"\"fd7a:115c:a1e0::/64\"" koanf:"v6"`
+
+	// Allocation is how a new node's addresses are picked.
+	Allocation IPAllocationStrategy `example:"\"random\"" koanf:"allocation"`
+}
+
+// liveDNS is the DNS state of a running server: the tailcfg form, whose
+// extra records the extra-records watcher replaces while map builds clone
+// it, and the provider startup built.
+type liveDNS struct {
+	mu       sync.RWMutex
+	dns      *tailcfg.DNSConfig
+	provider hsdns.Provider
+}
+
+// DNSConfig is the DNS configuration clients get. To keep headscale out of
+// clients' DNS, set every field to its empty value.
 type DNSConfig struct {
-	MagicDNS         bool   `mapstructure:"magic_dns"`
-	BaseDomain       string `mapstructure:"base_domain"`
-	OverrideLocalDNS bool   `mapstructure:"override_local_dns"`
-	Nameservers      Nameservers
-	SearchDomains    []string            `mapstructure:"search_domains"`
-	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
-	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
-	Certificates     CertificatesConfig
+	// MagicDNS gives each node a name below `dns.base_domain`, e.g.
+	// `laptop.example.com`, resolved by the client. It requires
+	// `dns.base_domain`.
+	MagicDNS bool `koanf:"magic_dns"`
+
+	// BaseDomain is the domain MagicDNS names live under, without a
+	// trailing dot, e.g. `example.com`. The host of `server_url` must not
+	// be this domain or a name below it: clients take the domain over.
+	// The default is a private-use name, so `dns.certificates` needs a
+	// public domain you control.
+	BaseDomain string `example:"\"tailnet.example.com\"" koanf:"base_domain"`
+
+	// OverrideLocalDNS makes clients use `dns.nameservers.global` instead
+	// of their local DNS settings; with no global nameserver there is
+	// nothing to override with, and clients keep their own. False sends
+	// them only as fallback resolvers.
+	OverrideLocalDNS bool `koanf:"override_local_dns"`
+
+	// Nameservers are the upstream DNS servers sent to clients. An entry
+	// that is neither an IP address nor a URL is skipped with a warning.
+	Nameservers Nameservers `koanf:"nameservers"`
+
+	// SearchDomains are DNS search domains sent to clients. With MagicDNS,
+	// `dns.base_domain` comes first.
+	SearchDomains []string `example:"[\"corp.example.com\",\"lab.example.net\"]" koanf:"search_domains"`
+
+	// ExtraRecords are DNS records served to clients, each with a `name`,
+	// `type` and `value`. Clients support `A` and `AAAA`. Mutually
+	// exclusive with `dns.extra_records_path`. See
+	// [Setting extra DNS records](https://headscale.net/stable/ref/dns/#setting-extra-dns-records).
+	ExtraRecords []tailcfg.DNSRecord `example:"[{\"name\":\"grafana.tailnet.example.com\",\"type\":\"A\",\"value\":\"100.64.0.3\"},{\"name\":\"grafana.tailnet.example.com\",\"type\":\"AAAA\",\"value\":\"fd7a:115c:a1e0::3\"}]" koanf:"extra_records"`
+
+	// ExtraRecordsPath is a file of extra records, reloaded when it
+	// changes. The extension picks the format: `.json`, `.hujson`, `.yaml`
+	// or `.yml`. Mutually exclusive with `dns.extra_records`.
+	ExtraRecordsPath string `example:"\"/var/lib/headscale/extra-records.json\"" koanf:"extra_records_path" nix:"path"`
+
+	// Certificates lets nodes get TLS certificates for their MagicDNS
+	// names with `tailscale cert`. The node runs ACME itself; headscale
+	// publishes its DNS-01 challenge through `dns.challenge.provider`.
+	Certificates CertificatesConfig `koanf:"certificates"`
+
+	// Challenge is the DNS provider answering ACME DNS-01 challenges, for
+	// node certificates and for headscale's own certificate when
+	// `tls.acme.challenge_type` is `DNS-01`. See
+	// [DNS-01 challenge provider](https://headscale.net/stable/ref/dns/#dns-01-challenge-provider).
+	Challenge DNSChallengeConfig `koanf:"challenge"`
 }
 
 // CertificatesConfig lets nodes get TLS certificates for their MagicDNS
 // name with `tailscale cert`. The node runs ACME itself; headscale
 // publishes its DNS-01 challenge through [DNSChallengeConfig].
 type CertificatesConfig struct {
-	Enabled bool
-	// Zone is the public DNS zone challenge records are written to. It is
-	// base_domain unless base_domain sits below the zone apex.
-	Zone string
+	// Enabled lets nodes run `tailscale cert`. It requires
+	// `dns.magic_dns`, a lowercase `dns.base_domain` and
+	// `dns.challenge.provider`.
+	Enabled bool `koanf:"enabled"`
+
+	// Zone is the public DNS zone challenge records are written to, when
+	// `dns.base_domain` sits below the zone apex. It must contain
+	// `dns.base_domain`. Empty uses `dns.base_domain`.
+	Zone string `example:"\"example.com\"" koanf:"zone"`
+}
+
+// CertificateZone is the zone challenge records are written to:
+// Certificates.Zone, else BaseDomain.
+func (d DNSConfig) CertificateZone() string {
+	return cmp.Or(d.Certificates.Zone, d.BaseDomain)
 }
 
 // DNSChallengeConfig is the DNS provider answering ACME DNS-01
 // challenges for node certificates and headscale's own certificate.
 type DNSChallengeConfig struct {
-	PropagationTimeout time.Duration
-	Resolvers          []string
-	ProviderName       string
-	// Provider is nil when no provider is configured. It is built while
-	// loading so `headscale configtest` reports bad provider settings,
-	// and never serialised because it holds credentials.
-	Provider hsdns.Provider `json:"-"`
+	// PropagationTimeout is how long to wait for a challenge record to
+	// show up on every authoritative nameserver. Zero skips the check.
+	PropagationTimeout time.Duration `example:"\"5m\"" koanf:"propagation_timeout"`
+
+	// Resolvers are the servers asked for the zone's nameservers, each an
+	// IP or host with an optional port (53 if omitted). Empty uses the
+	// default public resolvers. The system resolver is never used: on a
+	// host running MagicDNS it answers for `dns.base_domain` itself.
+	Resolvers []string `example:"[\"9.9.9.9:53\",\"[2620:fe::fe]:53\"]" koanf:"resolvers"`
+
+	// ProviderSettings is the DNS provider that writes challenge records:
+	// `name` selects it, the other keys are its settings. Keys are
+	// lowercased on load, at every depth; two that differ only in case
+	// are an error. Any setting may be `file:<path>` to read it from a
+	// file; a non-string one, such as acme-dns `config`, is the JSON in it.
+	// `headscale generate config --running` and `/debug/config`
+	// show `name` and `file:` references; every other setting is
+	// `<redacted>`, as any may be a credential. See
+	// [DNS-01 challenge provider](https://headscale.net/stable/ref/dns/#dns-01-challenge-provider)
+	// to set a provider up, acme-dns included, and to set it from
+	// environment variables.
+	ProviderSettings map[string]any `example:"{\"name\":\"cloudflare\",\"api_token\":\"file:/run/secrets/cloudflare\"}" json:"-" koanf:"provider" mapkey:"setting"`
+
+	// Provider is a DNS provider set from Go, by an embedder or a test; it
+	// cannot be set from a file. It wins over ProviderSettings.
+	Provider hsdns.Provider `json:"-" koanf:"-"`
 }
 
+// ProviderName is the provider ProviderSettings names, or "".
+func (c DNSChallengeConfig) ProviderName() string {
+	name, _ := c.ProviderNameText()
+
+	return name
+}
+
+// ProviderNameText is the name as text, and false when it is a map or list:
+// its contents may be credentials, so it is never formatted.
+func (c DNSChallengeConfig) ProviderNameText() (string, bool) {
+	switch name := c.ProviderSettings["name"].(type) {
+	case nil:
+		return "", true
+	case string:
+		return name, true
+	default:
+		return util.ScalarText(reflect.ValueOf(name))
+	}
+}
+
+// NewProvider builds the provider ProviderSettings names, handing secret
+// each string setting under its full config key.
+func (c DNSChallengeConfig) NewProvider(secret func(key, value string) (string, error)) (hsdns.Provider, error) {
+	return hsdns.NewProvider(
+		c.ProviderName(),
+		c.ProviderSettings,
+		func(key string) (any, bool) {
+			v, ok := c.ProviderSettings[key]
+
+			return v, ok
+		},
+		func(key, value string) (string, error) {
+			return secret(providerKey+"."+key, value)
+		},
+	)
+}
+
+// ResolverAddrs returns Resolvers as host:port, or the defaults when none
+// are set. Like dns.nameservers, a resolver may be a bare IP.
+func (c DNSChallengeConfig) ResolverAddrs() []string {
+	if len(c.Resolvers) == 0 {
+		return DefaultChallengeResolvers()
+	}
+
+	addrs := make([]string, len(c.Resolvers))
+	for i, r := range c.Resolvers {
+		addrs[i] = r
+
+		_, _, err := net.SplitHostPort(r)
+		if err != nil {
+			addrs[i] = net.JoinHostPort(r, "53")
+		}
+	}
+
+	return addrs
+}
+
+// Nameservers are the upstream DNS servers sent to clients. An entry that
+// is neither an IP address nor a URL is skipped with a warning.
 type Nameservers struct {
-	Global []string
-	Split  map[string][]string
+	// Global are the nameservers for names `dns.nameservers.split` does not
+	// cover: IP addresses, or DNS-over-HTTPS URLs such as
+	// `https://dns.nextdns.io/<id>`. Empty by default, so clients keep
+	// their own DNS: headscale points them at no resolver you did not list.
+	Global []string `example:"[\"9.9.9.9\",\"149.112.112.112\",\"2620:fe::fe\",\"2620:fe::9\"]" koanf:"global"`
+
+	// Split maps a domain to the nameservers that answer for it (split
+	// DNS). Domains are lowercased on load; two that differ only in case
+	// are an error.
+	Split map[string][]string `example:"{\"corp.example.com\":[\"192.0.2.53\"],\"lab.example.net\":[\"198.51.100.53\",\"2001:db8::53\"]}" koanf:"split" mapkey:"domain"`
 }
 
+// SqliteConfig configures the SQLite database.
 type SqliteConfig struct {
-	Path              string
-	WriteAheadLog     bool
-	WALAutoCheckPoint int
+	// Path is the database file, relative to the configuration file;
+	// `:memory:` keeps the database in memory.
+	Path string `example:"\"/opt/headscale/db.sqlite\"" koanf:"path" nix:"external"`
+
+	// WriteAheadLog runs SQLite in write-ahead log (WAL) mode, applies
+	// `database.sqlite.wal_autocheckpoint` and compacts the database
+	// (`VACUUM`) on shutdown. False uses SQLite's rollback journal
+	// (`DELETE`) with `synchronous=FULL`, and converts a database left
+	// in WAL mode when headscale opens it.
+	WriteAheadLog bool `koanf:"write_ahead_log"`
+
+	// WALAutoCheckPoint is the number of WAL frames after which the WAL
+	// is checkpointed automatically; zero disables automatic checkpoints.
+	// Applied only when `database.sqlite.write_ahead_log` is true.
+	WALAutoCheckPoint int `example:"2000" koanf:"wal_autocheckpoint"`
 }
 
+// PostgresConfig configures the PostgreSQL database, supported for legacy
+// deployments only.
 type PostgresConfig struct {
-	Host                string
-	Port                int
-	Name                string
-	User                string
-	Pass                string `json:"-"` // never serialise the database password
-	Ssl                 string
-	MaxOpenConnections  int
-	MaxIdleConnections  int
-	ConnMaxIdleTimeSecs int
+	// Host is the server's host name or IP, or the directory of its Unix
+	// socket (a path starting with `/`).
+	Host string `example:"\"db.example.com\"" koanf:"host"`
+
+	// Port is the server's port or, with a Unix socket directory in
+	// `database.postgres.host`, the port in the socket's file name. Zero
+	// uses the driver's default.
+	Port int `example:"5432" koanf:"port"`
+
+	// Name is the database name.
+	Name string `example:"\"headscale\"" koanf:"name"`
+
+	// User is the user to connect as.
+	User string `example:"\"headscale\"" koanf:"user"`
+
+	// Pass is the password, or `file:<path>` to read it from a file, read
+	// only when `database.type` is `postgres`. `headscale generate config
+	// --running` and `/debug/config` show a literal password as
+	// `<redacted>` and a `file:` reference as written.
+	Pass Secret `example:"\"file:/run/secrets/postgres_password\"" json:"-" koanf:"pass"`
+
+	// Ssl is the TLS mode: `true` keeps the driver's default `sslmode`,
+	// `false` disables TLS, any other value is passed as `sslmode`
+	// (`require`, `verify-full`, ...).
+	Ssl string `example:"\"verify-full\"" koanf:"ssl"`
+
+	// MaxOpenConnections caps open connections to the database.
+	MaxOpenConnections int `example:"20" koanf:"max_open_conns"`
+
+	// MaxIdleConnections caps idle connections kept in the pool.
+	MaxIdleConnections int `example:"5" koanf:"max_idle_conns"`
+
+	// ConnMaxIdleTimeSecs is how long, in seconds, a connection may stay
+	// idle before it is closed.
+	ConnMaxIdleTimeSecs int `example:"600" koanf:"conn_max_idle_time_secs"`
 }
 
 // DSN returns the connection string for this configuration as a
@@ -243,7 +555,7 @@ func (cfg PostgresConfig) DSN() string {
 
 	switch {
 	case cfg.Pass != "":
-		u.User = url.UserPassword(cfg.User, cfg.Pass)
+		u.User = url.UserPassword(cfg.User, string(cfg.Pass))
 	case cfg.User != "":
 		u.User = url.User(cfg.User)
 	}
@@ -280,129 +592,256 @@ func (cfg PostgresConfig) DSN() string {
 	return u.String()
 }
 
+// GormConfig configures query logging; it applies only with
+// database.debug.
 type GormConfig struct {
-	Debug                 bool
-	SlowThreshold         time.Duration
-	SkipErrRecordNotFound bool
-	ParameterizedQueries  bool
+	// SlowThreshold is the query time, in milliseconds, above which a
+	// query is logged as a warning. Zero disables the warning.
+	SlowThreshold int `example:"1000" koanf:"slow_threshold"`
+
+	// SkipErrRecordNotFound logs a query that finds no record as an
+	// ordinary query, not as an error.
+	SkipErrRecordNotFound bool `koanf:"skip_err_record_not_found"`
+
+	// ParameterizedQueries logs queries without their parameter values.
+	ParameterizedQueries bool `koanf:"parameterized_queries"`
 }
 
+// DatabaseConfig selects and configures the database.
 type DatabaseConfig struct {
-	// Type sets the database type, either "sqlite3" or "postgres"
-	Type  string
-	Debug bool
+	// Type is the database backend. SQLite is recommended; PostgreSQL is
+	// supported for legacy deployments only.
+	Type DatabaseType `example:"\"sqlite\"" koanf:"type"`
 
-	// Type sets the gorm configuration
-	Gorm GormConfig
+	// Debug turns on query logging: ordinary queries at log level debug,
+	// shown only when `log.level` is `debug` or `trace`, slow ones at warn
+	// and failed ones at error. Off, no query is logged. `database.gorm`
+	// shapes the query log. See
+	// [Database logging](https://headscale.net/stable/ref/debug/#database-logging).
+	Debug bool `koanf:"debug"`
 
-	Sqlite   SqliteConfig
-	Postgres PostgresConfig
+	// Gorm is query logging, applied only when `database.debug` is true.
+	Gorm GormConfig `koanf:"gorm"`
+
+	// Sqlite is SQLite, read only when `database.type` is `sqlite` or
+	// `sqlite3`.
+	Sqlite SqliteConfig `koanf:"sqlite"`
+
+	// Postgres is PostgreSQL, read only when `database.type` is
+	// `postgres`. An empty `host`, `name`, `user`, `pass` or `ssl` leaves
+	// that setting to the driver, which reads the `PG*` environment
+	// variables and falls back to the defaults of libpq, PostgreSQL's
+	// client library: a local socket, the OS user, and TLS if the server
+	// offers it.
+	Postgres PostgresConfig `koanf:"postgres"`
 }
 
-type TLSConfig struct {
-	CertPath string
-	KeyPath  string
+// IsSQLite reports whether Type names SQLite, in either spelling.
+func (d DatabaseConfig) IsSQLite() bool {
+	return d.Type == DatabaseSqlite || d.Type == DatabaseSqliteShort
+}
 
-	ACME ACMEConfig
+// TLSConfig is headscale's own certificate: from files, or from ACME. The
+// two are mutually exclusive.
+type TLSConfig struct {
+	// CertPath is the PEM certificate file, relative to the configuration
+	// file. Setting it turns TLS on.
+	CertPath string `example:"\"/etc/headscale/tls/cert.pem\"" koanf:"cert_path" nix:"path"`
+
+	// KeyPath is the PEM private key file of `tls.cert_path`, relative to
+	// the configuration file.
+	KeyPath string `example:"\"/etc/headscale/tls/key.pem\"" koanf:"key_path" nix:"external"`
+
+	// ACME gets the certificate from an ACME CA such as Let's Encrypt,
+	// and renews it. Setting `tls.acme.hostname` turns it on.
+	ACME ACMEConfig `koanf:"acme"`
 }
 
 // ACMEConfig gets headscale's own certificate from an ACME CA.
 type ACMEConfig struct {
-	Hostname      string
-	ChallengeType string
-	// HTTPListen serves HTTP-01 challenges.
-	HTTPListen string
-	URL        string
-	Email      string
-	CacheDir   string
+	// Hostname is the domain to request a certificate for. Setting it
+	// turns ACME on.
+	Hostname string `example:"\"headscale.example.com\"" koanf:"hostname"`
+
+	// ChallengeType is how the CA verifies that headscale controls
+	// `tls.acme.hostname`.
+	ChallengeType ACMEChallenge `example:"\"TLS-ALPN-01\"" koanf:"challenge_type"`
+
+	// HTTPListen is the host:port serving HTTP-01 challenges; the port
+	// may be a name, as in `:http` for port 80. Other requests to it are
+	// redirected to `server_url`.
+	HTTPListen ListenAddr `example:"\"0.0.0.0:80\"" koanf:"http_listen"`
+
+	// URL is the CA's ACME directory. Empty uses Let's Encrypt.
+	URL HTTPURL `example:"\"https://acme-staging-v02.api.letsencrypt.org/directory\"" koanf:"url"`
+
+	// Email is the contact address registered with the CA.
+	Email string `example:"\"admin@example.com\"" koanf:"email"`
+
+	// CacheDir is where certificates and ACME account data are stored,
+	// relative to the configuration file.
+	CacheDir string `example:"\"/var/cache/headscale/acme\"" koanf:"cache_dir" nix:"external"`
 }
 
-// legacyTLSKeys maps each tls key to the flat key it replaced. The flat
-// keys keep working, so existing configs and NixOS modules still run.
-var legacyTLSKeys = map[string]string{
-	"tls.cert_path":           "tls_cert_path",
-	"tls.key_path":            "tls_key_path",
-	"tls.acme.hostname":       "tls_letsencrypt_hostname",
-	"tls.acme.challenge_type": "tls_letsencrypt_challenge_type",
-	"tls.acme.http_listen":    "tls_letsencrypt_listen",
-	"tls.acme.cache_dir":      "tls_letsencrypt_cache_dir",
-	"tls.acme.url":            "acme_url",
-	"tls.acme.email":          "acme_email",
-}
-
-var tlsDefaults = map[string]string{
-	"tls.acme.challenge_type": HTTP01ChallengeType,
-	"tls.acme.http_listen":    ":http",
-	"tls.acme.cache_dir":      "/var/lib/headscale/cache",
-}
-
-// warnLegacyTLSKeys points at the tls keys for flat keys in the config
-// file that turn TLS on. NixOS writes the flat keys even with TLS off, and
-// the HEADSCALE_TLS_* variables name both the flat and the tls keys.
-func warnLegacyTLSKeys(depr *deprecator) {
-	legacyTLSOn := func(key string) bool { return viper.InConfig(key) && viper.GetString(key) != "" }
-	if !legacyTLSOn("tls_letsencrypt_hostname") && !legacyTLSOn("tls_cert_path") {
-		return
-	}
-
-	for _, key := range slices.Sorted(maps.Keys(legacyTLSKeys)) {
-		if viper.InConfig(legacyTLSKeys[key]) {
-			depr.warnNoAlias(key, legacyTLSKeys[key])
-		}
-	}
-}
-
-// tlsKey reads a tls setting, falling back to the flat key it replaced and
-// then to its default. The defaults are not viper defaults: those would
-// shadow the flat key.
-func tlsKey(key string) string {
-	return cmp.Or(viper.GetString(key), viper.GetString(legacyTLSKeys[key]), tlsDefaults[key])
-}
-
+// PKCEConfig configures PKCE (RFC 7636), which protects the OIDC
+// authorization code from interception.
 type PKCEConfig struct {
-	Enabled bool
-	Method  string
+	// Enabled sends a PKCE challenge with each login.
+	Enabled bool `koanf:"enabled"`
+
+	// Method is how the code challenge is derived from the verifier. The
+	// verifier is sent as is in the token exchange.
+	Method PKCEMethod `example:"\"plain\"" koanf:"method"`
 }
 
+// OIDCConfig configures login through an OpenID Connect provider.
 type OIDCConfig struct {
-	OnlyStartIfOIDCIsAvailable bool
-	Issuer                     string
-	ClientID                   string
-	ClientSecret               string `json:"-"` // never serialise the OIDC client secret
-	Scope                      []string
-	ExtraParams                map[string]string
-	AllowedDomains             []string
-	AllowedUsers               []string
-	AllowedGroups              []string
-	EmailVerifiedRequired      bool
-	UseExpiryFromToken         bool
-	PKCE                       PKCEConfig
+	// OnlyStartIfOIDCIsAvailable stops startup when the provider cannot be
+	// reached. False starts without OIDC, with CLI-based registration.
+	OnlyStartIfOIDCIsAvailable bool `koanf:"only_start_if_oidc_is_available"`
+
+	// Issuer is the provider's issuer URL. Setting it turns OIDC on.
+	Issuer HTTPURL `example:"\"https://idp.example.com/realms/headscale\"" koanf:"issuer"`
+
+	// ClientID is the client ID from the provider; required when
+	// `oidc.issuer` is set.
+	ClientID string `example:"\"headscale\"" koanf:"client_id"`
+
+	// ClientSecret is the client secret from the provider, or
+	// `file:<path>` to read it from a file; required when `oidc.issuer` is
+	// set. `headscale generate config --running` and `/debug/config` show a
+	// literal secret as `<redacted>` and a `file:` reference as written.
+	ClientSecret Secret `example:"\"file:/run/secrets/oidc_client_secret\"" json:"-" koanf:"client_secret"`
+
+	// Scope are the scopes requested; include `openid`.
+	Scope []string `example:"[\"openid\",\"profile\",\"email\",\"groups\"]" koanf:"scope"`
+
+	// ExtraParams are sent as is to the provider's authorization endpoint,
+	// e.g. `domain_hint`; names keep their case.
+	ExtraParams map[string]string `example:"{\"domain_hint\":\"example.com\",\"prompt\":\"select_account\"}" koanf:"extra_params" mapkey:"param"`
+
+	// AllowedDomains admits only users whose email domain is listed.
+	// Empty admits any domain.
+	AllowedDomains []string `example:"[\"example.com\"]" koanf:"allowed_domains"`
+
+	// AllowedUsers admits only users whose email address is listed. Empty
+	// admits any user.
+	AllowedUsers []string `example:"[\"alice@example.com\"]" koanf:"allowed_users"`
+
+	// AllowedGroups admits only members of at least one listed group,
+	// from the provider's `groups` claim: UserInfo first, the ID token as
+	// fallback. Empty admits any group.
+	AllowedGroups []string `example:"[\"headscale-users\"]" koanf:"allowed_groups"`
+
+	// EmailVerifiedRequired trusts an email only when the provider marks
+	// it verified: an unverified one fails `oidc.allowed_domains` and
+	// `oidc.allowed_users` and is not copied to the user. Turn it off for a
+	// provider that does not send `email_verified`.
+	EmailVerifiedRequired bool `koanf:"email_verified_required"`
+
+	// UseExpiryFromToken expires an OIDC-registered node with its token,
+	// instead of `node.expiry`. Tokens are often short-lived, forcing
+	// frequent logins.
+	UseExpiryFromToken bool `koanf:"use_expiry_from_token"`
+
+	// PKCE is Proof Key for Code Exchange (RFC 7636), which protects the
+	// authorization code from interception. See
+	// [Enable PKCE](https://headscale.net/stable/ref/oidc/#enable-pkce-recommended).
+	PKCE PKCEConfig `koanf:"pkce"`
 }
 
+// DERPConfig is the DERP map: the relay servers clients use when a direct
+// connection fails. Sources merge in order (DERPMap, URLs, Paths, then the
+// embedded server); a region replaces an earlier one with the same ID.
 type DERPConfig struct {
-	ServerEnabled                      bool
-	AutomaticallyAddEmbeddedDerpRegion bool
-	ServerRegionID                     tailcfg.DERPRegionID
-	ServerRegionCode                   string
-	ServerRegionName                   string
-	ServerPrivateKeyPath               string
-	ServerVerifyClients                bool
-	STUNAddr                           string
-	URLs                               []url.URL
-	Paths                              []string
-	DERPMap                            *tailcfg.DERPMap
-	AutoUpdate                         bool
-	UpdateFrequency                    time.Duration
-	IPv4                               string
-	IPv6                               string
+	// Server is the embedded DERP server, a relay and STUN server run by
+	// headscale itself. See
+	// [Enable embedded DERP](https://headscale.net/stable/ref/derp/#enable-embedded-derp).
+	Server DERPServerConfig `koanf:"server"`
+
+	// URLs are DERP maps in JSON to fetch. One that fails to load is
+	// logged and skipped; startup fails only when no region remains. The
+	// default is Tailscale's map: headscale fetches it from Tailscale and
+	// clients relay through Tailscale's servers. `[]` keeps to your own.
+	URLs []HTTPURL `example:"[\"https://derp.example.com/derpmap.json\"]" koanf:"urls"`
+
+	// Paths are DERP map files. The extension picks the format: `.yaml` or
+	// `.yml`, or Tailscale JSON as `.json` or `.hujson`, both accepting
+	// comments and trailing commas.
+	Paths []string `example:"[\"/etc/headscale/derp.yaml\"]" koanf:"paths" nix:"path"`
+
+	// AutoUpdate reloads `derp.urls` and `derp.paths` every
+	// `derp.update_frequency`.
+	AutoUpdate bool `koanf:"auto_update_enabled"`
+
+	// UpdateFrequency is how often `derp.auto_update_enabled` reloads the
+	// DERP map. Zero disables reloading.
+	UpdateFrequency time.Duration `example:"\"24h\"" koanf:"update_frequency"`
+
+	// DERPMap is a DERP map set from Go, by an embedder or a test; it
+	// cannot be set from a file.
+	DERPMap *tailcfg.DERPMap `json:"-" koanf:"-"`
 }
 
+// DERPServerConfig is the embedded DERP server.
+type DERPServerConfig struct {
+	// Enabled runs the embedded DERP server. DERP needs TLS, so
+	// `server_url` must be `https://`.
+	Enabled bool `koanf:"enabled"`
+
+	// RegionID is the embedded server's region ID; required and positive
+	// when `derp.server.enabled` is true. Tailscale keeps 900-999 for your
+	// own regions. It replaces a region with the same ID from the other
+	// sources.
+	RegionID tailcfg.DERPRegionID `example:"999" koanf:"region_id"`
+
+	// RegionCode is the region's short code, shown by Tailscale clients.
+	RegionCode string `example:"\"headscale\"" koanf:"region_code"`
+
+	// RegionName is the region's name, shown by Tailscale clients.
+	RegionName string `example:"\"Headscale Embedded DERP\"" koanf:"region_name"`
+
+	// VerifyClients admits only nodes registered with this server.
+	VerifyClients bool `koanf:"verify_clients"`
+
+	// STUNAddr is the UDP host:port of the STUN server, which helps
+	// clients with NAT traversal; required when `derp.server.enabled` is
+	// true.
+	STUNAddr ListenAddr `example:"\"0.0.0.0:3478\"" koanf:"stun_listen_addr"`
+
+	// PrivateKeyPath is the file holding the DERP server's private key,
+	// relative to the configuration file; required when
+	// `derp.server.enabled` is true. A missing file is created with a new
+	// key. It must differ from `noise.private_key_path`.
+	PrivateKeyPath string `example:"\"/var/lib/headscale/derp_server_private.key\"" koanf:"private_key_path" nix:"external"`
+
+	// IPv4 is the server's public IPv4 address, published in the DERP map
+	// so clients reach it without DNS. Empty publishes none.
+	IPv4 string `example:"\"198.51.100.1\"" koanf:"ipv4"`
+
+	// IPv6 is the server's public IPv6 address, published in the DERP map
+	// so clients reach it without DNS. Empty publishes none.
+	IPv6 string `example:"\"2001:db8::1\"" koanf:"ipv6"`
+
+	// AutomaticallyAddEmbeddedDerpRegion adds the embedded server's region
+	// to the DERP map. When it is false and `derp.server.enabled` is true,
+	// `derp.paths` is required: write the region there yourself.
+	AutomaticallyAddEmbeddedDerpRegion bool `koanf:"automatically_add_embedded_derp_region"`
+}
+
+// LogTailConfig controls client logging to Tailscale.
 type LogTailConfig struct {
-	Enabled bool
+	// Enabled lets nodes send their logs to Tailscale Inc.; headscale
+	// cannot point them at another log server. False tells nodes not to.
+	Enabled bool `koanf:"enabled"`
 }
 
+// TaildropConfig controls Taildrop, Tailscale's file sharing between
+// nodes.
 type TaildropConfig struct {
-	Enabled bool
+	// Enabled gives every node the file-sharing capability. False omits
+	// it from the baseline; a policy `nodeAttrs` grant can still give it.
+	Enabled bool `koanf:"enabled"`
 }
 
 // AutoUpdateConfig controls the tailnet-wide default for client
@@ -411,28 +850,54 @@ type TaildropConfig struct {
 // node's CapMap; clients fall back to that default unless they have
 // opted in or out locally.
 type AutoUpdateConfig struct {
-	Enabled bool
+	// Enabled makes auto-update the default for clients that have not
+	// chosen locally. Clients store the default they first see, so a
+	// later change reaches only new clients.
+	Enabled bool `koanf:"enabled"`
 }
 
+// CLIConfig is how the headscale CLI reaches the server: the local
+// unix_socket without authentication, or a remote address with an API key.
 type CLIConfig struct {
-	Address  string
-	APIKey   string `json:"-"` // never serialise the headscale admin API key
-	Timeout  time.Duration
-	Insecure bool
+	// Address is the remote server's host:port or URL; `https://` is
+	// assumed without a scheme. Empty uses `unix_socket`.
+	Address string `example:"\"headscale.example.com:443\"" koanf:"address"`
+
+	// APIKey is the API key the CLI sends to `cli.address`, or
+	// `file:<path>` to read it from a file. Read only by the CLI.
+	APIKey Secret `example:"\"file:/run/secrets/headscale_api_key\"" json:"-" koanf:"api_key"`
+
+	// Timeout bounds each CLI command's requests to the server.
+	Timeout time.Duration `example:"\"30s\"" koanf:"timeout"`
+
+	// Insecure skips TLS certificate verification of `cli.address`.
+	Insecure bool `koanf:"insecure"`
 }
 
+// PolicyConfig is where the access control policy (ACLs and grants) is
+// stored.
 type PolicyConfig struct {
-	Path string
-	Mode PolicyMode
+	// Path is the HuJSON policy file read when `policy.mode` is `file`,
+	// relative to the configuration file. Empty starts without a policy,
+	// which allows all traffic.
+	Path string `example:"\"/etc/headscale/policy.hujson\"" koanf:"path" nix:"path"`
+
+	// Mode is where the policy is kept: in the file `policy.path`, or in
+	// the database, edited through the CLI or API.
+	Mode PolicyMode `example:"\"database\"" koanf:"mode"`
 }
 
 func (p *PolicyConfig) IsEmpty() bool {
 	return p.Mode == PolicyModeFile && p.Path == ""
 }
 
+// LogConfig configures headscale's own log output.
 type LogConfig struct {
-	Format string
-	Level  zerolog.Level
+	// Level is the lowest level logged.
+	Level LogLevel `example:"\"debug\"" koanf:"level"`
+
+	// Format is how log lines are written.
+	Format LogFormat `example:"\"json\"" koanf:"format"`
 }
 
 // Tuning contains advanced performance tuning parameters for Headscale.
@@ -441,107 +906,161 @@ type LogConfig struct {
 // need adjustment. Changes to these values can significantly impact performance
 // and resource usage.
 type Tuning struct {
-	// NotifierSendTimeout is the maximum time to wait when sending notifications
-	// to connected clients about network changes.
-	NotifierSendTimeout time.Duration
+	// BatchChangeDelay is how often queued changes are sent to clients
+	// as one update; must be positive.
+	BatchChangeDelay time.Duration `example:"\"500ms\"" koanf:"batch_change_delay"`
 
-	// BatchChangeDelay controls how long to wait before sending batched updates
-	// to clients when multiple changes occur in rapid succession.
-	BatchChangeDelay time.Duration
+	// NodeMapSessionBufferedChanSize is how many map updates are queued
+	// per connected client.
+	NodeMapSessionBufferedChanSize int `example:"60" koanf:"node_mapsession_buffered_chan_size"`
 
-	// NodeMapSessionBufferedChanSize sets the buffer size for the channel that
-	// queues map updates to be sent to connected clients.
-	NodeMapSessionBufferedChanSize int
+	// BatcherWorkers is the number of workers building map updates for
+	// connected clients. Zero picks the number from the CPU count.
+	BatcherWorkers int `defaulttext:"three quarters of the CPU cores, at least one" example:"8" koanf:"batcher_workers"`
 
-	// BatcherWorkers controls the number of parallel workers processing map
-	// updates for connected clients.
-	BatcherWorkers int
+	// RegisterCacheExpiration is how long a pending registration waits
+	// to be completed. Zero uses the default.
+	RegisterCacheExpiration time.Duration `example:"\"30m\"" koanf:"register_cache_expiration"`
 
-	// RegisterCacheExpiration is how long registration cache entries remain
-	// valid before being eligible for eviction.
-	RegisterCacheExpiration time.Duration
+	// RegisterCacheMaxEntries bounds pending registrations. At capacity,
+	// new registrations are refused without evicting pending ones; SSH
+	// checks have a small reserve beyond it. Zero uses the default. See
+	// [Pending authentication limits](https://headscale.net/stable/ref/registration/#pending-authentication-limits).
+	RegisterCacheMaxEntries int `example:"4096" koanf:"register_cache_max_entries"`
 
-	// RegisterCacheMaxEntries bounds pending registrations. At capacity, new
-	// registrations are refused without evicting admitted sessions. SSH checks
-	// can also use 64 reserved slots beyond this limit.
-	// A value of 0 falls back to defaultRegisterCacheMaxEntries (1024).
-	RegisterCacheMaxEntries int
+	// NodeStoreBatchSize is how many node changes are batched before the
+	// in-memory node state, peer relationships included, is rebuilt; must
+	// be positive. Higher values save CPU on bulk changes but delay each
+	// change until its batch is full or `tuning.node_store_batch_timeout`
+	// passes.
+	NodeStoreBatchSize int `example:"200" koanf:"node_store_batch_size"`
 
-	// NodeStoreBatchSize controls how many write operations are accumulated
-	// before rebuilding the in-memory node snapshot.
-	//
-	// The NodeStore batches write operations (add/update/delete nodes) before
-	// rebuilding its in-memory data structures. Rebuilding involves recalculating
-	// peer relationships between all nodes based on the current ACL policy, which
-	// is computationally expensive and scales with the square of the number of nodes.
-	//
-	// By batching writes, Headscale can process N operations but only rebuild once,
-	// rather than rebuilding N times. This significantly reduces CPU usage during
-	// bulk operations like initial sync or policy updates.
-	//
-	// Trade-off: Higher values reduce CPU usage from rebuilds but increase latency
-	// for individual operations waiting for their batch to complete.
-	NodeStoreBatchSize int
-
-	// NodeStoreBatchTimeout is the maximum time to wait before processing a
-	// partial batch of node operations.
-	//
-	// When [Tuning.NodeStoreBatchSize] operations haven't accumulated, this timeout ensures
-	// writes don't wait indefinitely. The batch processes when either the size
-	// threshold is reached OR this timeout expires, whichever comes first.
-	//
-	// Trade-off: Lower values provide faster response for individual operations
-	// but trigger more frequent (expensive) peer map rebuilds. Higher values
-	// optimize for bulk throughput at the cost of individual operation latency.
-	NodeStoreBatchTimeout time.Duration
+	// NodeStoreBatchTimeout is the longest a partial batch of node changes
+	// waits before the rebuild; must be positive. Lower values answer
+	// single changes faster at the cost of more rebuilds.
+	NodeStoreBatchTimeout time.Duration `example:"\"1s\"" koanf:"node_store_batch_timeout"`
 }
 
-func validatePKCEMethod(method string) error {
-	if method != PKCEMethodPlain && method != PKCEMethodS256 {
-		return errInvalidPKCEMethod
+// BatcherWorkerCount is BatcherWorkers, or [DefaultBatcherWorkers] when unset.
+func (t Tuning) BatcherWorkerCount() int {
+	if t.BatcherWorkers > 0 {
+		return t.BatcherWorkers
 	}
 
-	return nil
+	return DefaultBatcherWorkers()
 }
 
-// validateOIDCConfig validates the OIDC settings, called when oidc.issuer is
-// set. It fails fast on a setup that cannot work: an invalid PKCE method, a
-// malformed issuer URL (which would otherwise surface as an opaque discovery
-// error or, worse, resolve to an unintended provider), or a missing client
-// id/secret.
-func validateOIDCConfig() error {
-	err := validatePKCEMethod(viper.GetString("oidc.pkce.method"))
-	if err != nil {
-		return err
+// DERPShuffleSeed seeds the DERP node order: dns.base_domain, or the
+// server_url host while dns.base_domain is [DefaultBaseDomain]. Empty
+// seeds randomly on each start.
+func (c *Config) DERPShuffleSeed() string {
+	if c.DNSConfig.BaseDomain != DefaultBaseDomain {
+		return c.DNSConfig.BaseDomain
 	}
 
-	issuer := viper.GetString("oidc.issuer")
-
-	u, err := url.Parse(issuer)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return fmt.Errorf("%w: got %q", errOIDCIssuerInvalid, issuer)
-	}
-
-	if viper.GetString("oidc.client_id") == "" {
-		return errOIDCClientIDRequired
-	}
-
-	if viper.GetString("oidc.client_secret") == "" && viper.GetString("oidc.client_secret_path") == "" {
-		return errOIDCClientSecretRequired
-	}
-
-	return nil
-}
-
-// Domain returns the hostname/domain part of the [Config.ServerURL].
-// If the [Config.ServerURL] is not a valid URL, it returns the [Config.BaseDomain].
-func (c *Config) Domain() string {
+	// A shared default domain would give every such server the same relay order.
 	u, err := url.Parse(c.ServerURL)
 	if err != nil {
-		return c.BaseDomain
+		return ""
 	}
 
 	return u.Hostname()
+}
+
+// Domain returns the hostname/domain part of the [Config.ServerURL].
+// If the [Config.ServerURL] is not a valid URL, it returns dns.base_domain.
+func (c *Config) Domain() string {
+	u, err := url.Parse(c.ServerURL)
+	if err != nil {
+		return c.DNSConfig.BaseDomain
+	}
+
+	return u.Hostname()
+}
+
+// AbsPath resolves a path from the configuration against [Config.ConfigDir].
+func (c *Config) AbsPath(p string) string {
+	return util.AbsolutePath(c.ConfigDir, p)
+}
+
+// URLKeys are the keys that may hold a URL, whose userinfo may be a
+// credential: [Config.RedactedURLs] redacts it and errors never show their
+// values.
+var URLKeys = []string{
+	"server_url", "cli.address", "dns.nameservers.global", "dns.nameservers.split",
+	"tls.acme.url", "oidc.issuer", "derp.urls",
+}
+
+// RedactedURLs returns c with the userinfo of the URLs that URLKeys hold
+// redacted as [HTTPURL.Redacted] does; a value without an @ has none and is
+// kept, a host:port or an IP included. c keeps its values.
+func (c Config) RedactedURLs() Config {
+	for _, f := range ConfigFields(&c) {
+		if slices.Contains(URLKeys, f.Path) {
+			f.Value.Set(redactedURLs(f.Value))
+		}
+	}
+
+	return c
+}
+
+// redactedURLs is v, a text or a list or map of texts, with each redacted;
+// a list or map is a copy.
+func redactedURLs(v reflect.Value) reflect.Value {
+	switch v.Kind() { //nolint:exhaustive // the kinds URLKeys hold
+	case reflect.String:
+		return reflect.ValueOf(redactedURL(v.String())).Convert(v.Type())
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := range v.Len() {
+			out.Index(i).Set(redactedURLs(v.Index(i)))
+		}
+
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		for k, e := range v.Seq2() {
+			out.SetMapIndex(k, redactedURLs(e))
+		}
+
+		return out
+	}
+
+	return v
+}
+
+func redactedURL(s string) string {
+	if !strings.Contains(s, "@") {
+		return s
+	}
+
+	return HTTPURL(s).Redacted()
+}
+
+// MarshalJSON writes c without credentials, for debug output and logs:
+// secrets are left out and URLs lose their userinfo.
+func (c Config) MarshalJSON() ([]byte, error) {
+	type plain Config // without this method
+
+	return json.Marshal(plain(c.RedactedURLs()))
+}
+
+// SQLitePath is database.sqlite.path resolved, keeping SQLite's in-memory
+// name, which is not a file.
+func (c *Config) SQLitePath() string {
+	if c.Database.Sqlite.Path == ":memory:" {
+		return c.Database.Sqlite.Path
+	}
+
+	return c.AbsPath(c.Database.Sqlite.Path)
 }
 
 // ServesRoute reports whether an approved route is handed to clients. A
@@ -555,858 +1074,71 @@ func (c *Config) ServesRoute(p netip.Prefix) bool {
 
 	addr := p.Addr().Unmap()
 
-	return (c.PrefixV4 == nil || !c.PrefixV4.Contains(addr)) &&
-		(c.PrefixV6 == nil || !c.PrefixV6.Contains(addr))
+	return (c.Prefixes.V4 == nil || !c.Prefixes.V4.Contains(addr)) &&
+		(c.Prefixes.V6 == nil || !c.Prefixes.V6.Contains(addr))
 }
 
-// LoadConfig prepares and loads the Headscale configuration into Viper.
-// This means it sets the default values, reads the configuration file and
-// environment variables, and handles deprecated configuration options.
-// It has to be called before [LoadServerConfig] and [LoadCLIConfig].
-// The configuration is not validated and the caller should check for errors
-// using a validation function.
-func LoadConfig(path string, isFile bool) error {
-	if isFile {
-		viper.SetConfigFile(path)
-	} else {
-		viper.SetConfigName("config")
-
-		if path == "" {
-			viper.AddConfigPath("/etc/headscale/")
-			viper.AddConfigPath("$HOME/.headscale")
-			viper.AddConfigPath(".")
-		} else {
-			// For testing
-			viper.AddConfigPath(path)
-		}
-	}
-
-	envPrefix := "headscale"
-	viper.SetEnvPrefix(envPrefix)
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
-
-	viper.SetDefault("policy.mode", "file")
-
-	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.format", TextLogFormat)
-
-	viper.SetDefault("dns.magic_dns", true)
-	viper.SetDefault("dns.base_domain", "")
-	viper.SetDefault("dns.override_local_dns", true)
-	viper.SetDefault("dns.nameservers.global", []string{})
-	viper.SetDefault("dns.nameservers.split", map[string]string{})
-	viper.SetDefault("dns.search_domains", []string{})
-	viper.SetDefault("dns.certificates.enabled", false)
-
-	viper.SetDefault("dns.challenge.propagation_timeout", "2m")
-
-	viper.SetDefault("derp.server.enabled", false)
-	viper.SetDefault("derp.server.verify_clients", true)
-	viper.SetDefault("derp.server.stun.enabled", true)
-	viper.SetDefault("derp.server.automatically_add_embedded_derp_region", true)
-	viper.SetDefault("derp.update_frequency", "3h")
-
-	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
-	viper.SetDefault("unix_socket_permission", "0o770")
-
-	viper.SetDefault("cli.timeout", "5s")
-	viper.SetDefault("cli.insecure", false)
-
-	viper.SetDefault("database.postgres.ssl", false)
-	viper.SetDefault("database.postgres.max_open_conns", 10)
-	viper.SetDefault("database.postgres.max_idle_conns", 10)
-	viper.SetDefault("database.postgres.conn_max_idle_time_secs", 3600)
-
-	viper.SetDefault("database.sqlite.write_ahead_log", true)
-	viper.SetDefault("database.sqlite.wal_autocheckpoint", 1000) // SQLite default
-
-	viper.SetDefault("oidc.scope", []string{oidc.ScopeOpenID, "profile", "email"})
-	viper.SetDefault("oidc.only_start_if_oidc_is_available", true)
-	viper.SetDefault("oidc.use_expiry_from_token", false)
-	viper.SetDefault("oidc.pkce.enabled", false)
-	viper.SetDefault("oidc.pkce.method", "S256")
-	viper.SetDefault("oidc.email_verified_required", true)
-
-	viper.SetDefault("logtail.enabled", false)
-	viper.SetDefault("taildrop.enabled", true)
-	viper.SetDefault("auto_update.enabled", false)
-
-	viper.SetDefault("node.expiry", "0")
-	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
-	viper.SetDefault("preauth_keys.revoked_retention", "168h")
-	viper.SetDefault("node.routes.ha.probe_interval", "10s")
-	viper.SetDefault("node.routes.ha.probe_timeout", "5s")
-
-	viper.SetDefault("tuning.notifier_send_timeout", "800ms")
-	viper.SetDefault("tuning.batch_change_delay", "800ms")
-	viper.SetDefault("tuning.node_mapsession_buffered_chan_size", 30)
-	viper.SetDefault("tuning.node_store_batch_size", defaultNodeStoreBatchSize)
-	viper.SetDefault("tuning.node_store_batch_timeout", "500ms")
-
-	viper.SetDefault("prefixes.allocation", string(IPAllocationStrategySequential))
-
-	err := viper.ReadInConfig()
-	if err != nil {
-		if _, ok := errors.AsType[viper.ConfigFileNotFoundError](err); ok {
-			log.Warn().Msg("no config file found, using defaults")
-			return nil
-		}
-
-		return fmt.Errorf("fatal error reading config file: %w", err)
-	}
-
-	return nil
+// outsideRange reports whether p holds addresses outside r.
+func outsideRange(p, r netip.Prefix) bool {
+	return p.Bits() < r.Bits() || !r.Contains(p.Addr())
 }
 
-// resolveEphemeralInactivityTimeout resolves the ephemeral inactivity timeout
-// from config, supporting both the new key (node.ephemeral.inactivity_timeout)
-// and the old key (ephemeral_node_inactivity_timeout) for backwards compatibility.
-//
-// We cannot use viper.RegisterAlias here because aliases silently ignore
-// config values set under the alias name. If a user writes the new key in
-// their config file, RegisterAlias redirects reads to the old key (which
-// has no config value), returning only the default and discarding the
-// user's setting.
-func resolveEphemeralInactivityTimeout() time.Duration {
-	// New key takes precedence if explicitly set in config.
-	if viper.IsSet("node.ephemeral.inactivity_timeout") &&
-		viper.GetString("node.ephemeral.inactivity_timeout") != "" {
-		return viper.GetDuration("node.ephemeral.inactivity_timeout")
-	}
-
-	// Fall back to old key for backwards compatibility.
-	if viper.IsSet("ephemeral_node_inactivity_timeout") {
-		return viper.GetDuration("ephemeral_node_inactivity_timeout")
-	}
-
-	// Default
-	return viper.GetDuration("node.ephemeral.inactivity_timeout")
-}
-
-// resolveNodeExpiry parses the node.expiry config value.
-// Returns 0 if set to "0" (no default expiry) or on parse failure.
-func resolveNodeExpiry() time.Duration {
-	value := viper.GetString("node.expiry")
-	if value == "" || value == "0" {
-		return 0
-	}
-
-	expiry, err := model.ParseDuration(value)
-	if err != nil {
-		log.Warn().
-			Str("value", value).
-			Msg("failed to parse node.expiry, defaulting to no expiry")
-
-		return 0
-	}
-
-	return time.Duration(expiry)
-}
-
-// validateServerConfig is the test-only entry point. Production code
-// goes through LoadServerConfig, which lifts the validator to span
-// every config-time sub-builder so the operator sees every problem
-// in one render.
-func validateServerConfig() error {
-	v := &configValidator{}
-	validateServerConfigInto(v)
-
-	return v.Err()
-}
-
-var boolConfigKeys = []string{
-	"auto_update.enabled",
-	"cli.insecure",
-	"database.debug",
-	"database.gorm.parameterized_queries",
-	"database.gorm.skip_err_record_not_found",
-	"database.sqlite.write_ahead_log",
-	"derp.auto_update_enabled",
-	"derp.server.automatically_add_embedded_derp_region",
-	"derp.server.enabled",
-	"derp.server.verify_clients",
-	"disable_check_updates",
-	"dns.certificates.enabled",
-	"dns.magic_dns",
-	"dns.override_local_dns",
-	"logtail.enabled",
-	"oidc.email_verified_required",
-	"oidc.only_start_if_oidc_is_available",
-	"oidc.pkce.enabled",
-	"oidc.use_expiry_from_token",
-	"taildrop.enabled",
-}
-
-// Validate raw values before GetBool can discard conversion errors.
-func validateBoolConfig(v *configValidator, keys ...string) {
-	for _, key := range keys {
-		value := viper.Get(key)
-		if value == nil {
-			continue
-		}
-
-		_, err := strconv.ParseBool(fmt.Sprint(value))
-		if err != nil {
-			v.Add(&ConfigError{
-				Reason:  key + " is not a boolean",
-				Current: []KV{{key, value}},
-				Hint:    "use true or false",
-				Cause:   err,
-			})
-		}
-	}
-}
-
-// validateServerConfigInto runs every viper-level validation rule
-// against the provided validator. Caller owns the validator and is
-// responsible for inspecting v.Err() once all sub-builders have run.
-func validateServerConfigInto(v *configValidator) {
-	validateBoolConfig(v, boolConfigKeys...)
-
-	depr := deprecator{seen: make(set.Set[string])}
-
-	// Register aliases for backward compatibility
-	// Has to be called _after_ viper.ReadInConfig()
-	// https://github.com/spf13/viper/issues/560
-
-	// Alias the old ACL Policy path with the new configuration option.
-	depr.fatalIfNewKeyIsNotUsed("policy.path", "acl_policy_path")
-
-	// Move dns_config -> dns
-	depr.fatalIfNewKeyIsNotUsed("dns.magic_dns", "dns_config.magic_dns")
-	depr.fatalIfNewKeyIsNotUsed("dns.base_domain", "dns_config.base_domain")
-	depr.fatalIfNewKeyIsNotUsed("dns.override_local_dns", "dns_config.override_local_dns")
-	depr.fatalIfNewKeyIsNotUsed("dns.nameservers.global", "dns_config.nameservers")
-	depr.fatalIfNewKeyIsNotUsed("dns.nameservers.split", "dns_config.restricted_nameservers")
-	depr.fatalIfNewKeyIsNotUsed("dns.search_domains", "dns_config.domains")
-	depr.fatalIfNewKeyIsNotUsed("dns.extra_records", "dns_config.extra_records")
-	depr.fatal("dns.use_username_in_magic_dns")
-	depr.fatal("dns_config.use_username_in_magic_dns")
-
-	// Removed since version v0.26.0
-	depr.fatal("oidc.strip_email_domain")
-	depr.fatal("oidc.map_legacy_users")
-
-	// Removed since v0.29.0: `randomize_client_port` moved to the ACL
-	// policy as a top-level `randomizeClientPort` field, matching the
-	// Tailscale-hosted control plane schema. Per-node `nodeAttrs`
-	// entries granting `https://tailscale.com/cap/randomize-client-port`
-	// also work.
-	depr.fatalWithHint("randomize_client_port",
-		`Set "randomizeClientPort": true at the top level of your policy file `+
-			`(see policy.path / policy.mode), or grant the cap per-node via a `+
-			`"nodeAttrs" entry. See CHANGELOG.md (BREAKING / Configuration).`)
-
-	// Deprecated: ephemeral_node_inactivity_timeout -> node.ephemeral.inactivity_timeout
-	depr.warnNoAlias("node.ephemeral.inactivity_timeout", "ephemeral_node_inactivity_timeout")
-
-	// Removed: oidc.expiry -> node.expiry
-	depr.fatalIfSet("oidc.expiry", "node.expiry")
-
-	// Ignored: database.gorm.prepare_stmt. A warning, not a fatal, so configs
-	// that shipped with it set still start.
-	depr.warn("database.gorm.prepare_stmt")
-
-	// OIDC is activated by setting oidc.issuer (see app.go), not by a
-	// dedicated oidc.enabled key. Gate validation on the real activation
-	// condition so a misconfiguration fails at startup.
-	if viper.GetString("oidc.issuer") != "" {
-		err := validateOIDCConfig()
-		if err != nil {
-			v.Add(&ConfigError{
-				Reason: "OIDC configuration is invalid",
-				Detail: err.Error(),
-				Hint:   "check oidc.issuer, oidc.client_id, oidc.client_secret, and oidc.pkce.method",
-				Cause:  err,
-			})
-		}
-	}
-
-	if viper.IsSet("dns.extra_records") && viper.IsSet("dns.extra_records_path") {
-		v.Add(&ConfigError{
-			Reason: "dns.extra_records and dns.extra_records_path are mutually exclusive",
-			Current: []KV{
-				{"dns.extra_records_path", viper.GetString("dns.extra_records_path")},
-				{"dns.extra_records", "<inline records>"},
-			},
-			Hint: "keep one (a path is recommended for production); remove the other",
-		})
-	}
-
-	warnLegacyTLSKeys(&depr)
-
-	if tlsKey("tls.acme.hostname") != "" &&
-		(tlsKey("tls.cert_path") != "" || tlsKey("tls.key_path") != "") {
-		v.Add(&ConfigError{
-			Reason:  "tls.acme.hostname and tls.cert_path/tls.key_path are mutually exclusive",
-			Current: []KV{{"tls.acme.hostname", tlsKey("tls.acme.hostname")}},
-			ConflictsWith: []KV{
-				{"tls.cert_path", tlsKey("tls.cert_path")},
-				{"tls.key_path", tlsKey("tls.key_path")},
-			},
-			Hint: "choose one TLS strategy and unset the other (Let's Encrypt OR a static keypair)",
-			See:  "https://headscale.net/stable/ref/tls/",
-		})
-	}
-
-	if viper.GetString("noise.private_key_path") == "" {
-		v.Add(&ConfigError{
-			Reason: "noise.private_key_path is required",
-			Hint:   "set noise.private_key_path: /var/lib/headscale/noise_private.key (or any writable path)",
-			See:    "https://headscale.net/stable/setup/install/official/",
-		})
-	}
-
-	if tlsKey("tls.acme.hostname") != "" &&
-		tlsKey("tls.acme.challenge_type") == TLSALPN01ChallengeType &&
-		!strings.HasSuffix(viper.GetString("listen_addr"), ":443") {
-		// this is only a warning because there could be something sitting in front of headscale that redirects the traffic (e.g. an iptables rule)
-		log.Warn().
-			Msg("Warning: when using tls.acme.hostname with TLS-ALPN-01 as challenge type, headscale must be reachable on port 443, i.e. listen_addr should probably end in :443")
-	}
-
-	validateListenerCollisions(v)
-
-	if ct := tlsKey("tls.acme.challenge_type"); ct != HTTP01ChallengeType &&
-		ct != TLSALPN01ChallengeType && ct != DNS01ChallengeType {
-		v.Add(&ConfigError{
-			Reason:  "tls.acme.challenge_type has an unsupported value",
-			Current: []KV{{"tls.acme.challenge_type", ct}},
-			Allowed: []string{HTTP01ChallengeType, TLSALPN01ChallengeType, DNS01ChallengeType},
-			Hint:    "pick one of the allowed values; HTTP-01 is the default",
-		})
-	}
-
-	serverURL := viper.GetString("server_url")
-	if !strings.HasPrefix(serverURL, "http://") && !strings.HasPrefix(serverURL, "https://") {
-		v.Add(&ConfigError{
-			Reason:  "server_url is missing a scheme",
-			Current: []KV{{"server_url", serverURL}},
-			Hint:    "prefix the URL with https:// (recommended) or http://",
-		})
-	}
-
-	// Minimum inactivity time out is keepalive timeout (60s) plus a few seconds
-	// to avoid races
-	minInactivityTimeout := 65 * time.Second
-
-	ephemeralTimeout := resolveEphemeralInactivityTimeout()
-	if ephemeralTimeout <= minInactivityTimeout {
-		v.Add(&ConfigError{
-			Reason:  "node.ephemeral.inactivity_timeout is below the minimum",
-			Current: []KV{{"node.ephemeral.inactivity_timeout", ephemeralTimeout.String()}},
-			Minimum: minInactivityTimeout.String(),
-			Hint:    "raise the value above the keepalive interval (60s) plus a safety margin",
-		})
-	}
-
-	if viper.GetBool("dns.override_local_dns") {
-		if global := viper.GetStringSlice("dns.nameservers.global"); len(global) == 0 {
-			v.Add(&ConfigError{
-				Reason: "dns.nameservers.global is required when dns.override_local_dns is true",
-				Current: []KV{
-					{"dns.override_local_dns", true},
-					{"dns.nameservers.global", "[]"},
-				},
-				Hint: "list at least one upstream nameserver, or set dns.override_local_dns: false",
-				See:  dnsDocsURL,
-			})
-		}
-	}
-
-	// Validate HA health probing parameters
-	if haInterval := viper.GetDuration("node.routes.ha.probe_interval"); haInterval > 0 {
-		if haInterval < 2*time.Second {
-			v.Add(&ConfigError{
-				Reason:  "node.routes.ha.probe_interval is below the minimum",
-				Current: []KV{{"node.routes.ha.probe_interval", haInterval.String()}},
-				Minimum: "2s",
-				Hint:    "raise the value to at least the minimum",
-			})
-		}
-
-		haTimeout := viper.GetDuration("node.routes.ha.probe_timeout")
-		if haTimeout < 1*time.Second {
-			v.Add(&ConfigError{
-				Reason:  "node.routes.ha.probe_timeout is below the minimum",
-				Current: []KV{{"node.routes.ha.probe_timeout", haTimeout.String()}},
-				Minimum: "1s",
-				Hint:    "raise the value to at least the minimum",
-			})
-		}
-
-		if haTimeout >= haInterval {
-			v.Add(&ConfigError{
-				Reason: "node.routes.ha.probe_timeout must be less than node.routes.ha.probe_interval",
-				Current: []KV{
-					{"node.routes.ha.probe_timeout", haTimeout.String()},
-					{"node.routes.ha.probe_interval", haInterval.String()},
-				},
-				Hint: "lower probe_timeout below probe_interval (a probe must finish before the next one starts)",
-			})
-		}
-	}
-
-	// Validate tuning parameters
-	if size := viper.GetInt("tuning.node_store_batch_size"); size <= 0 {
-		v.Add(&ConfigError{
-			Reason:  "tuning.node_store_batch_size must be positive",
-			Current: []KV{{"tuning.node_store_batch_size", size}},
-			Hint:    fmt.Sprintf("set to a positive integer (default: %d)", defaultNodeStoreBatchSize),
-		})
-	}
-
-	if timeout := viper.GetDuration("tuning.node_store_batch_timeout"); timeout <= 0 {
-		v.Add(&ConfigError{
-			Reason:  "tuning.node_store_batch_timeout must be positive",
-			Current: []KV{{"tuning.node_store_batch_timeout", timeout.String()}},
-			Hint:    "set to a positive duration (default: 500ms)",
-		})
-	}
-
-	validateDERPConfig(v)
-	validateDatabaseConfig(v)
-	validateMagicDNSConfig(v)
-	validateCertificatesConfig(v)
-
-	depr.Apply(v)
-}
-
-// validateDERPConfig records ConfigErrors when the embedded DERP server
-// is enabled without the addresses or paths it needs.
-func validateDERPConfig(v *configValidator) {
-	if !viper.GetBool("derp.server.enabled") {
-		return
-	}
-
-	if viper.GetString("derp.server.stun_listen_addr") == "" {
-		v.Add(&ConfigError{
-			Reason: "derp.server.stun_listen_addr is required when the embedded DERP server is enabled",
-			Current: []KV{
-				{"derp.server.enabled", true},
-				{"derp.server.stun_listen_addr", ""},
-			},
-			Hint: `set derp.server.stun_listen_addr (e.g. "0.0.0.0:3478"), or set derp.server.enabled: false`,
-			See:  "https://headscale.net/stable/ref/integration/derp/",
-		})
-	}
-
-	if !viper.GetBool("derp.server.automatically_add_embedded_derp_region") &&
-		len(viper.GetStringSlice("derp.paths")) == 0 {
-		v.Add(&ConfigError{
-			Reason: "derp.paths is required when derp.server.automatically_add_embedded_derp_region is false",
-			Current: []KV{
-				{"derp.server.automatically_add_embedded_derp_region", false},
-				{"derp.paths", "[]"},
-			},
-			Hint: "list at least one DERP map file (.yaml, .yml, .json or .hujson) in derp.paths, or set automatically_add_embedded_derp_region: true",
-		})
-	}
-}
-
-// validateDatabaseConfig records a ConfigError when database.type is not
-// one of the supported backends.
-func validateDatabaseConfig(v *configValidator) {
-	t := viper.GetString("database.type")
-	switch t {
-	case DatabaseSqlite, DatabasePostgres, "sqlite":
-		return
-	}
-
-	v.Add(&ConfigError{
-		Reason:  "database.type has an unsupported value",
-		Current: []KV{{"database.type", t}},
-		Allowed: []string{"sqlite", "sqlite3", "postgres"},
-		Hint:    "pick one of the allowed values; sqlite is the default for single-host deployments",
-		See:     "https://headscale.net/stable/ref/database/",
-	})
-}
-
-// validateMagicDNSConfig records a ConfigError when MagicDNS is enabled
-// without a base_domain.
-func validateMagicDNSConfig(v *configValidator) {
-	if !viper.GetBool("dns.magic_dns") {
-		return
-	}
-
-	if viper.GetString("dns.base_domain") == "" {
-		v.Add(&ConfigError{
-			Reason: "dns.base_domain is required when dns.magic_dns is true",
-			Current: []KV{
-				{"dns.magic_dns", true},
-				{"dns.base_domain", ""},
-			},
-			Hint: `set dns.base_domain to a domain you control (e.g. "ts.example.net"), or set dns.magic_dns: false`,
-			See:  dnsDocsURL,
-		})
-	}
-}
-
-// validateCertificatesConfig records ConfigErrors when node certificates
-// are enabled without what the Tailscale client needs: a MagicDNS name
-// it can match exactly, and a provider to publish the challenge.
-func validateCertificatesConfig(v *configValidator) {
-	if timeout := viper.GetDuration("dns.challenge.propagation_timeout"); timeout < 0 {
-		v.Add(&ConfigError{
-			Reason:  "dns.challenge.propagation_timeout must not be negative",
-			Current: []KV{{"dns.challenge.propagation_timeout", timeout.String()}},
-			Hint:    "use 0 to skip waiting for the record on the zone's nameservers",
-		})
-	}
-
-	enabled := viper.GetBool("dns.certificates.enabled")
-	challengeType := tlsKey("tls.acme.challenge_type")
-	ownDNS01 := tlsKey("tls.acme.hostname") != "" && challengeType == DNS01ChallengeType
-
-	if (enabled || ownDNS01) && viper.GetString("dns.challenge.provider.name") == "" {
-		v.Add(&ConfigError{
-			Reason:  "dns.certificates and tls.acme DNS-01 require dns.challenge.provider",
-			Current: []KV{{"dns.certificates.enabled", enabled}, {"tls.acme.challenge_type", challengeType}},
-			Allowed: hsdns.ProviderNames(),
-			Hint:    "configure the DNS provider that hosts dns.base_domain or tls.acme.hostname under dns.challenge.provider",
-			See:     dnsDocsURL,
-		})
-	}
-
-	if !enabled {
-		return
-	}
-
-	if !viper.GetBool("dns.magic_dns") {
-		v.Add(&ConfigError{
-			Reason:  "dns.certificates requires dns.magic_dns",
-			Current: []KV{{"dns.certificates.enabled", true}, {"dns.magic_dns", false}},
-			Hint:    "certificates are issued for MagicDNS names; set dns.magic_dns: true",
-			See:     dnsDocsURL,
-		})
-	}
-
-	base := strings.TrimSuffix(viper.GetString("dns.base_domain"), ".")
-	if base != strings.ToLower(base) || dnsname.ValidHostname(base) != nil {
-		v.Add(&ConfigError{
-			Reason:  "dns.base_domain must be a lowercase DNS name for dns.certificates",
-			Current: []KV{{"dns.base_domain", base}},
-			Hint:    "Tailscale clients match certificate names exactly; use a lowercase public domain you control",
-			See:     dnsDocsURL,
-		})
-	}
-
-	zone := strings.TrimSuffix(viper.GetString("dns.certificates.zone"), ".")
-	if zone != "" && base != zone && !strings.HasSuffix(base, "."+zone) {
-		v.Add(&ConfigError{
-			Reason:  "dns.base_domain is not inside dns.certificates.zone",
-			Current: []KV{{"dns.base_domain", base}, {"dns.certificates.zone", zone}},
-			Hint:    "set zone to the DNS zone that contains base_domain, or leave it empty to use base_domain",
-			See:     dnsDocsURL,
-		})
-	}
-}
-
-// dnsChallengeConfig builds the DNS-01 provider. Provider keys are read
-// one by one, because environment variables never reach into a map.
-func dnsChallengeConfig() (DNSChallengeConfig, error) {
-	cfg := DNSChallengeConfig{
-		PropagationTimeout: viper.GetDuration("dns.challenge.propagation_timeout"),
-		Resolvers:          viper.GetStringSlice("dns.challenge.resolvers"),
-		ProviderName:       viper.GetString("dns.challenge.provider.name"),
-	}
-
-	if len(cfg.Resolvers) == 0 {
-		cfg.Resolvers = slices.Clone(defaultChallengeResolvers)
-	}
-
-	// Like dns.nameservers, a resolver may be a bare IP.
-	for i, r := range cfg.Resolvers {
-		_, _, err := net.SplitHostPort(r)
-		if err != nil {
-			cfg.Resolvers[i] = net.JoinHostPort(r, "53")
-		}
-	}
-
-	if cfg.ProviderName == "" {
-		return cfg, nil
-	}
-
-	provider, err := hsdns.NewProvider(
-		cfg.ProviderName,
-		viper.GetStringMap("dns.challenge.provider"),
-		func(key string) (any, bool) {
-			key = "dns.challenge.provider." + key
-
-			return viper.Get(key), viper.IsSet(key)
-		},
-	)
-	if err != nil {
-		return cfg, err
-	}
-
-	// Only node certificates let a client pick what is published; a record
-	// shared by headscale's own certificate alone is harmless.
-	if iso, ok := provider.(hsdns.Isolator); ok && viper.GetBool("dns.certificates.enabled") {
-		err = iso.CheckIsolation()
-		if err != nil {
-			return cfg, fmt.Errorf("%w for %s: %w", hsdns.ErrProviderConfig, cfg.ProviderName, err)
-		}
-	}
-
-	cfg.Provider = provider
-
-	return cfg, nil
-}
-
-func tlsConfig() TLSConfig {
-	return TLSConfig{
-		CertPath: util.AbsolutePathFromConfigPath(tlsKey("tls.cert_path")),
-		KeyPath:  util.AbsolutePathFromConfigPath(tlsKey("tls.key_path")),
-		ACME: ACMEConfig{
-			Hostname:      tlsKey("tls.acme.hostname"),
-			ChallengeType: tlsKey("tls.acme.challenge_type"),
-			HTTPListen:    tlsKey("tls.acme.http_listen"),
-			URL:           tlsKey("tls.acme.url"),
-			Email:         tlsKey("tls.acme.email"),
-			CacheDir:      util.AbsolutePathFromConfigPath(tlsKey("tls.acme.cache_dir")),
-		},
-	}
-}
-
-func derpConfig() DERPConfig {
-	serverEnabled := viper.GetBool("derp.server.enabled")
-	serverRegionID := viper.GetInt64("derp.server.region_id")
-	serverRegionCode := viper.GetString("derp.server.region_code")
-	serverRegionName := viper.GetString("derp.server.region_name")
-	serverVerifyClients := viper.GetBool("derp.server.verify_clients")
-	stunAddr := viper.GetString("derp.server.stun_listen_addr")
-	privateKeyPath := util.AbsolutePathFromConfigPath(
-		viper.GetString("derp.server.private_key_path"),
-	)
-	ipv4 := viper.GetString("derp.server.ipv4")
-	ipv6 := viper.GetString("derp.server.ipv6")
-	automaticallyAddEmbeddedDerpRegion := viper.GetBool(
-		"derp.server.automatically_add_embedded_derp_region",
-	)
-
-	urlStrs := viper.GetStringSlice("derp.urls")
-
-	urls := make([]url.URL, 0, len(urlStrs))
-	for _, urlStr := range urlStrs {
-		urlAddr, err := url.Parse(urlStr)
-		if err != nil {
-			log.Error().
-				Caller().
-				Str("url", urlStr).
-				Err(err).
-				Msg("Failed to parse url, ignoring...")
-
-			continue
-		}
-
-		urls = append(urls, *urlAddr)
-	}
-
-	paths := viper.GetStringSlice("derp.paths")
-
-	autoUpdate := viper.GetBool("derp.auto_update_enabled")
-	updateFrequency := viper.GetDuration("derp.update_frequency")
-
-	return DERPConfig{
-		ServerEnabled:                      serverEnabled,
-		ServerRegionID:                     tailcfg.DERPRegionID(serverRegionID),
-		ServerRegionCode:                   serverRegionCode,
-		ServerRegionName:                   serverRegionName,
-		ServerVerifyClients:                serverVerifyClients,
-		ServerPrivateKeyPath:               privateKeyPath,
-		STUNAddr:                           stunAddr,
-		URLs:                               urls,
-		Paths:                              paths,
-		AutoUpdate:                         autoUpdate,
-		UpdateFrequency:                    updateFrequency,
-		IPv4:                               ipv4,
-		IPv6:                               ipv6,
-		AutomaticallyAddEmbeddedDerpRegion: automaticallyAddEmbeddedDerpRegion,
-	}
-}
-
-func logtailConfig() LogTailConfig {
-	enabled := viper.GetBool("logtail.enabled")
-
-	return LogTailConfig{
-		Enabled: enabled,
-	}
-}
-
-func policyConfig() PolicyConfig {
-	policyPath := viper.GetString("policy.path")
-	policyMode := viper.GetString("policy.mode")
-
-	return PolicyConfig{
-		Path: policyPath,
-		Mode: PolicyMode(policyMode),
-	}
-}
-
-func logConfig() LogConfig {
-	logLevelStr := viper.GetString("log.level")
-
-	logLevel, err := zerolog.ParseLevel(logLevelStr)
-	if err != nil {
-		logLevel = zerolog.DebugLevel
-	}
-
-	logFormatOpt := viper.GetString("log.format")
-
-	var logFormat string
-
-	switch logFormatOpt {
-	case JSONLogFormat:
-		logFormat = JSONLogFormat
-	case TextLogFormat:
-		logFormat = TextLogFormat
-	case "":
-		logFormat = TextLogFormat
-	default:
-		log.Error().
-			Caller().
-			Str("func", "GetLogConfig").
-			Msgf("Could not parse log format: %s. Valid choices are 'json' or 'text'", logFormatOpt)
-	}
-
-	return LogConfig{
-		Format: logFormat,
-		Level:  logLevel,
-	}
-}
-
-func databaseConfig() DatabaseConfig {
-	debug := viper.GetBool("database.debug")
-
-	type_ := viper.GetString("database.type")
-
-	skipErrRecordNotFound := viper.GetBool("database.gorm.skip_err_record_not_found")
-	slowThreshold := time.Duration(viper.GetInt64("database.gorm.slow_threshold")) * time.Millisecond
-	parameterizedQueries := viper.GetBool("database.gorm.parameterized_queries")
-
-	switch type_ {
-	case DatabaseSqlite, DatabasePostgres:
-		break
-	case "sqlite":
-		type_ = "sqlite3"
-	}
-
-	return DatabaseConfig{
-		Type:  type_,
-		Debug: debug,
-		Gorm: GormConfig{
-			Debug:                 debug,
-			SkipErrRecordNotFound: skipErrRecordNotFound,
-			SlowThreshold:         slowThreshold,
-			ParameterizedQueries:  parameterizedQueries,
-		},
-		Sqlite: SqliteConfig{
-			Path: util.AbsolutePathFromConfigPath(
-				viper.GetString("database.sqlite.path"),
-			),
-			WriteAheadLog:     viper.GetBool("database.sqlite.write_ahead_log"),
-			WALAutoCheckPoint: viper.GetInt("database.sqlite.wal_autocheckpoint"),
-		},
-		Postgres: PostgresConfig{
-			Host:               viper.GetString("database.postgres.host"),
-			Port:               viper.GetInt("database.postgres.port"),
-			Name:               viper.GetString("database.postgres.name"),
-			User:               viper.GetString("database.postgres.user"),
-			Pass:               viper.GetString("database.postgres.pass"),
-			Ssl:                viper.GetString("database.postgres.ssl"),
-			MaxOpenConnections: viper.GetInt("database.postgres.max_open_conns"),
-			MaxIdleConnections: viper.GetInt("database.postgres.max_idle_conns"),
-			ConnMaxIdleTimeSecs: viper.GetInt(
-				"database.postgres.conn_max_idle_time_secs",
-			),
-		},
-	}
-}
-
-func dns() (DNSConfig, error) {
-	var dns DNSConfig
-
-	// TODO: Use this instead of manually getting settings when
-	// UnmarshalKey is compatible with Environment Variables.
-	// err := viper.UnmarshalKey("dns", &dns)
-	// if err != nil {
-	// 	return DNSConfig{}, fmt.Errorf("unmarshalling dns config: %w", err)
-	// }
-
-	dns.MagicDNS = viper.GetBool("dns.magic_dns")
-	dns.BaseDomain = viper.GetString("dns.base_domain")
-	dns.OverrideLocalDNS = viper.GetBool("dns.override_local_dns")
-	dns.Nameservers.Global = viper.GetStringSlice("dns.nameservers.global")
-	dns.Nameservers.Split = viper.GetStringMapStringSlice("dns.nameservers.split")
-	dns.SearchDomains = viper.GetStringSlice("dns.search_domains")
-	dns.ExtraRecordsPath = viper.GetString("dns.extra_records_path")
-	dns.Certificates.Enabled = viper.GetBool("dns.certificates.enabled")
-	dns.Certificates.Zone = cmp.Or(viper.GetString("dns.certificates.zone"), dns.BaseDomain)
-
-	if viper.IsSet("dns.extra_records") {
-		var extraRecords []tailcfg.DNSRecord
-
-		err := viper.UnmarshalKey("dns.extra_records", &extraRecords)
-		if err != nil {
-			return DNSConfig{}, fmt.Errorf("unmarshalling dns extra records: %w", err)
-		}
-
-		dns.ExtraRecords = extraRecords
-	}
-
-	return dns, nil
-}
-
-// parseResolvers converts nameserver strings into DNS resolvers.
-// If a nameserver is a valid IP, it will be used as a regular resolver.
-// If a nameserver is a valid URL, it will be used as a DoH resolver.
-// If a nameserver is neither a valid URL nor a valid IP, it will be ignored.
-// When domain is non-empty, it is included in the warning for invalid entries.
-func parseResolvers(nameservers []string, domain string) []*dnstype.Resolver {
+// parseResolvers converts nameserver strings into DNS resolvers: an IP is a
+// plain resolver, a URL a DoH one. Anything else is skipped;
+// [DNSConfig.NameserverWarnings] lists it for config.Warnings.
+func parseResolvers(nameservers []string) []*dnstype.Resolver {
 	var resolvers []*dnstype.Resolver
 
-	for _, nsStr := range nameservers {
-		if _, err := netip.ParseAddr(nsStr); err == nil { //nolint:noinlineerr
-			resolvers = append(resolvers, &dnstype.Resolver{
-				Addr: nsStr,
-			})
-
-			continue
+	for _, ns := range nameservers {
+		if validNameserver(ns) {
+			resolvers = append(resolvers, &dnstype.Resolver{Addr: ns})
 		}
-
-		if _, err := url.Parse(nsStr); err == nil { //nolint:noinlineerr
-			resolvers = append(resolvers, &dnstype.Resolver{
-				Addr: nsStr,
-			})
-
-			continue
-		}
-
-		e := log.Warn().Str("nameserver", nsStr)
-		if domain != "" {
-			e = e.Str("domain", domain)
-		}
-
-		e.Msg("invalid nameserver, ignoring")
 	}
 
 	return resolvers
 }
 
+func validNameserver(ns string) bool {
+	_, addrErr := netip.ParseAddr(ns)
+	_, urlErr := url.Parse(ns)
+
+	return addrErr == nil || urlErr == nil
+}
+
+// NameserverWarnings lists each nameserver parseResolvers skips, so
+// config.Warnings reports it once rather than on each build.
+func (d DNSConfig) NameserverWarnings() []string {
+	var warnings []string
+
+	check := func(key string, nameservers []string) {
+		for _, ns := range nameservers {
+			if !validNameserver(ns) {
+				warnings = append(warnings, fmt.Sprintf("invalid nameserver %q in %s, ignoring", redactedURL(ns), key))
+			}
+		}
+	}
+
+	check("dns.nameservers.global", d.Nameservers.Global)
+
+	for _, domain := range slices.Sorted(maps.Keys(d.Nameservers.Split)) {
+		check("dns.nameservers.split."+domain, d.Nameservers.Split[domain])
+	}
+
+	return warnings
+}
+
 // globalResolvers returns the global DNS resolvers
 // defined in the config file.
-func (d *DNSConfig) globalResolvers() []*dnstype.Resolver {
-	return parseResolvers(d.Nameservers.Global, "")
+func (d DNSConfig) globalResolvers() []*dnstype.Resolver {
+	return parseResolvers(d.Nameservers.Global)
 }
 
 // splitResolvers returns a map of domain to DNS resolvers.
-func (d *DNSConfig) splitResolvers() map[string][]*dnstype.Resolver {
+func (d DNSConfig) splitResolvers() map[string][]*dnstype.Resolver {
 	routes := make(map[string][]*dnstype.Resolver)
 
 	for domain, nameservers := range d.Nameservers.Split {
-		routes[domain] = parseResolvers(nameservers, domain)
+		routes[domain] = parseResolvers(nameservers)
 	}
 
 	return routes
@@ -1439,642 +1171,73 @@ func dnsToTailcfgDNS(dns DNSConfig) *tailcfg.DNSConfig {
 	return &cfg
 }
 
-// warnBanner prints a highly visible warning banner to the log output.
-// It wraps the provided lines in an ASCII-art box with a "Warning!" header.
-// This is intended for critical configuration issues that users must not ignore.
-func warnBanner(lines []string) {
-	var b strings.Builder
-
-	b.WriteString("\n")
-	b.WriteString("################################################################\n")
-	b.WriteString("###      __          __              _             _         ###\n")
-	b.WriteString("###      \\ \\        / /             (_)           | |        ###\n")
-	b.WriteString("###       \\ \\  /\\  / /_ _ _ __ _ __  _ _ __   __ _| |        ###\n")
-	b.WriteString("###        \\ \\/  \\/ / _` | '__| '_ \\| | '_ \\ / _` | |        ###\n")
-	b.WriteString("###         \\  /\\  / (_| | |  | | | | | | | | (_| |_|        ###\n")
-	b.WriteString("###          \\/  \\/ \\__,_|_|  |_| |_|_|_| |_|\\__, (_)        ###\n")
-	b.WriteString("###                                           __/ |          ###\n")
-	b.WriteString("###                                          |___/           ###\n")
-	b.WriteString("################################################################\n")
-	b.WriteString("###                                                          ###\n")
-
-	for _, line := range lines {
-		fmt.Fprintf(&b, "###  %-54s  ###\n", line)
+// TailcfgDNSConfig builds the DNS config clients get from DNSConfig and the
+// IP prefixes. It is never nil.
+func (c *Config) TailcfgDNSConfig() *tailcfg.DNSConfig {
+	cfg := dnsToTailcfgDNS(c.DNSConfig)
+	if !cfg.Proxied {
+		return cfg
 	}
 
-	b.WriteString("###                                                          ###\n")
-	b.WriteString("################################################################")
+	// Clients route reverse lookups for the Tailscale ranges themselves
+	// (magicDNSRootDomains in tailscale.com/ipn/ipnlocal) and SaaS sends
+	// no reverse routes, so only a prefix outside those ranges needs them.
+	var reverse []dnsname.FQDN
+	if v4 := c.Prefixes.V4; v4 != nil && outsideRange(*v4, tsaddr.CGNATRange()) {
+		reverse = append(reverse, util.GenerateIPv4DNSRootDomain(*v4)...)
+	}
 
-	log.Warn().Msg(b.String())
+	if v6 := c.Prefixes.V6; v6 != nil && outsideRange(*v6, tsaddr.TailscaleULARange()) {
+		reverse = append(reverse, util.GenerateIPv6DNSRootDomain(*v6)...)
+	}
+
+	for _, d := range reverse {
+		// Empty non-nil slice rather than nil: tailcfg.DNSConfig.Clone
+		// and dns.Config.Clone in tailscale drop map entries whose
+		// value is nil (see tailscale.com/tailcfg/tailcfg_clone.go and
+		// tailscale.com/net/dns/dns_clone.go: `if sv == nil { continue }`).
+		// Sending nil here caused the client's wgengine LinkChange:major
+		// handler to clobber /etc/resolv.conf on every tunnel-IP rebind
+		// — the handler reapplies a Clone of lastDNSConfig and the magic
+		// DNS routes vanish, taking the resolver with them for ~6 min
+		// until the next route-changing netmap. Empty slice survives
+		// Clone and carries the same "resolve locally" semantics
+		// ([tailcfg.DNSConfig.Routes] documents the empty-resolver form).
+		cfg.Routes[d.WithoutTrailingDot()] = []*dnstype.Resolver{}
+	}
+
+	return cfg
 }
 
-func parsePrefixConfig(key string, standardRange netip.Prefix, family string) (*netip.Prefix, bool, error) {
-	s := viper.GetString(key)
-
-	if s == "" {
-		return nil, false, nil
-	}
-
-	prefix, err := netip.ParsePrefix(s)
-	if err != nil {
-		return nil, false, fmt.Errorf("parsing %s prefix from config: %w", family, err)
-	}
-
-	builder := netipx.IPSetBuilder{}
-	builder.AddPrefix(standardRange)
-
-	ipSet, _ := builder.IPSet()
-
-	return &prefix, !ipSet.ContainsPrefix(prefix), nil
+// StartDNS builds the DNS config clients get, from here on changed only by
+// [Config.SetExtraRecords], and keeps provider for [Config.DNSProvider].
+// Call it before the config is shared.
+func (c *Config) StartDNS(provider hsdns.Provider) {
+	c.dns = &liveDNS{dns: c.TailcfgDNSConfig(), provider: provider}
 }
 
-// trustedProxies rejects 0.0.0.0/0 and ::/0 because they defeat the
-// peer-trust gate and almost always indicate misconfiguration.
-func trustedProxies() ([]netip.Prefix, error) {
-	raw := viper.GetStringSlice("trusted_proxies")
-	if len(raw) == 0 {
-		return nil, nil
+// DNSProvider returns the provider [Config.StartDNS] was given, else the
+// Go-only DNSConfig.Challenge.Provider.
+func (c *Config) DNSProvider() hsdns.Provider {
+	if c.dns != nil {
+		return c.dns.provider
 	}
 
-	out := make([]netip.Prefix, 0, len(raw))
-	for i, s := range raw {
-		p, err := netip.ParsePrefix(s)
-		if err != nil {
-			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, err)
-		}
-
-		if p.Bits() == 0 {
-			return nil, fmt.Errorf("trusted_proxies[%d] %q: %w", i, s, errTrustedProxyZeroRange)
-		}
-
-		out = append(out, p.Masked())
-	}
-
-	return out, nil
+	return c.DNSConfig.Challenge.Provider
 }
 
-// LoadCLIConfig returns the needed configuration for the CLI client
-// of Headscale to connect to a Headscale server.
-func LoadCLIConfig() (*Config, error) {
-	v := &configValidator{}
-	validateBoolConfig(v, "cli.insecure", "disable_check_updates")
-
-	err := v.Err()
-	if err != nil {
-		return nil, err
-	}
-
-	logConfig := logConfig()
-	zerolog.SetGlobalLevel(logConfig.Level)
-
-	return &Config{
-		DisableUpdateCheck: viper.GetBool("disable_check_updates"),
-		UnixSocket:         viper.GetString("unix_socket"),
-		CLI: CLIConfig{
-			Address:  viper.GetString("cli.address"),
-			APIKey:   viper.GetString("cli.api_key"),
-			Timeout:  viper.GetDuration("cli.timeout"),
-			Insecure: viper.GetBool("cli.insecure"),
-		},
-		Log: logConfig,
-	}, nil
-}
-
-// LoadServerConfig returns the full Headscale configuration to
-// host a Headscale server. This is called as part of `headscale serve`.
-func LoadServerConfig() (*Config, error) {
-	v := &configValidator{}
-	validateServerConfigInto(v)
-
-	logConfig := logConfig()
-	zerolog.SetGlobalLevel(logConfig.Level)
-
-	prefix4, v4NonStandard, err := parsePrefixConfig("prefixes.v4", tsaddr.CGNATRange(), "IPv4")
-	if err != nil {
-		v.Add(&ConfigError{
-			Reason:  "prefixes.v4 is not a valid CIDR",
-			Current: []KV{{"prefixes.v4", viper.GetString("prefixes.v4")}},
-			Detail:  err.Error(),
-			Hint:    `use CIDR form, e.g. "100.64.0.0/10" (CGNAT, headscale default)`,
-			Cause:   err,
-		})
-	}
-
-	prefix6, v6NonStandard, err := parsePrefixConfig("prefixes.v6", tsaddr.TailscaleULARange(), "IPv6")
-	if err != nil {
-		v.Add(&ConfigError{
-			Reason:  "prefixes.v6 is not a valid CIDR",
-			Current: []KV{{"prefixes.v6", viper.GetString("prefixes.v6")}},
-			Detail:  err.Error(),
-			Hint:    `use CIDR form, e.g. "fd7a:115c:a1e0::/48" (Tailscale ULA, headscale default)`,
-			Cause:   err,
-		})
-	}
-
-	trusted, err := trustedProxies()
-	if err != nil {
-		v.Add(&ConfigError{
-			Reason:  "trusted_proxies contains an invalid CIDR",
-			Current: []KV{{"trusted_proxies", viper.GetStringSlice("trusted_proxies")}},
-			Detail:  err.Error(),
-			Hint:    "use specific proxy CIDRs; catch-all ranges are not allowed",
-			Cause:   err,
-		})
-	}
-
-	if prefix4 == nil && prefix6 == nil {
-		v.Add(&ConfigError{
-			Reason: "no IP prefix configured for the tailnet",
-			Current: []KV{
-				{"prefixes.v4", viper.GetString("prefixes.v4")},
-				{"prefixes.v6", viper.GetString("prefixes.v6")},
-			},
-			Hint:  `set at least one of prefixes.v4 (default: "100.64.0.0/10") or prefixes.v6 (default: "fd7a:115c:a1e0::/48")`,
-			Cause: ErrNoPrefixConfigured,
-		})
-	}
-
-	if v4NonStandard || v6NonStandard {
-		warnBanner([]string{
-			"You have overridden the default Headscale IP prefixes",
-			"with a range outside of the standard CGNAT and/or ULA",
-			"ranges. This is NOT a supported configuration.",
-			"",
-			"Using subsets of the default ranges (100.64.0.0/10 for",
-			"IPv4, fd7a:115c:a1e0::/48 for IPv6) is fine. Using",
-			"ranges outside of these will cause undefined behaviour",
-			"as the Tailscale client is NOT designed to operate on",
-			"any other ranges.",
-			"",
-			"Please revert your prefixes to subsets of the standard",
-			"ranges as described in the example configuration.",
-			"",
-			"Any issue raised using a range outside of the",
-			"supported range will be labelled as wontfix",
-			"and closed.",
-		})
-	}
-
-	allocStr := viper.GetString("prefixes.allocation")
-
-	var alloc IPAllocationStrategy
-
-	switch allocStr {
-	case string(IPAllocationStrategySequential):
-		alloc = IPAllocationStrategySequential
-	case string(IPAllocationStrategyRandom):
-		alloc = IPAllocationStrategyRandom
-	default:
-		v.Add(&ConfigError{
-			Reason:  "prefixes.allocation has an unsupported value",
-			Current: []KV{{"prefixes.allocation", allocStr}},
-			Allowed: []string{
-				string(IPAllocationStrategySequential),
-				string(IPAllocationStrategyRandom),
-			},
-			Hint:  "pick one of the allowed values; sequential is the default",
-			Cause: ErrInvalidAllocationStrategy,
-		})
-	}
-
-	// YAML reads an unquoted 0770 as the integer 504, which cannot be told
-	// apart from a literal 504, so only a string is accepted.
-	socketPermRaw := viper.Get("unix_socket_permission")
-	socketPermStr, _ := socketPermRaw.(string)
-
-	socketPerm, err := util.ParseFileMode(socketPermStr)
-	if err != nil {
-		v.Add(&ConfigError{
-			Reason:  "unix_socket_permission is not a quoted octal file mode",
-			Current: []KV{{"unix_socket_permission", socketPermRaw}},
-			Maximum: `"0777"`,
-			Hint:    `quote the value, e.g. "0770"; unquoted, YAML reads 0770 as the number 504`,
-			Cause:   err,
-		})
-	}
-
-	dnsConfig, err := dns()
-	if err != nil {
-		v.Add(&ConfigError{
-			Reason:  "dns.extra_records cannot be parsed",
-			Current: []KV{{"dns.extra_records", "<inline records>"}},
-			Detail:  err.Error(),
-			Hint:    "check the YAML syntax; see config-example.yaml for the expected shape",
-			Cause:   err,
-		})
-	}
-
-	derpConfig := derpConfig()
-	logTailConfig := logtailConfig()
-
-	dnsChallenge, err := dnsChallengeConfig()
-	if err != nil {
-		// The provider names only help when the name is what is wrong.
-		var allowed []string
-		if errors.Is(err, hsdns.ErrUnknownProvider) {
-			allowed = hsdns.ProviderNames()
-		}
-
-		v.Add(&ConfigError{
-			Reason:  "dns.challenge.provider is invalid",
-			Current: []KV{{"dns.challenge.provider.name", dnsChallenge.ProviderName}},
-			Detail:  err.Error(),
-			Allowed: allowed,
-			Hint:    "check the provider name and its settings; any string setting can be read from a file with <setting>_path",
-			See:     dnsDocsURL,
-			Cause:   err,
-		})
-	}
-
-	oidcClientSecret := viper.GetString("oidc.client_secret")
-	oidcClientSecretPath := viper.GetString("oidc.client_secret_path")
-
-	switch {
-	case oidcClientSecretPath != "" && oidcClientSecret != "":
-		v.Add(&ConfigError{
-			Reason: "oidc.client_secret and oidc.client_secret_path are mutually exclusive",
-			Current: []KV{
-				{"oidc.client_secret", "<redacted>"},
-				{"oidc.client_secret_path", oidcClientSecretPath},
-			},
-			Hint:  "keep one source for the secret; the path form is recommended so the secret stays out of config files",
-			See:   "https://headscale.net/stable/ref/oidc/",
-			Cause: errOidcMutuallyExclusive,
-		})
-
-	case oidcClientSecretPath != "":
-		secretBytes, err := os.ReadFile(os.ExpandEnv(oidcClientSecretPath))
-		if err != nil {
-			v.Add(&ConfigError{
-				Reason:  "oidc.client_secret_path cannot be read",
-				Current: []KV{{"oidc.client_secret_path", oidcClientSecretPath}},
-				Detail:  err.Error(),
-				Hint:    "ensure the file exists and is readable by the headscale user",
-				Cause:   err,
-			})
-		} else {
-			oidcClientSecret = strings.TrimSpace(string(secretBytes))
-		}
-	}
-
-	serverURL := strings.TrimRight(viper.GetString("server_url"), "/")
-
-	// BaseDomain cannot be the same as the server URL.
-	// This is because Tailscale takes over the domain in BaseDomain,
-	// causing the headscale server and DERP to be unreachable.
-	// For Tailscale upstream, the following is true:
-	// - DERP run on their own domains
-	// - Control plane runs on login.tailscale.com/controlplane.tailscale.com
-	// - MagicDNS (BaseDomain) for users is on a *.ts.net domain per tailnet (e.g. tail-scale.ts.net)
-	if dnsConfig.BaseDomain != "" {
-		err := isSafeServerURL(serverURL, dnsConfig.BaseDomain)
-		if err != nil {
-			addServerURLConfigError(v, serverURL, dnsConfig.BaseDomain, err)
-		}
-	}
-
-	err = v.Err()
-	if err != nil {
-		return nil, err
-	}
-
-	return &Config{
-		ServerURL:          serverURL,
-		Addr:               viper.GetString("listen_addr"),
-		MetricsAddr:        viper.GetString("metrics_listen_addr"),
-		TrustedProxies:     trusted,
-		DisableUpdateCheck: false,
-
-		PrefixV4:     prefix4,
-		PrefixV6:     prefix6,
-		IPAllocation: alloc,
-
-		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(
-			viper.GetString("noise.private_key_path"),
-		),
-		BaseDomain: dnsConfig.BaseDomain,
-
-		DERP: derpConfig,
-
-		Node: NodeConfig{
-			Expiry: resolveNodeExpiry(),
-			Ephemeral: EphemeralConfig{
-				InactivityTimeout: resolveEphemeralInactivityTimeout(),
-			},
-			Routes: RouteConfig{
-				HA: HARouteConfig{
-					ProbeInterval: viper.GetDuration("node.routes.ha.probe_interval"),
-					ProbeTimeout:  viper.GetDuration("node.routes.ha.probe_timeout"),
-				},
-			},
-		},
-
-		PreAuthKeys: PreAuthKeysConfig{
-			RevokedRetention: viper.GetDuration("preauth_keys.revoked_retention"),
-		},
-
-		Database: databaseConfig(),
-
-		TLS: tlsConfig(),
-
-		DNSConfig:        dnsConfig,
-		TailcfgDNSConfig: dnsToTailcfgDNS(dnsConfig),
-		DNSChallenge:     dnsChallenge,
-
-		UnixSocket:           viper.GetString("unix_socket"),
-		UnixSocketPermission: socketPerm,
-
-		OIDC: OIDCConfig{
-			OnlyStartIfOIDCIsAvailable: viper.GetBool(
-				"oidc.only_start_if_oidc_is_available",
-			),
-			Issuer:                viper.GetString("oidc.issuer"),
-			ClientID:              viper.GetString("oidc.client_id"),
-			ClientSecret:          oidcClientSecret,
-			Scope:                 viper.GetStringSlice("oidc.scope"),
-			ExtraParams:           viper.GetStringMapString("oidc.extra_params"),
-			AllowedDomains:        viper.GetStringSlice("oidc.allowed_domains"),
-			AllowedUsers:          viper.GetStringSlice("oidc.allowed_users"),
-			AllowedGroups:         viper.GetStringSlice("oidc.allowed_groups"),
-			EmailVerifiedRequired: viper.GetBool("oidc.email_verified_required"),
-			UseExpiryFromToken:    viper.GetBool("oidc.use_expiry_from_token"),
-			PKCE: PKCEConfig{
-				Enabled: viper.GetBool("oidc.pkce.enabled"),
-				Method:  viper.GetString("oidc.pkce.method"),
-			},
-		},
-
-		LogTail: logTailConfig,
-		Taildrop: TaildropConfig{
-			Enabled: viper.GetBool("taildrop.enabled"),
-		},
-		AutoUpdate: AutoUpdateConfig{
-			Enabled: viper.GetBool("auto_update.enabled"),
-		},
-
-		Policy: policyConfig(),
-
-		CLI: CLIConfig{
-			Address:  viper.GetString("cli.address"),
-			APIKey:   viper.GetString("cli.api_key"),
-			Timeout:  viper.GetDuration("cli.timeout"),
-			Insecure: viper.GetBool("cli.insecure"),
-		},
-
-		Log: logConfig,
-
-		Tuning: Tuning{
-			NotifierSendTimeout: viper.GetDuration("tuning.notifier_send_timeout"),
-			BatchChangeDelay:    viper.GetDuration("tuning.batch_change_delay"),
-			NodeMapSessionBufferedChanSize: viper.GetInt(
-				"tuning.node_mapsession_buffered_chan_size",
-			),
-			BatcherWorkers: func() int {
-				if workers := viper.GetInt("tuning.batcher_workers"); workers > 0 {
-					return workers
-				}
-
-				return DefaultBatcherWorkers()
-			}(),
-			RegisterCacheExpiration: viper.GetDuration("tuning.register_cache_expiration"),
-			RegisterCacheMaxEntries: viper.GetInt("tuning.register_cache_max_entries"),
-			NodeStoreBatchSize:      viper.GetInt("tuning.node_store_batch_size"),
-			NodeStoreBatchTimeout:   viper.GetDuration("tuning.node_store_batch_timeout"),
-		},
-	}, nil
-}
-
-// addServerURLConfigError pushes a structured ConfigError onto v for
-// each isSafeServerURL failure mode so the operator sees the issue
-// rendered consistently with the rest of the config-load report.
-func addServerURLConfigError(v *configValidator, serverURL, baseDomain string, err error) {
-	current := []KV{
-		{"server_url", serverURL},
-		{"dns.base_domain", baseDomain},
-	}
-
-	switch {
-	case errors.Is(err, errServerURLSame):
-		v.Add(&ConfigError{
-			Reason:  "server_url and dns.base_domain refer to the same hostname",
-			Current: current,
-			Hint:    "give server_url a host distinct from dns.base_domain (Tailscale takes over base_domain via MagicDNS)",
-			See:     dnsDocsURL,
-			Cause:   errServerURLSame,
-		})
-
-	case errors.Is(err, errServerURLSuffix):
-		v.Add(&ConfigError{
-			Reason:  "server_url is a subdomain of dns.base_domain",
-			Current: current,
-			Hint:    "host headscale on a domain outside dns.base_domain (Tailscale takes over base_domain via MagicDNS)",
-			See:     dnsDocsURL,
-			Cause:   errServerURLSuffix,
-		})
-
-	default:
-		v.Add(&ConfigError{
-			Reason:  "server_url cannot be parsed",
-			Current: []KV{{"server_url", serverURL}},
-			Detail:  err.Error(),
-			Hint:    "set server_url to an absolute URL, e.g. https://headscale.example.com",
-			Cause:   err,
-		})
-	}
-}
-
-// BaseDomain cannot be a suffix of the server URL.
-// This is because Tailscale takes over the domain in BaseDomain,
-// causing the headscale server and DERP to be unreachable.
-// For Tailscale upstream, the following is true:
-// - DERP run on their own domains.
-// - Control plane runs on login.tailscale.com/controlplane.tailscale.com.
-// - MagicDNS (BaseDomain) for users is on a *.ts.net domain per tailnet (e.g. tail-scale.ts.net).
-func isSafeServerURL(serverURL, baseDomain string) error {
-	server, err := url.Parse(serverURL)
-	if err != nil {
-		return err
-	}
-
-	if server.Hostname() == baseDomain {
-		return errServerURLSame
-	}
-
-	if strings.HasSuffix(server.Hostname(), "."+baseDomain) {
-		return errServerURLSuffix
-	}
-
-	return nil
-}
-
-// deprecation describes a configuration key that is no longer
-// supported. NewKey is the replacement (when one exists) or empty
-// when the key has been removed without a replacement.
-type deprecation struct {
-	OldKey string
-	NewKey string
-	Hint   string
-}
-
-// deprecator collects deprecated configuration keys observed in the
-// current viper config. Warns are non-blocking and surface via
-// log.Warn; fatals are pushed onto a configValidator as ConfigError
-// entries so they merge with the rest of the validation report
-// instead of pre-empting it via log.Fatal.
-type deprecator struct {
-	seen   set.Set[string]
-	warns  []deprecation
-	fatals []deprecation
-}
-
-func (d *deprecator) addWarn(dep deprecation) {
-	if d.seen.Contains(dep.OldKey) {
-		return
-	}
-
-	d.seen.Add(dep.OldKey)
-	d.warns = append(d.warns, dep)
-}
-
-func (d *deprecator) addFatal(dep deprecation) {
-	if d.seen.Contains(dep.OldKey) {
-		return
-	}
-
-	d.seen.Add(dep.OldKey)
-	d.fatals = append(d.fatals, dep)
-}
-
-// warnWithAlias registers an alias from newKey to oldKey and records
-// a non-blocking warning when oldKey is set.
-//
-//nolint:unused
-func (d *deprecator) warnWithAlias(newKey, oldKey string) {
-	// NOTE: RegisterAlias is called with NEW KEY -> OLD KEY
-	viper.RegisterAlias(newKey, oldKey)
-
-	if viper.IsSet(oldKey) {
-		d.addWarn(deprecation{OldKey: oldKey, NewKey: newKey})
-	}
-}
-
-// fatal records a removed key (no replacement) as a config error.
-func (d *deprecator) fatal(oldKey string) {
-	if viper.IsSet(oldKey) {
-		d.addFatal(deprecation{OldKey: oldKey})
-	}
-}
-
-// fatalWithHint behaves like fatal but appends a remediation pointer to
-// the message so operators see exactly what to do without leaving the
-// terminal. Use it when the removed key has a clean replacement on the
-// policy side.
-func (d *deprecator) fatalWithHint(oldKey, hint string) {
-	if viper.IsSet(oldKey) {
-		d.addFatal(deprecation{OldKey: oldKey, Hint: hint})
-	}
-}
-
-// fatalIfNewKeyIsNotUsed records a config error when oldKey is set
-// without newKey, or a warning when both are set (oldKey ignored,
-// newKey takes precedence).
-func (d *deprecator) fatalIfNewKeyIsNotUsed(newKey, oldKey string) {
-	if !viper.IsSet(oldKey) {
-		return
-	}
-
-	if !viper.IsSet(newKey) {
-		d.addFatal(deprecation{OldKey: oldKey, NewKey: newKey})
-
-		return
-	}
-
-	d.addWarn(deprecation{OldKey: oldKey, NewKey: newKey})
-}
-
-// fatalIfSet records a config error any time oldKey is set, naming
-// newKey as the replacement.
-func (d *deprecator) fatalIfSet(oldKey, newKey string) {
-	if viper.IsSet(oldKey) {
-		d.addFatal(deprecation{OldKey: oldKey, NewKey: newKey})
-	}
-}
-
-// warnNoAlias records a non-blocking warning when oldKey is set,
-// pointing operators at newKey.
-//
-//nolint:unused
-func (d *deprecator) warnNoAlias(newKey, oldKey string) {
-	if viper.IsSet(oldKey) {
-		d.addWarn(deprecation{OldKey: oldKey, NewKey: newKey})
-	}
-}
-
-// warn records a non-blocking warning when oldKey is set, with no
-// replacement to point at.
-func (d *deprecator) warn(oldKey string) {
-	if viper.IsSet(oldKey) {
-		d.addWarn(deprecation{OldKey: oldKey})
-	}
-}
-
-// Apply emits warns via log.Warn and pushes one *ConfigError per
-// fatal onto v. Run after the rest of validation so deprecated-key
-// failures surface alongside the other config errors in a single
-// pass.
-func (d *deprecator) Apply(v *configValidator) {
-	for _, w := range d.warns {
-		if w.NewKey != "" {
-			log.Warn().Msgf(
-				"configuration key %q is deprecated; use %q instead",
-				w.OldKey, w.NewKey)
-
-			continue
-		}
-
-		log.Warn().Msgf("configuration key %q is ignored", w.OldKey)
-	}
-
-	for _, f := range d.fatals {
-		ce := &ConfigError{
-			Current: []KV{{f.OldKey, viper.Get(f.OldKey)}},
-		}
-
-		if f.NewKey != "" {
-			ce.Reason = fmt.Sprintf(
-				"configuration key %s has been removed; use %s instead",
-				f.OldKey, f.NewKey)
-			ce.Hint = fmt.Sprintf("remove %s and set %s", f.OldKey, f.NewKey)
-		} else {
-			ce.Reason = fmt.Sprintf("configuration key %s has been removed", f.OldKey)
-			if f.Hint != "" {
-				ce.Hint = f.Hint
-			} else {
-				ce.Hint = fmt.Sprintf("remove %s; see the CHANGELOG for context", f.OldKey)
-			}
-		}
-
-		v.Add(ce)
-	}
-}
-
-// tailcfgDNSMu guards concurrent access to the mutable ExtraRecords of
-// [Config.TailcfgDNSConfig] between the extra-records file watcher (writer)
-// and the per-client map builds that clone it (readers). It is a package-level
-// lock so [Config] stays freely copyable during construction.
-var tailcfgDNSMu sync.RWMutex
-
-// CloneTailcfgDNSConfig returns a deep copy of [Config.TailcfgDNSConfig], or
-// nil if none is set. Safe for concurrent use with [Config.SetExtraRecords].
+// CloneTailcfgDNSConfig returns a deep copy of the started DNS config, or a
+// fresh [Config.TailcfgDNSConfig] before [Config.StartDNS]. Safe for
+// concurrent use with [Config.SetExtraRecords].
 func (c *Config) CloneTailcfgDNSConfig() *tailcfg.DNSConfig {
-	tailcfgDNSMu.RLock()
-	defer tailcfgDNSMu.RUnlock()
-
-	if c.TailcfgDNSConfig == nil {
-		return nil
+	if c.dns == nil {
+		return c.TailcfgDNSConfig()
 	}
 
-	return c.TailcfgDNSConfig.Clone()
+	c.dns.mu.RLock()
+	defer c.dns.mu.RUnlock()
+
+	return c.dns.dns.Clone()
 }
 
 // HasExtraRecord reports whether an extra DNS record is exactly name,
@@ -2088,14 +1251,15 @@ func (c *Config) HasExtraRecord(name string) bool {
 // a subdomain of it. Case is ignored, as in TLS name matching; name is
 // lowercase.
 func (c *Config) extraRecordAt(name string, orBelow bool) bool {
-	tailcfgDNSMu.RLock()
-	defer tailcfgDNSMu.RUnlock()
+	records := c.DNSConfig.ExtraRecords
+	if c.dns != nil {
+		c.dns.mu.RLock()
+		defer c.dns.mu.RUnlock()
 
-	if c.TailcfgDNSConfig == nil {
-		return false
+		records = c.dns.dns.ExtraRecords
 	}
 
-	for _, r := range c.TailcfgDNSConfig.ExtraRecords {
+	for _, r := range records {
 		rn := strings.ToLower(strings.TrimSuffix(r.Name, "."))
 		if rn == name || (orBelow && strings.HasSuffix(rn, "."+name)) {
 			return true
@@ -2116,15 +1280,18 @@ func (c *Config) TailcfgDebug() *tailcfg.Debug {
 	return &tailcfg.Debug{DisableLogTail: true}
 }
 
-// SetExtraRecords replaces the ExtraRecords of [Config.TailcfgDNSConfig]. Safe
-// for concurrent use with [Config.CloneTailcfgDNSConfig].
+// SetExtraRecords replaces the extra records of the started DNS config; it
+// does nothing before [Config.StartDNS]. Safe for concurrent use with
+// [Config.CloneTailcfgDNSConfig].
 func (c *Config) SetExtraRecords(records []tailcfg.DNSRecord) {
-	tailcfgDNSMu.Lock()
-	defer tailcfgDNSMu.Unlock()
-
-	if c.TailcfgDNSConfig != nil {
-		c.TailcfgDNSConfig.ExtraRecords = lowercaseRecordNames(records)
+	if c.dns == nil {
+		return
 	}
+
+	c.dns.mu.Lock()
+	defer c.dns.mu.Unlock()
+
+	c.dns.dns.ExtraRecords = lowercaseRecordNames(records)
 }
 
 // lowercaseRecordNames normalizes DNS record names to lowercase, as DNS names

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-json-experiment/json"
+	"github.com/juanfont/headscale/hscontrol/derp"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/tailscale/hujson"
@@ -43,22 +45,24 @@ var ErrUndefinedTagReference = errors.New("does not exist")
 
 // SSH validation errors.
 var (
-	ErrSSHTagSourceToUserDest             = errors.New("tags in SSH source cannot access user-owned devices")
-	ErrSSHUserDestRequiresSameUser        = errors.New("user destination requires source to contain only that same user")
-	ErrSSHAutogroupSelfRequiresUserSource = errors.New("autogroup:self destination requires source to contain only users or groups, not tags or autogroup:tagged")
-	ErrSSHTagSourceToAutogroupMember      = errors.New("tags in SSH source cannot access autogroup:member (user-owned devices)")
-	ErrSSHWildcardDestination             = errors.New("wildcard (*) is not supported as SSH destination")
+	ErrSSHUserDestRequiresSameUser        = errors.New("users in dst are only allowed from the same user")
+	ErrSSHAutogroupSelfRequiresUserSource = errors.New("is not allowed in src for autogroup:self")
 	ErrSSHCheckPeriodAboveMax             = errors.New("is above the max (168h)")
 	ErrSSHCheckPeriodNegative             = errors.New("must be a positive duration")
-	ErrSSHCheckPeriodOnNonCheck           = errors.New("checkPeriod is only valid with action \"check\"")
+	ErrSSHCheckPeriodOnNonCheck           = errors.New(`"checkPeriod" can only be specified for the "check" action`)
 	ErrInvalidLocalpart                   = errors.New("invalid localpart format, must be localpart:*@<domain>")
 	ErrSSHUsersMustBeSpecified            = errors.New("users must be specified")
 	ErrSSHUserInvalid                     = errors.New("is not valid")
 	ErrSSHAcceptEnvEmpty                  = errors.New("acceptEnv values cannot be empty")
 	ErrSSHActionMustBeSpecified           = errors.New("action must be specified")
 	ErrSSHActionInvalid                   = errors.New("is not a valid action")
-	ErrSSHDestinationHostAlias            = errors.New("invalid dst")
-	ErrSSHCheckTagSource                  = errors.New(`[ssh] "check" action does not support tags in src`)
+	ErrSSHInvalidDst                      = errors.New("invalid dst")
+	ErrSSHGroupDst                        = errors.New("groups are not allowed dst")
+	ErrSSHSrcNotAllowed                   = errors.New("is not allowed")
+	ErrSSHSrcAutogroupNotAllowed          = errors.New("is not allowed in src")
+	ErrSSHSrcIP                           = errors.New("IPs and CIDRs are not allowed")
+	ErrSSHSrcHost                         = errors.New("hosts are not allowed")
+	ErrSSHCheckTagSource                  = errors.New(`"check" action does not support tags in src`)
 	ErrTagNameMustStartWithLetter         = errors.New("tag names must start with a letter, after 'tag:'")
 	ErrGroupMembersCannotBeRecursive      = errors.New("group members cannot be recursive")
 )
@@ -173,7 +177,7 @@ var (
 	ErrInvalidAlias                = errors.New("invalid alias format")
 	ErrInvalidAutoApprover         = errors.New("invalid auto approver format")
 	ErrInvalidOwner                = errors.New("invalid owner format")
-	ErrGroupNotDefined             = errors.New("group not defined in policy")
+	ErrGroupNotDefined             = errors.New("group not found")
 	ErrInvalidGroupMember          = errors.New("invalid group member type")
 	ErrGroupValueNotArray          = errors.New("group value must be an array of users")
 	ErrInvalidHostIP               = errors.New("hostname contains invalid IP address")
@@ -190,12 +194,11 @@ var (
 	ErrAutogroupNotSupportedACLSrc = errors.New("autogroup not supported for ACL sources")
 	ErrAutogroupNotSupportedACLDst = errors.New("autogroup not supported for ACL destinations")
 	ErrAutogroupDangerAllDst       = errors.New("cannot use autogroup:danger-all as a dst")
-	ErrAutogroupNotSupportedSSHSrc = errors.New("autogroup not supported for SSH sources")
-	ErrAutogroupNotSupportedSSHDst = errors.New("autogroup not supported for SSH destinations")
 	ErrHostNotDefined              = errors.New("host not defined in policy")
-	ErrSSHSourceAliasNotSupported  = errors.New("alias not supported for SSH source")
-	ErrSSHDestAliasNotSupported    = errors.New("alias not supported for SSH destination")
 	ErrUnknownField                = errors.New("unknown field")
+	ErrDERPRegionIDRange           = errors.New("must be in range [900,999]")
+	ErrDERPTailscaleName           = errors.New("cannot use Tailscale hostname or subdomain")
+	ErrDERPOmitDefaultsNoRegions   = errors.New("OmitDefaultRegions specified but no custom DERP regions specified")
 	ErrProtocolNoSpecificPorts     = errors.New("protocol does not support specific ports")
 	ErrTestEmptyAssertions         = errors.New("test entry must have at least one of \"accept\" or \"deny\"")
 	ErrTestProtocolNotAllowed      = errors.New("test protocol must be tcp, udp, sctp, or empty")
@@ -211,15 +214,10 @@ var (
 
 type resolved struct {
 	ips netipx.IPSet
-}
 
-func newResolved(ipb *netipx.IPSetBuilder) (resolved, error) {
-	ips, err := ipb.IPSet()
-	if err != nil {
-		return resolved{}, err
-	}
-
-	return resolved{ips: *ips}, nil
+	// wire is the alias as Tailscale writes it in a filter rule; nil
+	// writes ips as ranges and prefixes.
+	wire []string
 }
 
 func newResolvedAddresses(ips *netipx.IPSet, err error) (ResolvedAddresses, error) {
@@ -229,6 +227,35 @@ func newResolvedAddresses(ips *netipx.IPSet, err error) (ResolvedAddresses, erro
 
 	return resolved{ips: *ips}, err
 }
+
+// newNodeAddresses wraps the addresses of the nodes an alias names.
+// Tailscale writes each node address on its own, never merged into a
+// range with its neighbours.
+func newNodeAddresses(ips *netipx.IPSet, err error) (ResolvedAddresses, error) {
+	if ips == nil {
+		return nil, err
+	}
+
+	res := resolved{ips: *ips}
+	for addr := range util.IPSetAddrIter(ips) {
+		res.wire = append(res.wire, addr.String())
+	}
+
+	return res, err
+}
+
+// internetStrings writes [util.TheInternet] as Tailscale does: one address
+// range per span, also where a span is a prefix.
+var internetStrings = sync.OnceValue(func() []string {
+	ranges := util.TheInternet().Ranges()
+	out := make([]string, 0, len(ranges))
+
+	for _, r := range ranges {
+		out = append(out, r.String())
+	}
+
+	return out
+})
 
 func ipSetToStrings(ips *netipx.IPSet) []string {
 	var result []string
@@ -251,6 +278,10 @@ func ipSetToStrings(ips *netipx.IPSet) []string {
 }
 
 func (res resolved) Strings() []string {
+	if res.wire != nil {
+		return slices.Clip(res.wire)
+	}
+
 	return ipSetToStrings(&res.ips)
 }
 
@@ -492,7 +523,7 @@ func (u *Username) resolveUser(users types.Users) (types.User, error) {
 }
 
 func (u *Username) Resolve(_ *Policy, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
-	return newResolvedAddresses(u.resolve(nil, users, nodes))
+	return newNodeAddresses(u.resolve(nil, users, nodes))
 }
 
 func (u *Username) resolve(_ *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
@@ -591,7 +622,7 @@ func (g *Group) MarshalJSON() ([]byte, error) {
 }
 
 func (g *Group) Resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
-	return newResolvedAddresses(g.resolve(p, users, nodes))
+	return newNodeAddresses(g.resolve(p, users, nodes))
 }
 
 func (g *Group) resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
@@ -657,7 +688,7 @@ func (t *Tag) UnmarshalJSON(b []byte) error {
 }
 
 func (t *Tag) Resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
-	return newResolvedAddresses(t.resolve(p, users, nodes))
+	return newNodeAddresses(t.resolve(p, users, nodes))
 }
 
 func (t *Tag) resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
@@ -875,7 +906,17 @@ func (ag *AutoGroup) MarshalJSON() ([]byte, error) {
 }
 
 func (ag *AutoGroup) Resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (ResolvedAddresses, error) {
-	return newResolvedAddresses(ag.resolve(p, users, nodes))
+	ips, err := ag.resolve(p, users, nodes)
+
+	switch *ag {
+	case AutoGroupMember, AutoGroupTagged:
+		return newNodeAddresses(ips, err)
+	case AutoGroupInternet:
+		return resolved{ips: *ips, wire: internetStrings()}, err
+	case AutoGroupSelf, AutoGroupDangerAll, AutoGroupNonRoot:
+	}
+
+	return newResolvedAddresses(ips, err)
 }
 
 func (ag *AutoGroup) resolve(p *Policy, users types.Users, nodes views.Slice[types.NodeView]) (*netipx.IPSet, error) {
@@ -2105,6 +2146,10 @@ type Policy struct {
 	SSHTests            []SSHPolicyTest    `json:"sshTests,omitempty"`
 	RandomizeClientPort bool               `json:"randomizeClientPort,omitempty"`
 
+	// DERPMap changes the DERP map served to every node, as a Tailscale
+	// policy's derpMap does; see [validateDERPMap].
+	DERPMap *tailcfg.DERPMap `json:"derpMap,omitempty"`
+
 	// nodesByTag is set only on the copy [Policy.withNodesByTag] makes for
 	// one compile, and indexes the nodes that compile resolves against.
 	nodesByTag map[string][]types.NodeView
@@ -2176,7 +2221,7 @@ var (
 	autogroupForSrc       = []AutoGroup{AutoGroupMember, AutoGroupTagged, AutoGroupDangerAll}
 	autogroupForDst       = []AutoGroup{AutoGroupInternet, AutoGroupMember, AutoGroupTagged, AutoGroupSelf}
 	autogroupForSSHSrc    = []AutoGroup{AutoGroupMember, AutoGroupTagged}
-	autogroupForSSHDst    = []AutoGroup{AutoGroupMember, AutoGroupTagged, AutoGroupSelf}
+	autogroupForSSHDst    = []AutoGroup{AutoGroupTagged, AutoGroupSelf}
 	autogroupForNodeAttrs = []AutoGroup{AutoGroupMember, AutoGroupTagged}
 	autogroupNotSupported = []AutoGroup{}
 
@@ -2289,12 +2334,8 @@ func validateAutogroupForSSHSrc(src *AutoGroup) error {
 		return nil
 	}
 
-	if src.Is(AutoGroupInternet) {
-		return ErrAutogroupInternetSrc
-	}
-
 	if !slices.Contains(autogroupForSSHSrc, *src) {
-		return fmt.Errorf("%w: %q, can be %v", ErrAutogroupNotSupportedSSHSrc, *src, autogroupForSSHSrc)
+		return fmt.Errorf("%q %w", *src, ErrSSHSrcAutogroupNotAllowed)
 	}
 
 	return nil
@@ -2305,67 +2346,59 @@ func validateAutogroupForSSHDst(dst *AutoGroup) error {
 		return nil
 	}
 
-	if dst.Is(AutoGroupInternet) {
-		return ErrAutogroupInternetSrc
-	}
-
 	if !slices.Contains(autogroupForSSHDst, *dst) {
-		return fmt.Errorf("%w: %q, can be %v", ErrAutogroupNotSupportedSSHDst, *dst, autogroupForSSHDst)
+		return fmt.Errorf("%w %q", ErrSSHInvalidDst, *dst)
 	}
 
 	return nil
 }
 
-// validateSSHSrcDstCombination validates that SSH source/destination combinations
-// follow Tailscale's security model:
-//   - Destination can be: tags, autogroup:self (if source is users/groups), or same-user
-//   - Tags/autogroup:tagged CANNOT SSH to user destinations
-//   - [Username] destinations require the source to be that same single user only.
-func validateSSHSrcDstCombination(sources SSHSrcAliases, destinations SSHDstAliases) error {
-	// Categorize source types
-	srcHasTaggedEntities := false
-	srcHasGroups := false
-	srcUsernames := make(map[string]bool)
+// validateSSHSrcDstCombination applies Tailscale's limits on reaching
+// user-owned devices: a user in dst only from sources that are all that
+// same user, and autogroup:self not from tagged sources.
+//
+// autogroup:tagged is refused for both, as Tailscale's docs require (tagged
+// devices cannot SSH into user-owned devices; autogroup:self needs user,
+// group or role sources). SaaS's validator accepts it there, but then sends
+// no SSH rules to any node, so refusing grants the same access with an
+// error instead. sshRefusedUnlikeSaaS in the SSH compat test pins the SaaS
+// side and fails when a re-capture shows it changed.
+func validateSSHSrcDstCombination(groups Groups, sources SSHSrcAliases, destinations SSHDstAliases) error {
+	var srcTagged Alias
+
+	srcUsers := make(map[Username]bool)
+	srcAllMembers := false
 
 	for _, src := range sources {
 		switch v := src.(type) {
-		case *Tag:
-			srcHasTaggedEntities = true
-		case *AutoGroup:
-			if v.Is(AutoGroupTagged) {
-				srcHasTaggedEntities = true
-			} else if v.Is(AutoGroupMember) {
-				srcHasGroups = true // autogroup:member is like a group of users
-			}
-		case *Group:
-			srcHasGroups = true
 		case *Username:
-			srcUsernames[string(*v)] = true
+			srcUsers[*v] = true
+		case *Group:
+			for _, u := range groups[*v] {
+				srcUsers[u] = true
+			}
+		case *Tag:
+			if srcTagged == nil {
+				srcTagged = v
+			}
+		case *AutoGroup:
+			srcAllMembers = srcAllMembers || v.Is(AutoGroupMember)
+
+			if v.Is(AutoGroupTagged) && srcTagged == nil {
+				srcTagged = v
+			}
 		}
 	}
 
-	// Check destinations against source constraints
 	for _, dst := range destinations {
 		switch v := dst.(type) {
 		case *Username:
-			// Rule: Tags/autogroup:tagged CANNOT SSH to user destinations
-			if srcHasTaggedEntities {
-				return fmt.Errorf("%w (%s); use autogroup:tagged or specific tags as destinations instead",
-					ErrSSHTagSourceToUserDest, *v)
-			}
-			// Rule: Username destination requires source to be that same single user only
-			if srcHasGroups || len(srcUsernames) != 1 || !srcUsernames[string(*v)] {
-				return fmt.Errorf("%w %q; use autogroup:self instead for same-user SSH access",
-					ErrSSHUserDestRequiresSameUser, *v)
+			if srcTagged != nil || srcAllMembers || len(srcUsers) != 1 || !srcUsers[*v] {
+				return ErrSSHUserDestRequiresSameUser
 			}
 		case *AutoGroup:
-			// Rule: autogroup:self requires source to NOT contain tags
-			if v.Is(AutoGroupSelf) && srcHasTaggedEntities {
-				return ErrSSHAutogroupSelfRequiresUserSource
-			}
-			// Rule: autogroup:member (user-owned devices) cannot be accessed by tagged entities
-			if v.Is(AutoGroupMember) && srcHasTaggedEntities {
-				return ErrSSHTagSourceToAutogroupMember
+			if v.Is(AutoGroupSelf) && srcTagged != nil {
+				return fmt.Errorf("%q %w", srcTagged, ErrSSHAutogroupSelfRequiresUserSource)
 			}
 		}
 	}
@@ -2502,7 +2535,7 @@ func validateGrantSrcDstCombination(sources Aliases, destinations Aliases) error
 // not known before the policy is compiled.
 func minDstPrefixes(dst Alias) int64 {
 	if ag, ok := dst.(*AutoGroup); ok && ag.Is(AutoGroupInternet) {
-		return int64(len(util.TheInternet().Prefixes()))
+		return int64(len(internetStrings()))
 	}
 
 	return 1
@@ -2612,6 +2645,8 @@ func (p *Policy) validate() error {
 	}
 
 	for _, ssh := range p.SSHs {
+		ruleErrs := len(errs)
+
 		// Empty action and users survive parse; surface them here.
 		if ssh.Action == "" {
 			errs = append(errs, ErrSSHActionMustBeSpecified)
@@ -2668,6 +2703,12 @@ func (p *Policy) validate() error {
 				if err != nil {
 					errs = append(errs, err)
 				}
+			case Asterix:
+				errs = append(errs, fmt.Errorf("%q %w", src, ErrSSHSrcNotAllowed))
+			case *Prefix:
+				errs = append(errs, fmt.Errorf("%q: %w", filterIP(netip.Prefix(*src)), ErrSSHSrcIP))
+			case *Host:
+				errs = append(errs, fmt.Errorf("%q: %w", string(*src), ErrSSHSrcHost))
 			}
 		}
 
@@ -2700,15 +2741,21 @@ func (p *Policy) validate() error {
 				if err != nil {
 					errs = append(errs, err)
 				}
+			case *Group:
+				errs = append(errs, ErrSSHGroupDst)
+			case Asterix:
+				errs = append(errs, fmt.Errorf("%w %q", ErrSSHInvalidDst, dst))
+			case *Prefix:
+				errs = append(errs, fmt.Errorf("%w %q", ErrSSHInvalidDst, filterIP(netip.Prefix(*dst))))
 			case *Host:
 				// Hosts-table aliases are valid on ACL dst but
 				// rejected here for SSH dst.
-				errs = append(errs, fmt.Errorf("%w %q", ErrSSHDestinationHostAlias, string(*dst)))
+				errs = append(errs, fmt.Errorf("%w %q", ErrSSHInvalidDst, string(*dst)))
 			}
 		}
 
 		// Validate SSH source/destination combinations follow Tailscale's security model
-		err := validateSSHSrcDstCombination(ssh.Sources, ssh.Destinations)
+		err := validateSSHSrcDstCombination(p.Groups, ssh.Sources, ssh.Destinations)
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -2724,6 +2771,12 @@ func (p *Policy) validate() error {
 					errs = append(errs, err)
 				}
 			}
+		}
+
+		// Shared checks (tags, groups) cannot tell which section they
+		// serve; this label is the marker Tailscale uses for SSH rules.
+		for i := ruleErrs; i < len(errs); i++ {
+			errs[i] = fmt.Errorf("[ssh] %w", errs[i])
 		}
 	}
 
@@ -3006,6 +3059,8 @@ func (p *Policy) validate() error {
 		}
 	}
 
+	errs = append(errs, validateDERPMap(p.DERPMap)...)
+
 	if err := validateTests(p, p.Tests); err != nil { //nolint:noinlineerr
 		errs = append(errs, err)
 	}
@@ -3128,14 +3183,10 @@ func (a *SSHSrcAliases) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
+	// Kinds an SSH rule refuses are reported by [Policy.validate].
 	*a = make([]Alias, len(aliases))
 	for i, alias := range aliases {
-		switch alias.Alias.(type) {
-		case *Username, *Group, *Tag, *AutoGroup:
-			(*a)[i] = alias.Alias
-		default:
-			return fmt.Errorf("%w: %T", ErrSSHSourceAliasNotSupported, alias.Alias)
-		}
+		(*a)[i] = alias.Alias
 	}
 
 	return nil
@@ -3149,18 +3200,10 @@ func (a *SSHDstAliases) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
+	// Kinds an SSH rule refuses are reported by [Policy.validate].
 	*a = make([]Alias, len(aliases))
 	for i, alias := range aliases {
-		switch alias.Alias.(type) {
-		case *Username, *Tag, *AutoGroup, *Host:
-			(*a)[i] = alias.Alias
-		case Asterix:
-			return fmt.Errorf("%w; use 'autogroup:member' for user-owned devices, "+
-				"'autogroup:tagged' for tagged devices, or specific tags/users",
-				ErrSSHWildcardDestination)
-		default:
-			return fmt.Errorf("%w: %T", ErrSSHDestAliasNotSupported, alias.Alias)
-		}
+		(*a)[i] = alias.Alias
 	}
 
 	return nil
@@ -3368,6 +3411,12 @@ func stripMetadataMembers(v *hujson.Value) {
 	}
 }
 
+// ParsePolicy parses and validates a policy without users or nodes: syntax,
+// shape and cross-reference checks only. Empty input returns nil, nil.
+func ParsePolicy(b []byte) (*Policy, error) {
+	return unmarshalPolicy(b)
+}
+
 // unmarshalPolicy takes a byte slice and unmarshals it into a [Policy] struct.
 // In addition to unmarshalling, it will also validate the policy.
 // This is the only entrypoint of reading a policy from a file or other source.
@@ -3444,6 +3493,61 @@ func validateProtocolPortCompatibility(protocol Protocol, destinations []AliasWi
 	}
 
 	return nil
+}
+
+// validateDERPMap checks a policy derpMap the way Tailscale SaaS does, with
+// its wording: an added region uses an ID in 900-999, passes
+// [derp.ValidateRegion] like every DERP map, and no node is on tailscale.com. A null
+// region only removes one, so it is not checked. HomeParams are decoded but
+// never sent, as on SaaS.
+func validateDERPMap(dm *tailcfg.DERPMap) []error {
+	if dm == nil {
+		return nil
+	}
+
+	var (
+		errs   []error
+		custom int
+	)
+
+	for _, id := range slices.Sorted(maps.Keys(dm.Regions)) {
+		region := dm.Regions[id]
+		if region == nil {
+			continue
+		}
+
+		custom++
+
+		if id < 900 || id > 999 {
+			errs = append(errs, fmt.Errorf("invalid region ID %d; %w", id, ErrDERPRegionIDRange))
+
+			continue
+		}
+
+		errs = append(errs, derp.ValidateRegion(id, region)...)
+
+		for _, node := range region.Nodes {
+			if node == nil {
+				continue
+			}
+
+			// SaaS keeps custom regions off Tailscale's own servers. It also
+			// rejects their IPs, which takes a live list of them.
+			for _, name := range []string{node.HostName, node.CertName} {
+				if name == "tailscale.com" || strings.HasSuffix(name, ".tailscale.com") {
+					errs = append(errs, fmt.Errorf("custom DERP Region %d %w %q", id, ErrDERPTailscaleName, name))
+
+					break
+				}
+			}
+		}
+	}
+
+	if dm.OmitDefaultRegions && custom == 0 {
+		errs = append(errs, ErrDERPOmitDefaultsNoRegions)
+	}
+
+	return errs
 }
 
 // validateTests enforces the four shape rules a tests-block entry must

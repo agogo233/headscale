@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -23,7 +22,7 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/envknob"
-	"tailscale.com/net/stun"
+	"tailscale.com/net/stunserver"
 	"tailscale.com/net/wsconn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -68,7 +67,7 @@ func NewDERPServer(
 	log.Trace().Caller().Msg("creating new embedded DERP server")
 	server := derpserver.New(derpKey, util.TSLogfWrapper()) // nolint // zerolinter complains
 
-	if cfg.ServerVerifyClients {
+	if cfg.Server.VerifyClients {
 		server.SetVerifyClientURL(DerpVerifyScheme + "://verify")
 		server.SetVerifyClientURLFailOpen(false)
 	}
@@ -136,24 +135,24 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 	}
 
 	localDERPregion := tailcfg.DERPRegion{
-		RegionID:   d.cfg.ServerRegionID,
-		RegionCode: d.cfg.ServerRegionCode,
-		RegionName: d.cfg.ServerRegionName,
+		RegionID:   d.cfg.Server.RegionID,
+		RegionCode: d.cfg.Server.RegionCode,
+		RegionName: d.cfg.Server.RegionName,
 		Nodes: []*tailcfg.DERPNode{
 			{
-				Name:     d.cfg.ServerRegionID.String(),
-				RegionID: d.cfg.ServerRegionID,
+				Name:     d.cfg.Server.RegionID.String(),
+				RegionID: d.cfg.Server.RegionID,
 				HostName: host,
 				DERPPort: port,
-				IPv4:     d.cfg.IPv4,
-				IPv6:     d.cfg.IPv6,
+				IPv4:     d.cfg.Server.IPv4,
+				IPv6:     d.cfg.Server.IPv6,
 
 				InsecureForTests: insecure,
 			},
 		},
 	}
 
-	_, portSTUNStr, err := net.SplitHostPort(d.cfg.STUNAddr)
+	_, portSTUNStr, err := net.SplitHostPort(string(d.cfg.Server.STUNAddr))
 	if err != nil {
 		return tailcfg.DERPRegion{}, err
 	}
@@ -378,71 +377,23 @@ func DERPBootstrapDNSHandler(
 	}
 }
 
-// ServeSTUN starts a STUN server on the configured addr.
-func (d *DERPServer) ServeSTUN() {
-	packetConn, err := new(net.ListenConfig).ListenPacket(context.Background(), "udp", d.cfg.STUNAddr)
+// ListenSTUN binds a STUN server on the configured addr; the caller runs its
+// Serve, which returns once ctx is cancelled. It uses Tailscale's stunserver
+// so replies match what Tailscale's own derpers send.
+func (d *DERPServer) ListenSTUN(ctx context.Context) (*stunserver.STUNServer, error) {
+	srv := stunserver.New(ctx)
+
+	err := srv.Listen(string(d.cfg.Server.STUNAddr))
 	if err != nil {
-		log.Fatal().Msgf("failed to open STUN listener: %v", err)
-	}
-
-	log.Info().Msgf("stun server started at %s", packetConn.LocalAddr())
-
-	udpConn, ok := packetConn.(*net.UDPConn)
-	if !ok {
-		log.Fatal().Msg("stun listener is not a UDP listener")
-	}
-
-	serverSTUNListener(context.Background(), udpConn)
-}
-
-func serverSTUNListener(ctx context.Context, packetConn *net.UDPConn) {
-	var buf [64 << 10]byte
-
-	for {
-		bytesRead, udpAddr, err := packetConn.ReadFromUDP(buf[:])
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-
-			log.Error().Caller().Err(err).Msgf("stun ReadFrom")
-
-			// Rate limit error logging - wait before retrying, but respect context cancellation
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-
-			continue
-		}
-
-		log.Trace().Caller().Msgf("stun request from %v", udpAddr)
-
-		pkt := buf[:bytesRead]
-		if !stun.Is(pkt) {
-			log.Trace().Caller().Msgf("udp packet is not stun")
-
-			continue
-		}
-
-		txid, err := stun.ParseBindingRequest(pkt)
-		if err != nil {
-			log.Trace().Caller().Err(err).Msgf("stun parse error")
-
-			continue
-		}
-
-		addr, _ := netip.AddrFromSlice(udpAddr.IP)
-		res := stun.Response(txid, netip.AddrPortFrom(addr, uint16(udpAddr.Port))) //nolint:gosec // port is always <=65535
-
-		_, err = packetConn.WriteTo(res, udpAddr)
-		if err != nil {
-			log.Trace().Caller().Err(err).Msgf("issue writing to UDP")
-
-			continue
+		return nil, &types.ListenerBindError{
+			Listener: "STUN",
+			YAMLKey:  "derp.server.stun_listen_addr",
+			Addr:     string(d.cfg.Server.STUNAddr),
+			Err:      err,
 		}
 	}
+
+	return srv, nil
 }
 
 func NewDERPVerifyTransport(handleVerifyRequest func(*http.Request, io.Writer) error) *DERPVerifyTransport {

@@ -1124,13 +1124,14 @@ func TestAuthenticationFlows(t *testing.T) {
 			wantErrMsg: "[tag:client-wants-this] are invalid",
 		},
 
-		// TEST: Existing tagged node re-registering with foreign RequestTags is rejected
-		// WHAT: Same machine and node key re-run `tailscale up --authkey` with a tag
-		// the key does not carry, hitting the skip-validation re-registration path
+		// TEST: Existing tagged node logging in again with foreign RequestTags is rejected
+		// WHAT: Same machine runs `tailscale up --force-reauth --authkey` with a tag
+		// the key does not carry
 		// INPUT: Node registered with tagged PreAuthKey ([tag:authorized]), then the
-		// same key with RequestTags [tag:client-wants-this]
+		// same key, a new node key and RequestTags [tag:client-wants-this]
 		// EXPECTED: Re-registration fails
-		// WHY: New and existing nodes are held to the same advertise-tags rule
+		// WHY: New and existing nodes are held to the same advertise-tags rule. Under
+		// its own node key the node only wakes and its RequestTags are not applied.
 		{
 			name: "existing_tagged_node_reregister_rejects_foreign_request_tags",
 			setupFunc: func(t *testing.T, app *Headscale) (string, error) { //nolint:thelper
@@ -1165,7 +1166,7 @@ func TestAuthenticationFlows(t *testing.T) {
 					Auth: &tailcfg.RegisterResponseAuth{
 						AuthKey: authKey,
 					},
-					NodeKey: nodeKey1.Public(),
+					NodeKey: nodeKey2.Public(),
 					Hostinfo: &tailcfg.Hostinfo{
 						Hostname:    "tagged-pak-rereg-node",
 						RequestTags: []string{"tag:client-wants-this"},
@@ -3362,26 +3363,7 @@ func TestWebFlowReauthDifferentUser(t *testing.T) {
 func createTestApp(t *testing.T, options ...func(*types.Config)) *Headscale {
 	t.Helper()
 
-	tmpDir := t.TempDir()
-
-	cfg := types.Config{
-		ServerURL:           "http://localhost:8080",
-		NoisePrivateKeyPath: tmpDir + "/noise_private.key",
-		Database: types.DatabaseConfig{
-			Type: "sqlite3",
-			Sqlite: types.SqliteConfig{
-				Path: tmpDir + "/headscale_test.db",
-			},
-		},
-		OIDC: types.OIDCConfig{},
-		Policy: types.PolicyConfig{
-			Mode: types.PolicyModeDB,
-		},
-		Tuning: types.Tuning{
-			BatchChangeDelay: 100 * time.Millisecond,
-			BatcherWorkers:   1,
-		},
-	}
+	cfg := validConfig(t)
 
 	for _, option := range options {
 		option(&cfg)

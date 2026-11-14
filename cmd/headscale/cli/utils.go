@@ -37,6 +37,7 @@ const (
 
 var (
 	errAPIKeyNotSet     = errors.New("HEADSCALE_CLI_API_KEY environment variable needs to be set")
+	errUnixSocketNotSet = errors.New("unix_socket is empty: set it, or cli.address and cli.api_key for a remote server")
 	errMissingParameter = errors.New("missing parameters")
 	errResponseStatus   = errors.New("unexpected response status")
 )
@@ -86,21 +87,27 @@ func mustMarkRequired(cmd *cobra.Command, names ...string) {
 	}
 }
 
+// newHeadscaleServerWithConfig builds the server, which validates the
+// configuration.
 func newHeadscaleServerWithConfig() (*hscontrol.Headscale, error) {
-	cfg, err := types.LoadServerConfig()
-	if err != nil {
-		return nil, fmt.Errorf(
-			"loading configuration: %w",
-			err,
-		)
-	}
-
-	app, err := hscontrol.NewHeadscale(cfg)
+	app, err := hscontrol.NewHeadscale(serverConfig())
 	if err != nil {
 		return nil, fmt.Errorf("creating new headscale: %w", err)
 	}
 
 	return app, nil
+}
+
+// serverConfig is the loaded configuration as the server takes it,
+// unvalidated.
+func serverConfig() *types.Config {
+	cfg := loaded.Config
+
+	// The server never uses the CLI's key, which may be an unread file:
+	// reference.
+	cfg.CLI.APIKey = ""
+
+	return cfg
 }
 
 // clientRunE wraps a [cobra.Command.RunE] func, injecting a ready API client
@@ -141,10 +148,7 @@ func withClient(
 // Otherwise it talks to the remote TCP address over HTTPS and injects the
 // configured API key as a bearer token.
 func newHeadscaleCLIWithConfig() (context.Context, *clientv1.ClientWithResponses, context.CancelFunc, error) {
-	cfg, err := types.LoadCLIConfig()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("loading configuration: %w", err)
-	}
+	cfg := loaded.Config
 
 	log.Debug().
 		Dur("timeout", cfg.CLI.Timeout).
@@ -173,11 +177,11 @@ func newHeadscaleCLIWithConfig() (context.Context, *clientv1.ClientWithResponses
 	}
 
 	// Remote connections require an API key for authentication.
-	apiKey := cfg.CLI.APIKey
-	if apiKey == "" {
+	apiKey, err := cliAPIKey(cfg.CLI)
+	if err != nil {
 		cancel()
 
-		return nil, nil, nil, errAPIKeyNotSet
+		return nil, nil, nil, err
 	}
 
 	client, err := newRemoteClient(address, apiKey, cfg.CLI.Insecure)
@@ -190,6 +194,21 @@ func newHeadscaleCLIWithConfig() (context.Context, *clientv1.ClientWithResponses
 	log.Trace().Caller().Str(zf.Address, address).Msg("connecting via HTTPS")
 
 	return ctx, client, cancel, nil
+}
+
+// cliAPIKey reads the key a remote CLI sends; over the unix socket the CLI
+// needs none, so it must not call this.
+func cliAPIKey(cfg types.CLIConfig) (string, error) {
+	key, err := types.ResolveSecret("cli.api_key", string(cfg.APIKey))
+	if err != nil {
+		return "", err
+	}
+
+	if key == "" {
+		return "", errAPIKeyNotSet
+	}
+
+	return key, nil
 }
 
 // newSocketClient builds an API client that dials the local unix socket. The
@@ -232,6 +251,11 @@ func newSocketClient(socketPath string) (*clientv1.ClientWithResponses, error) {
 // starts can race its creation; retrying preserves the old gRPC client's
 // blocking-dial tolerance rather than failing on a not-yet-present socket.
 func dialHeadscaleSocket(ctx context.Context, socketPath string) (net.Conn, error) {
+	// Retrying cannot help: no socket ever appears at "".
+	if socketPath == "" {
+		return nil, errUnixSocketNotSet
+	}
+
 	b := backoff.NewExponentialBackOff()
 	b.InitialInterval = 50 * time.Millisecond
 	b.MaxInterval = 1 * time.Second
@@ -393,8 +417,16 @@ func printError(err error, outputFormat string) {
 	fmt.Fprintf(os.Stderr, "%s\n", out)
 }
 
+// hasMachineOutputFlag reports whether --output, as Cobra parsed it in any
+// spelling for the command being run, asks for a machine-readable format.
+// The command's own flags hold it: version shadows the root's --output.
 func hasMachineOutputFlag() bool {
-	return slices.ContainsFunc(os.Args, func(arg string) bool {
-		return arg == outputFormatJSON || arg == outputFormatJSONLine || arg == outputFormatYAML
-	})
+	cmd, _, err := rootCmd.Find(os.Args[1:])
+	if err != nil {
+		return false
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+
+	return slices.Contains([]string{outputFormatJSON, outputFormatJSONLine, outputFormatYAML}, output)
 }

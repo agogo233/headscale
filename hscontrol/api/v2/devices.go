@@ -3,6 +3,7 @@ package apiv2
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/netip"
 	"slices"
@@ -13,11 +14,13 @@ import (
 	"github.com/juanfont/headscale/hscontrol/scope"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
+	"github.com/rs/zerolog/log"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tailcfg"
 )
 
 func init() {
-	registrations = append(registrations, registerDevices)
+	registrations = append(registrations, registerDevices, registerDeviceUpdates)
 }
 
 // Device is the Tailscale device response. Headscale nodes map onto it; fields
@@ -97,6 +100,19 @@ type DeviceRoutes struct {
 	Enabled    []string `json:"enabledRoutes"    nullable:"false"`
 }
 
+// DevicePostureAttributes is the GET /device/{id}/attributes response. Of
+// Tailscale's attributes, headscale sets only ip:publicAddress, and like
+// Tailscale leaves expiries out when no attribute has one.
+type DevicePostureAttributes struct {
+	Attributes map[string]any       `json:"attributes"         nullable:"false"`
+	Expiries   map[string]time.Time `json:"expiries,omitempty"`
+}
+
+// DeviceUpdateStatus is the GET /device/{id}/update-status response.
+type DeviceUpdateStatus struct {
+	Status string `enum:"updating,not-updating" json:"status"`
+}
+
 // Request bodies match the Tailscale SDK wire shapes and, like Tailscale's,
 // ignore properties they do not define.
 type (
@@ -135,6 +151,9 @@ type (
 		DeviceID string `doc:"Device id (the decimal node id)." path:"id"`
 		Fields   string `doc:"Set to \"all\" for route fields." query:"fields"`
 	}
+	deviceAttributesInput struct {
+		DeviceID string `doc:"Device id (the decimal node id)." path:"id"`
+	}
 	listDevicesInput struct {
 		Tailnet string `doc:"Tailnet; must be \"-\"." path:"tailnet"`
 		Fields  string `query:"fields"`
@@ -159,15 +178,21 @@ type (
 		DeviceID string `path:"id"`
 		Body     setSubnetRoutesRequest
 	}
+	deviceIDInput struct {
+		DeviceID string `path:"id"`
+	}
 
-	deviceOutput       struct{ Body Device }
-	deviceRoutesOutput struct{ Body DeviceRoutes }
-	listDevicesOutput  struct {
+	deviceOutput                  struct{ Body Device }
+	deviceRoutesOutput            struct{ Body DeviceRoutes }
+	devicePostureAttributesOutput struct{ Body DevicePostureAttributes }
+	listDevicesOutput             struct {
 		Body struct {
 			Devices []Device `json:"devices" nullable:"false"`
 		}
 	}
 	emptyOutput struct{ Body struct{} }
+
+	deviceUpdateStatusOutput struct{ Body DeviceUpdateStatus }
 )
 
 func registerDevices(api huma.API, b Backend) {
@@ -187,7 +212,24 @@ func registerDevices(api huma.API, b Backend) {
 			return nil, err
 		}
 
-		return &deviceOutput{Body: deviceFromView(node, in.Fields == "all", b.Cfg.BaseDomain)}, nil
+		return &deviceOutput{Body: deviceFromView(node, in.Fields == "all", b.Cfg.DNSConfig.BaseDomain)}, nil
+	})
+
+	huma.Register(api, requireScope(huma.Operation{
+		OperationID: "getDevicePostureAttributes",
+		Method:      http.MethodGet,
+		Path:        "/api/v2/device/{id}/attributes",
+		Summary:     "Get device posture attributes",
+		Tags:        deviceTags,
+		Security:    security,
+		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
+	}, scope.DevicesPostureAttributesRead), func(ctx context.Context, in *deviceAttributesInput) (*devicePostureAttributesOutput, error) {
+		node, err := lookupNode(b, in.DeviceID)
+		if err != nil {
+			return nil, err
+		}
+
+		return &devicePostureAttributesOutput{Body: devicePostureAttributesFromView(node)}, nil
 	})
 
 	huma.Register(api, requireScope(huma.Operation{
@@ -211,7 +253,7 @@ func registerDevices(api huma.API, b Backend) {
 		out.Body.Devices = make([]Device, 0, nodes.Len())
 
 		for _, node := range nodes.All() {
-			out.Body.Devices = append(out.Body.Devices, deviceFromView(node, allFields, b.Cfg.BaseDomain))
+			out.Body.Devices = append(out.Body.Devices, deviceFromView(node, allFields, b.Cfg.DNSConfig.BaseDomain))
 		}
 
 		// The NodeStore holds no order, and Tailscale lists devices by name.
@@ -463,6 +505,87 @@ func registerDevices(api huma.API, b Backend) {
 	})
 }
 
+func registerDeviceUpdates(api huma.API, b Backend) {
+	deviceTags := []string{"Devices", tagTailscaleCompat}
+
+	huma.Register(api, requireScope(huma.Operation{
+		OperationID:   "updateDeviceClient",
+		Method:        http.MethodPost,
+		Path:          "/api/v2/device/{id}/update-client",
+		Summary:       "Update a device's Tailscale client",
+		Description:   "Asks a connected device over c2n to update its Tailscale client. A device that does not allow remote updates, is not connected, or refuses is not found.",
+		Tags:          deviceTags,
+		Security:      security,
+		DefaultStatus: http.StatusOK,
+		Errors: []int{
+			http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
+			http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+		},
+	}, scope.DevicesCore), func(ctx context.Context, in *deviceIDInput) (*emptyOutput, error) {
+		node, err := lookupNode(b, in.DeviceID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Tailscale answers every device it will not update with the same 404.
+		hi := node.Hostinfo()
+		if !hi.Valid() || !hi.AllowsUpdate() || !b.Connected(node.ID()) {
+			return nil, huma.Error404NotFound("not found")
+		}
+
+		res, err := sendC2N(ctx, b, node.ID(), "/update")
+		if err != nil {
+			return nil, err
+		}
+		defer res.Body.Close()
+
+		var update tailcfg.C2NUpdateResponse
+
+		err = json.NewDecoder(res.Body).Decode(&update)
+		if err != nil {
+			return nil, huma.Error502BadGateway("decoding client update response", err)
+		}
+
+		if !update.Started {
+			log.Info().EmbedObject(node).Str("reason", update.Err).Msg("node refused client update")
+
+			return nil, huma.Error404NotFound("not found")
+		}
+
+		b.State.ClientUpdateStarted(node.ID(), hi.IPNVersion())
+
+		return &emptyOutput{}, nil
+	})
+
+	huma.Register(api, requireScope(huma.Operation{
+		OperationID: "getDeviceUpdateStatus",
+		Method:      http.MethodGet,
+		Path:        "/api/v2/device/{id}/update-status",
+		Summary:     "Get a device's client update status",
+		Description: "updating from a started client update until the device runs a new version, else not-updating.",
+		Tags:        deviceTags,
+		Security:    security,
+		Errors:      []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound},
+	}, scope.DevicesCoreRead), func(_ context.Context, in *deviceIDInput) (*deviceUpdateStatusOutput, error) {
+		node, err := lookupNode(b, in.DeviceID)
+		if err != nil {
+			return nil, err
+		}
+
+		var version string
+		if hi := node.Hostinfo(); hi.Valid() {
+			version = hi.IPNVersion()
+		}
+
+		status := "not-updating"
+		if b.State.ClientUpdating(node.ID(), version) {
+			status = "updating"
+		}
+
+		return &deviceUpdateStatusOutput{Body: DeviceUpdateStatus{Status: status}}, nil
+	})
+}
+
 // lookupNode resolves a device id to its NodeView, mapping a malformed or
 // unknown id to 404 (the Tailscale SDK keys IsNotFound off the status code).
 func lookupNode(b Backend, rawID string) (types.NodeView, error) {
@@ -594,6 +717,15 @@ func deviceFromView(view types.NodeView, allFields bool, baseDomain string) Devi
 	}
 
 	return d
+}
+
+func devicePostureAttributesFromView(view types.NodeView) DevicePostureAttributes {
+	attributes := make(map[string]any)
+	if addr := view.LastControlAddress(); addr.Valid() {
+		attributes["ip:publicAddress"] = addr.Get().String()
+	}
+
+	return DevicePostureAttributes{Attributes: attributes}
 }
 
 func routesFromView(view types.NodeView) DeviceRoutes {

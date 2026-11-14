@@ -57,7 +57,15 @@ The DERP map offered to clients can be customized with a [dedicated YAML-configu
 file](https://github.com/juanfont/headscale/blob/main/derp-example.yaml). The file extension picks the format: `.yaml`
 or `.yml`, or the JSON format Tailscale serves DERP maps in as `.json` or `.hujson`. Both JSON extensions are read as
 [HuJSON](https://github.com/tailscale/hujson), so comments and trailing commas are allowed. This allows to modify previously
-loaded DERP maps fetched via URL or to offer your own, custom DERP servers to nodes.
+loaded DERP maps fetched via URL or to offer your own, custom DERP servers to nodes. A file with a key that has no field
+in [DERPMap](https://pkg.go.dev/tailscale.com/tailcfg#DERPMap) fails to load. So does a region whose `regionid` differs
+from its key, a node whose `regionid` differs from its region, or a region without nodes: clients count latency by
+`regionid`.
+
+A `derp.urls` or `derp.paths` source that fails to load, for example a URL that is down or a file with an error, is
+logged as a warning and skipped. Headscale starts with the DERP regions from the other sources, the embedded DERP server
+and the policy's `derpMap`, and refuses to start only when no region remains. A refresh with a failing source keeps the
+previous DERP map. A skipped file also skips what it removes: a region it sets to `null` comes back.
 
 === "Remove specific DERP regions"
 
@@ -128,8 +136,63 @@ loaded DERP maps fetched via URL or to offer your own, custom DERP servers to no
         - /etc/headscale/derp.yaml
     ```
 
+=== "Prefer or avoid DERP regions"
+
+    Each client picks its home DERP region by latency. A region score multiplies the latency a client measures for a
+    region before it compares regions: a score below 1 makes a region more attractive, a score above 1 less attractive.
+    Regions without a score count as 1, scores of 0 or below are ignored. See
+    [DERPHomeParams](https://pkg.go.dev/tailscale.com/tailcfg#DERPHomeParams).
+
+    The following sample `derp.yaml` prefers the embedded DERP server (region ID 999) and avoids New York (region ID 1).
+    The file may hold scores alone, the regions come from other sources:
+
+    ```yaml title="derp.yaml"
+    homeparams:
+      regionscore:
+        999: 0.5
+        1: 2
+    ```
+
+    The same in a `.json` or `.hujson` file is `{"HomeParams": {"RegionScore": {"999": 0.5, "1": 2}}}`.
+
+    A score biases the choice, it does not pin it: a client keeps its home region unless another one is clearly faster
+    after scaling. Connected clients keep a score that is removed from the file until they reconnect; set it to `1`
+    instead to reset it.
+
 Independent of the custom DERP map, you may choose to [enable the embedded DERP server and have it automatically added
 to the custom DERP map](#enable-embedded-derp).
+
+### Customize the DERP map in the policy
+
+The [policy](policy.md#network-wide-policy-options) may hold a `derpMap`, as on Tailscale. It changes the DERP map from
+the configuration above, and connected nodes get the change as soon as the policy is updated. Headscale checks it like
+Tailscale does:
+
+- A region added in the policy needs a region ID from 900 to 999 and at least one node. Its `RegionID`, and the `RegionID`
+  of each node, must match the ID it is listed under. A policy region replaces a configured region with the same ID,
+  such as the embedded DERP server's.
+- A node's `HostName` and `CertName` must not be `tailscale.com` or one of its subdomains. Tailscale also rejects the IP
+  addresses of its own DERP servers; Headscale does not, as that needs Tailscale's current list of servers.
+- A region set to `null` is removed. This works for any region ID.
+- `OmitDefaultRegions: true` removes every region from the configuration, the embedded DERP server's included, and
+  needs at least one region added in the policy.
+- `HomeParams` is accepted but ignored, as on Tailscale. Set region scores in a `derp.paths` file instead.
+
+```json title="policy.json"
+{
+  "derpMap": {
+    "Regions": {
+      "1": null,
+      "900": {
+        "RegionID": 900,
+        "RegionCode": "custom",
+        "RegionName": "My region",
+        "Nodes": [{"Name": "900a", "RegionID": 900, "HostName": "derp900.example.com"}]
+      }
+    }
+  }
+}
+```
 
 ### Verify clients
 

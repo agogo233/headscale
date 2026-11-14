@@ -3,976 +3,50 @@ package types
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"net/netip"
 	"net/url"
-	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
-	hsdns "github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/libdns/cloudflare"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 )
 
-func TestReadConfig(t *testing.T) {
-	tests := []struct {
-		name       string
-		configPath string
-		setup      func(*testing.T) (any, error)
-		want       any
-		wantErr    string
-	}{
-		{
-			name:       "unmarshal-dns-full-config",
-			configPath: "testdata/dns_full.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				dns, err := dns()
-				if err != nil {
-					return nil, err
-				}
-
-				return dns, nil
-			},
-			want: DNSConfig{
-				MagicDNS:         true,
-				BaseDomain:       "example.com",
-				OverrideLocalDNS: false,
-				Nameservers: Nameservers{
-					Global: []string{
-						"1.1.1.1",
-						"1.0.0.1",
-						"2606:4700:4700::1111",
-						"2606:4700:4700::1001",
-						"https://dns.nextdns.io/abc123",
-					},
-					Split: map[string][]string{
-						"darp.headscale.net": {"1.1.1.1", "8.8.8.8"},
-						"foo.bar.com":        {"1.1.1.1"},
-					},
-				},
-				ExtraRecords: []tailcfg.DNSRecord{
-					{Name: "grafana.myvpn.example.com", Type: "A", Value: "100.64.0.3"},
-					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
-				},
-				SearchDomains: []string{"test.com", "bar.com"},
-				Certificates:  CertificatesConfig{Zone: "example.com"},
-			},
-		},
-		{
-			name:       "dns-to-tailcfg.DNSConfig",
-			configPath: "testdata/dns_full.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				dns, err := dns()
-				if err != nil {
-					return nil, err
-				}
-
-				return dnsToTailcfgDNS(dns), nil
-			},
-			want: &tailcfg.DNSConfig{
-				Proxied: true,
-				Domains: []string{"example.com", "test.com", "bar.com"},
-				FallbackResolvers: []*dnstype.Resolver{
-					{Addr: "1.1.1.1"},
-					{Addr: "1.0.0.1"},
-					{Addr: "2606:4700:4700::1111"},
-					{Addr: "2606:4700:4700::1001"},
-					{Addr: "https://dns.nextdns.io/abc123"},
-				},
-				Routes: map[string][]*dnstype.Resolver{
-					"darp.headscale.net": {{Addr: "1.1.1.1"}, {Addr: "8.8.8.8"}},
-					"foo.bar.com":        {{Addr: "1.1.1.1"}},
-				},
-				ExtraRecords: []tailcfg.DNSRecord{
-					{Name: "grafana.myvpn.example.com", Type: "A", Value: "100.64.0.3"},
-					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
-				},
-			},
-		},
-		{
-			name:       "unmarshal-dns-full-no-magic",
-			configPath: "testdata/dns_full_no_magic.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				dns, err := dns()
-				if err != nil {
-					return nil, err
-				}
-
-				return dns, nil
-			},
-			want: DNSConfig{
-				MagicDNS:         false,
-				BaseDomain:       "example.com",
-				OverrideLocalDNS: false,
-				Nameservers: Nameservers{
-					Global: []string{
-						"1.1.1.1",
-						"1.0.0.1",
-						"2606:4700:4700::1111",
-						"2606:4700:4700::1001",
-						"https://dns.nextdns.io/abc123",
-					},
-					Split: map[string][]string{
-						"darp.headscale.net": {"1.1.1.1", "8.8.8.8"},
-						"foo.bar.com":        {"1.1.1.1"},
-					},
-				},
-				ExtraRecords: []tailcfg.DNSRecord{
-					{Name: "grafana.myvpn.example.com", Type: "A", Value: "100.64.0.3"},
-					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
-				},
-				SearchDomains: []string{"test.com", "bar.com"},
-				Certificates:  CertificatesConfig{Zone: "example.com"},
-			},
-		},
-		{
-			name:       "dns-to-tailcfg.DNSConfig",
-			configPath: "testdata/dns_full_no_magic.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				dns, err := dns()
-				if err != nil {
-					return nil, err
-				}
-
-				return dnsToTailcfgDNS(dns), nil
-			},
-			want: &tailcfg.DNSConfig{
-				Proxied: false,
-				Domains: []string{"test.com", "bar.com"},
-				FallbackResolvers: []*dnstype.Resolver{
-					{Addr: "1.1.1.1"},
-					{Addr: "1.0.0.1"},
-					{Addr: "2606:4700:4700::1111"},
-					{Addr: "2606:4700:4700::1001"},
-					{Addr: "https://dns.nextdns.io/abc123"},
-				},
-				Routes: map[string][]*dnstype.Resolver{
-					"darp.headscale.net": {{Addr: "1.1.1.1"}, {Addr: "8.8.8.8"}},
-					"foo.bar.com":        {{Addr: "1.1.1.1"}},
-				},
-				ExtraRecords: []tailcfg.DNSRecord{
-					{Name: "grafana.myvpn.example.com", Type: "A", Value: "100.64.0.3"},
-					{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
-				},
-			},
-		},
-		{
-			name:       "base-domain-in-server-url-err",
-			configPath: "testdata/base-domain-in-server-url.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				return LoadServerConfig()
-			},
-			want:    nil,
-			wantErr: "server_url is a subdomain of dns.base_domain",
-		},
-		{
-			name:       "base-domain-not-in-server-url",
-			configPath: "testdata/base-domain-not-in-server-url.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				cfg, err := LoadServerConfig()
-				if err != nil {
-					return nil, err
-				}
-
-				return map[string]string{
-					"server_url":  cfg.ServerURL,
-					"base_domain": cfg.BaseDomain,
-				}, err
-			},
-			want: map[string]string{
-				"server_url":  "https://derp.no",
-				"base_domain": "clients.derp.no",
-			},
-			wantErr: "",
-		},
-		{
-			name:       "dns-override-true-errors",
-			configPath: "testdata/dns-override-true-error.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				return LoadServerConfig()
-			},
-			wantErr: "Fatal config error: dns.nameservers.global is required when dns.override_local_dns is true",
-		},
-		{
-			name:       "dns-override-true",
-			configPath: "testdata/dns-override-true.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper
-				_, err := LoadServerConfig()
-				if err != nil {
-					return nil, err
-				}
-
-				dns, err := dns()
-				if err != nil {
-					return nil, err
-				}
-
-				return dnsToTailcfgDNS(dns), nil
-			},
-			want: &tailcfg.DNSConfig{
-				Proxied: true,
-				Domains: []string{"derp2.no"},
-				Routes:  map[string][]*dnstype.Resolver{},
-				Resolvers: []*dnstype.Resolver{
-					{Addr: "1.1.1.1"},
-					{Addr: "1.0.0.1"},
-				},
-			},
-		},
-		{
-			name:       "policy-path-is-loaded",
-			configPath: "testdata/policy-path-is-loaded.yaml",
-			setup: func(t *testing.T) (any, error) { //nolint:thelper // inline test closure
-				cfg, err := LoadServerConfig()
-				if err != nil {
-					return nil, err
-				}
-
-				return map[string]string{
-					"policy.mode": string(cfg.Policy.Mode),
-					"policy.path": cfg.Policy.Path,
-				}, err
-			},
-			want: map[string]string{
-				"policy.mode": "file",
-				"policy.path": "/etc/policy.hujson",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-
-			err := LoadConfig(tt.configPath, true)
-			require.NoError(t, err)
-
-			conf, err := tt.setup(t)
-
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
-
-				return
-			}
-
-			require.NoError(t, err)
-
-			if diff := cmp.Diff(tt.want, conf); diff != "" {
-				t.Errorf("ReadConfig() mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestReadConfigFromEnv(t *testing.T) {
-	tests := []struct {
-		name      string
-		configEnv map[string]string
-		setup     func(*testing.T) (any, error)
-		want      any
-	}{
-		{
-			name: "test-random-base-settings-with-env",
-			configEnv: map[string]string{
-				"HEADSCALE_LOG_LEVEL":                       "trace",
-				"HEADSCALE_DATABASE_SQLITE_WRITE_AHEAD_LOG": "false",
-				"HEADSCALE_PREFIXES_V4":                     "100.64.0.0/10",
-			},
-			setup: func(t *testing.T) (any, error) { //nolint:thelper // inline test closure
-				t.Logf("all settings: %#v", viper.AllSettings())
-
-				assert.Equal(t, "trace", viper.GetString("log.level"))
-				assert.Equal(t, "100.64.0.0/10", viper.GetString("prefixes.v4"))
-				assert.False(t, viper.GetBool("database.sqlite.write_ahead_log"))
-
-				return nil, nil //nolint:nilnil // test setup returns nil to indicate no expected value
-			},
-			want: nil,
-		},
-		{
-			name: "unmarshal-dns-full-config",
-			configEnv: map[string]string{
-				"HEADSCALE_DNS_MAGIC_DNS":          "true",
-				"HEADSCALE_DNS_BASE_DOMAIN":        "example.com",
-				"HEADSCALE_DNS_OVERRIDE_LOCAL_DNS": "false",
-				"HEADSCALE_DNS_NAMESERVERS_GLOBAL": `1.1.1.1 8.8.8.8`,
-				"HEADSCALE_DNS_SEARCH_DOMAINS":     "test.com bar.com",
-
-				// TODO(kradalby): Figure out how to pass these as env vars
-				// "HEADSCALE_DNS_NAMESERVERS_SPLIT":  `{foo.bar.com: ["1.1.1.1"]}`,
-				// "HEADSCALE_DNS_EXTRA_RECORDS":      `[{ name: "prometheus.myvpn.example.com", type: "A", value: "100.64.0.4" }]`,
-			},
-			setup: func(t *testing.T) (any, error) { //nolint:thelper // inline test closure
-				t.Logf("all settings: %#v", viper.AllSettings())
-
-				dns, err := dns()
-				if err != nil {
-					return nil, err
-				}
-
-				return dns, nil
-			},
-			want: DNSConfig{
-				MagicDNS:         true,
-				BaseDomain:       "example.com",
-				OverrideLocalDNS: false,
-				Nameservers: Nameservers{
-					Global: []string{"1.1.1.1", "8.8.8.8"},
-					Split:  map[string][]string{
-						// "foo.bar.com": {"1.1.1.1"},
-					},
-				},
-				// ExtraRecords: []tailcfg.DNSRecord{
-				// 	{Name: "prometheus.myvpn.example.com", Type: "A", Value: "100.64.0.4"},
-				// },
-				SearchDomains: []string{"test.com", "bar.com"},
-				Certificates:  CertificatesConfig{Zone: "example.com"},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			for k, v := range tt.configEnv {
-				t.Setenv(k, v)
-			}
-
-			viper.Reset()
-
-			err := LoadConfig("testdata/minimal.yaml", true)
-			require.NoError(t, err)
-
-			conf, err := tt.setup(t)
-			require.NoError(t, err)
-
-			if diff := cmp.Diff(tt.want, conf, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("ReadConfig() mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestPreparedStatementConfigIsIgnoredWithWarning(t *testing.T) {
-	viper.Reset()
-	t.Cleanup(viper.Reset)
-
-	var logs bytes.Buffer
-
-	previousLogger := log.Logger
-	previousLevel := zerolog.GlobalLevel()
-
-	zerolog.SetGlobalLevel(zerolog.WarnLevel)
-	t.Cleanup(func() { zerolog.SetGlobalLevel(previousLevel) })
-
-	log.Logger = zerolog.New(&logs)
-
-	t.Cleanup(func() { log.Logger = previousLogger })
-
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	require.NoError(t, os.WriteFile(configPath, []byte(`
-server_url: https://example.com
-noise:
-  private_key_path: noise_private.key
-dns:
-  magic_dns: false
-  override_local_dns: false
-database:
-  type: sqlite3
-  gorm:
-    prepare_stmt: true
-`), 0o600))
-	require.NoError(t, LoadConfig(configPath, true))
-	require.NoError(t, validateServerConfig())
-	assert.Contains(t, logs.String(), "database.gorm.prepare_stmt")
-}
-
-func TestTLSConfigValidation(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	var err error
-
-	configYaml := []byte(`---
-tls:
-  cert_path: abc.pem
-  acme:
-    hostname: example.com
-    challenge_type: bogus
-noise:
-  private_key_path: noise_private.key`)
-
-	// Populate a custom config file
-	configFilePath := filepath.Join(tmpDir, "config.yaml")
-
-	err = os.WriteFile(configFilePath, configYaml, 0o600)
-	if err != nil {
-		t.Fatalf("Couldn't write file %s", configFilePath)
-	}
-
-	// Check configuration validation errors (1)
-	err = LoadConfig(tmpDir, false)
-	require.NoError(t, err)
-
-	err = validateServerConfig()
-	require.Error(t, err)
-	assert.Contains(
-		t,
-		err.Error(),
-		"Fatal config error: tls.acme.hostname and tls.cert_path/tls.key_path are mutually exclusive",
-	)
-	assert.Contains(
-		t,
-		err.Error(),
-		"Fatal config error: tls.acme.challenge_type has an unsupported value",
-	)
-	assert.Contains(
-		t,
-		err.Error(),
-		"Fatal config error: server_url is missing a scheme",
-	)
-
-	// Check configuration validation errors (2)
-	configYaml = []byte(`---
-noise:
-  private_key_path: noise_private.key
-server_url: http://127.0.0.1:8080
-tls:
-  acme:
-    hostname: example.com
-    challenge_type: TLS-ALPN-01
-`)
-
-	err = os.WriteFile(configFilePath, configYaml, 0o600)
-	if err != nil {
-		t.Fatalf("Couldn't write file %s", configFilePath)
-	}
-
-	err = LoadConfig(tmpDir, false)
-	require.NoError(t, err)
-}
-
-func TestPKCEMethodValidation(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// OIDC is active (issuer set) with PKCE enabled and an invalid method.
-	// There is no oidc.enabled key. validateServerConfig must reject the
-	// invalid method rather than silently skipping the check.
-	configYaml := []byte(`---
-noise:
-  private_key_path: noise_private.key
-server_url: http://127.0.0.1:8080
-dns:
-  override_local_dns: false
-oidc:
-  issuer: https://idp.example.com
-  client_id: headscale
-  pkce:
-    enabled: true
-    method: S256-typo
-`)
-
-	configFilePath := filepath.Join(tmpDir, "config.yaml")
-	err := os.WriteFile(configFilePath, configYaml, 0o600)
-	require.NoError(t, err)
-
-	err = LoadConfig(tmpDir, false)
-	require.NoError(t, err)
-
-	err = validateServerConfig()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), errInvalidPKCEMethod.Error())
-}
-
-// TestOIDCConfigValidation covers the issuer-URL and required-field checks that
-// fail an unworkable OIDC setup fast at config load.
-func TestOIDCConfigValidation(t *testing.T) {
-	tests := []struct {
-		name      string
-		oidcBlock string
-		wantErr   string
-	}{
-		{
-			name: "non-http issuer",
-			oidcBlock: `
-  issuer: ftp://idp.example.com
-  client_id: headscale
-  client_secret: sekret`,
-			wantErr: "valid http(s) URL",
-		},
-		{
-			name: "missing client_id",
-			oidcBlock: `
-  issuer: https://idp.example.com
-  client_secret: sekret`,
-			wantErr: "client_id is required",
-		},
-		{
-			name: "missing client_secret",
-			oidcBlock: `
-  issuer: https://idp.example.com
-  client_id: headscale`,
-			wantErr: "client_secret",
-		},
-		{
-			name: "valid",
-			oidcBlock: `
-  issuer: https://idp.example.com
-  client_id: headscale
-  client_secret: sekret`,
-			wantErr: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir := t.TempDir()
-			configYaml := []byte(`---
-noise:
-  private_key_path: noise_private.key
-server_url: http://127.0.0.1:8080
-dns:
-  magic_dns: false
-  override_local_dns: false
-database:
-  type: sqlite
-oidc:` + tt.oidcBlock + "\n")
-
-			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), configYaml, 0o600))
-			require.NoError(t, LoadConfig(tmpDir, false))
-
-			err := validateServerConfig()
-			if tt.wantErr == "" {
-				require.NoError(t, err)
-
-				return
-			}
-
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.wantErr)
-		})
-	}
-}
-
-func TestTLSACMEListenAddrCollision(t *testing.T) {
-	const (
-		tlsKeys = `tls:
-  acme:
-    hostname: %q
-    challenge_type: %q
-    http_listen: %q
-`
-		legacyKeys = `tls_letsencrypt_hostname: %q
-tls_letsencrypt_challenge_type: %q
-tls_letsencrypt_listen: %q
-`
-	)
-
-	tests := []struct {
-		name          string
-		listenAddr    string
-		acmeListen    string
-		hostname      string
-		challengeType string
-		keys          string
-		wantErr       string // empty = expect no error
-	}{
-		{"collision-numeric", ":80", ":80", "example.com", "HTTP-01", tlsKeys, "would bind the same TCP socket"},
-		{"collision-named-vs-numeric", "0.0.0.0:80", ":http", "example.com", "HTTP-01", tlsKeys, "would bind the same TCP socket"},
-		{"collision-https-named", ":443", ":https", "example.com", "HTTP-01", tlsKeys, "would bind the same TCP socket"},
-		{"collision-legacy-keys", ":80", ":80", "example.com", "HTTP-01", legacyKeys, "would bind the same TCP socket"},
-		{"canonical", "0.0.0.0:443", ":http", "example.com", "HTTP-01", tlsKeys, ""},
-		{"no-hostname-skipped", "0.0.0.0:80", ":http", "", "HTTP-01", tlsKeys, ""},
-		{"tls-alpn-01-skipped", "0.0.0.0:80", ":http", "example.com", "TLS-ALPN-01", tlsKeys, ""},
-		{"different-numeric", ":8080", ":8081", "example.com", "HTTP-01", tlsKeys, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-
-			tmpDir := t.TempDir()
-			cfg := fmt.Sprintf(`---
-server_url: https://example.com
-listen_addr: %q
-`+tt.keys+`noise:
-  private_key_path: noise_private.key
-database:
-  type: sqlite3
-dns:
-  magic_dns: false
-  override_local_dns: false
-`, tt.listenAddr, tt.hostname, tt.challengeType, tt.acmeListen)
-			require.NoError(t, os.WriteFile(
-				filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
-			require.NoError(t, LoadConfig(tmpDir, false))
-
-			err := validateServerConfig()
-			if tt.wantErr == "" {
-				require.NoError(t, err)
-				return
-			}
-
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.wantErr)
-		})
-	}
-}
-
-func TestLoadServerConfig_CollectsAcrossSubBuilders(t *testing.T) {
-	viper.Reset()
-
-	tmpDir := t.TempDir()
-	cfg := `---
-server_url: https://example.com
-listen_addr: 0.0.0.0:8080
-prefixes:
-  v4: not-a-cidr
-  v6: also-not-a-cidr
-  allocation: bogus
-oidc:
-  client_secret: hunter2
-  client_secret_path: /nonexistent/secret
-noise:
-  private_key_path: noise_private.key
-database:
-  type: sqlite3
-dns:
-  magic_dns: false
-  override_local_dns: false
-  base_domain: example.com
-`
-	require.NoError(t, os.WriteFile(
-		filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
-	require.NoError(t, LoadConfig(tmpDir, false))
-
-	_, err := LoadServerConfig()
-	require.Error(t, err)
-
-	got := ConfigErrors(err)
-	assert.GreaterOrEqual(t, len(got), 4,
-		"expected sub-builder errors collected into one report; got %d: %v",
-		len(got), reasons(got))
-
-	// Sentinels stay reachable through ConfigError.Cause.
-	require.ErrorIs(t, err, ErrInvalidAllocationStrategy,
-		"wrapped ErrInvalidAllocationStrategy not in chain")
-	require.ErrorIs(t, err, errOidcMutuallyExclusive,
-		"wrapped errOidcMutuallyExclusive not in chain")
-
-	// Each sub-builder failure surfaces its YAML key in the rendered output.
-	rendered := err.Error()
-	for _, want := range []string{
-		"prefixes.v4",
-		"prefixes.v6",
-		"prefixes.allocation",
-		"oidc.client_secret",
-	} {
-		assert.Contains(t, rendered, want,
-			"expected rendered error to mention %q", want)
-	}
-}
-
-func reasons(errs []*ConfigError) []string {
-	out := make([]string, len(errs))
-	for i, e := range errs {
-		out[i] = e.Reason
-	}
-
-	return out
-}
-
-func TestDeprecatedKeysFlowThroughValidator(t *testing.T) {
-	viper.Reset()
-
-	tmpDir := t.TempDir()
-	cfg := `---
-server_url: https://example.com
-listen_addr: 0.0.0.0:8080
-oidc:
-  expiry: 1h
-dns_config:
-  use_username_in_magic_dns: true
-noise:
-  private_key_path: noise_private.key
-database:
-  type: sqlite3
-dns:
-  magic_dns: false
-  override_local_dns: false
-`
-	require.NoError(t, os.WriteFile(
-		filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
-	require.NoError(t, LoadConfig(tmpDir, false))
-
-	err := validateServerConfig()
-	require.Error(t, err)
-
-	got := ConfigErrors(err)
-	require.GreaterOrEqual(t, len(got), 2,
-		"expected fatal deprecated keys to surface as ConfigErrors; got %d", len(got))
-
-	reasons := make([]string, 0, len(got))
-	for _, ce := range got {
-		reasons = append(reasons, ce.Reason)
-	}
-
-	wantSubstrs := []string{"oidc.expiry", "dns_config.use_username_in_magic_dns"}
-	for _, want := range wantSubstrs {
-		var found bool
-
-		for _, r := range reasons {
-			if strings.Contains(r, want) {
-				found = true
-				break
-			}
-		}
-
-		assert.True(t, found, "expected ConfigError mentioning %q in reasons %v", want, reasons)
-	}
-}
-
-// The unset case is the regression: the default is spelled "0o770", which a
-// base-8 parse rejects, so the socket silently became 0700.
-// https://github.com/juanfont/headscale/issues/3529
-func TestUnixSocketPermission(t *testing.T) {
-	tests := []struct {
-		name    string
-		yaml    string
-		env     string
-		want    fs.FileMode
-		wantErr bool
-	}{
-		{name: "unset-uses-default", want: 0o770},
-		{name: "null-uses-default", yaml: `unix_socket_permission: null`, want: 0o770},
-		{name: "quoted-leading-zero", yaml: `unix_socket_permission: "0770"`, want: 0o770},
-		{name: "quoted-plain", yaml: `unix_socket_permission: "770"`, want: 0o770},
-		{name: "quoted-0o-prefix", yaml: `unix_socket_permission: "0o770"`, want: 0o770},
-		{name: "quoted-0o-prefix-owner-only", yaml: `unix_socket_permission: "0o700"`, want: 0o700},
-		{name: "quoted-zero", yaml: `unix_socket_permission: "0000"`, want: 0},
-		{name: "env", env: "0660", want: 0o660},
-		{name: "env-0o-prefix", env: "0o660", want: 0o660},
-		{name: "env-overrides-file", yaml: `unix_socket_permission: "0770"`, env: "0700", want: 0o700},
-		{name: "env-invalid-is-error", env: "bogus", wantErr: true},
-		{name: "empty-is-error", yaml: `unix_socket_permission: ""`, wantErr: true},
-		{name: "symbolic-is-error", yaml: `unix_socket_permission: "rwxrwx---"`, wantErr: true},
-		{name: "special-bits-are-error", yaml: `unix_socket_permission: "1770"`, wantErr: true},
-		{name: "out-of-range-is-error", yaml: `unix_socket_permission: "17777"`, wantErr: true},
-		// YAML reads unquoted 0770 as int 504, indistinguishable from a literal 504.
-		{name: "unquoted-leading-zero-is-error", yaml: `unix_socket_permission: 0770`, wantErr: true},
-		{name: "unquoted-0o-prefix-is-error", yaml: `unix_socket_permission: 0o770`, wantErr: true},
-		{name: "unquoted-plain-is-error", yaml: `unix_socket_permission: 770`, wantErr: true},
-		{name: "float-is-error", yaml: `unix_socket_permission: 770.0`, wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-
-			if tt.env != "" {
-				t.Setenv("HEADSCALE_UNIX_SOCKET_PERMISSION", tt.env)
-			}
-
-			tmpDir := t.TempDir()
-			cfg := `---
-server_url: https://example.com
-listen_addr: 0.0.0.0:8080
-prefixes:
-  v4: 100.64.0.0/10
-noise:
-  private_key_path: noise_private.key
-database:
-  type: sqlite3
-dns:
-  magic_dns: false
-  override_local_dns: false
-` + tt.yaml + "\n"
-			require.NoError(t, os.WriteFile(
-				filepath.Join(tmpDir, "config.yaml"), []byte(cfg), 0o600))
-			require.NoError(t, LoadConfig(tmpDir, false))
-
-			got, err := LoadServerConfig()
-			if tt.wantErr {
-				require.ErrorIs(t, err, util.ErrInvalidFileMode,
-					"invalid unix_socket_permission must not silently fall back")
-				assert.Contains(t, err.Error(), "unix_socket_permission")
-
-				return
-			}
-
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got.UnixSocketPermission,
-				"got %#o, want %#o", got.UnixSocketPermission, tt.want)
-		})
-	}
-}
-
-func TestServerURLTrailingSlash(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{name: "no slash", input: "https://h", want: "https://h"},
-		{name: "one slash", input: "https://h/", want: "https://h"},
-		{name: "two slashes", input: "https://h//", want: "https://h"},
-		{name: "port", input: "https://h:8443/", want: "https://h:8443"},
-		{name: "path prefix", input: "https://h/hs/", want: "https://h/hs"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-			t.Cleanup(viper.Reset)
-			require.NoError(t, LoadConfig("testdata/minimal.yaml", true))
-
-			viper.Set("server_url", tt.input)
-			viper.Set("prefixes.v4", "100.64.0.0/10")
-			viper.Set("database.type", "sqlite3")
-			viper.Set("dns.magic_dns", false)
-			viper.Set("dns.override_local_dns", false)
-
-			cfg, err := LoadServerConfig()
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, cfg.ServerURL)
-		})
-	}
-}
-
-// OK
-// server_url: headscale.com, base: clients.headscale.com
-// server_url: headscale.com, base: headscale.net
-//
-// NOT OK
-// server_url: server.headscale.com, base: headscale.com.
-func TestSafeServerURL(t *testing.T) {
-	tests := []struct {
-		serverURL, baseDomain,
-		wantErr string
-	}{
-		{
-			serverURL:  "https://example.com",
-			baseDomain: "example.org",
-		},
-		{
-			serverURL:  "https://headscale.com",
-			baseDomain: "headscale.com",
-			wantErr:    errServerURLSame.Error(),
-		},
-		{
-			serverURL:  "https://headscale.com",
-			baseDomain: "clients.headscale.com",
-		},
-		{
-			serverURL:  "https://headscale.com",
-			baseDomain: "clients.subdomain.headscale.com",
-		},
-		{
-			serverURL:  "https://headscale.kristoffer.com",
-			baseDomain: "mybase",
-		},
-		{
-			serverURL:  "https://server.headscale.com",
-			baseDomain: "headscale.com",
-			wantErr:    errServerURLSuffix.Error(),
-		},
-		{
-			serverURL:  "https://server.subdomain.headscale.com",
-			baseDomain: "headscale.com",
-			wantErr:    errServerURLSuffix.Error(),
-		},
-		{
-			serverURL: "http://foo\x00",
-			wantErr:   `parse "http://foo\x00": net/url: invalid control character in URL`,
-		},
-	}
-
-	for _, tt := range tests {
-		testName := fmt.Sprintf("server=%s domain=%s", tt.serverURL, tt.baseDomain)
-		t.Run(testName, func(t *testing.T) {
-			err := isSafeServerURL(tt.serverURL, tt.baseDomain)
-			if tt.wantErr != "" {
-				assert.EqualError(t, err, tt.wantErr)
-
-				return
-			}
-
-			assert.NoError(t, err)
-		})
-	}
-}
-
-func TestSafeServerURLWithPort(t *testing.T) {
-	tests := []struct {
-		serverURL, baseDomain,
-		wantErr string
-	}{
-		{
-			serverURL:  "https://server.headscale.com:443",
-			baseDomain: "headscale.com",
-			wantErr:    errServerURLSuffix.Error(),
-		},
-		{
-			serverURL:  "https://server.subdomain.headscale.com:8080",
-			baseDomain: "headscale.com",
-			wantErr:    errServerURLSuffix.Error(),
-		},
-		{
-			serverURL:  "https://headscale.com:443",
-			baseDomain: "headscale.com",
-			wantErr:    errServerURLSame.Error(),
-		},
-		{
-			serverURL:  "https://example.com:8080",
-			baseDomain: "example.org",
-		},
-	}
-
-	for _, tt := range tests {
-		testName := fmt.Sprintf("server=%s domain=%s", tt.serverURL, tt.baseDomain)
-		t.Run(testName, func(t *testing.T) {
-			err := isSafeServerURL(tt.serverURL, tt.baseDomain)
-			if tt.wantErr != "" {
-				assert.EqualError(t, err, tt.wantErr)
-
-				return
-			}
-
-			assert.NoError(t, err)
-		})
-	}
-}
-
 // TestConfigJSONOmitsSecrets verifies that marshalling a [Config] to JSON
-// (as /debug/config does via [state.State.DebugConfig]) does not leak the
-// Postgres password, the OIDC client secret, or the headscale admin
-// API key. Operators who widen metrics_listen_addr to 0.0.0.0 should
-// not be able to read these back via debug endpoints reachable over
-// CGNAT/loopback.
+// or logging it does not leak the Postgres password, the OIDC client
+// secret, the headscale admin API key, or URL credentials. Operators who
+// widen metrics_listen_addr to 0.0.0.0 should not be able to read these
+// back via debug endpoints reachable over CGNAT/loopback.
 func TestConfigJSONOmitsSecrets(t *testing.T) {
 	const (
 		secretPostgresPass = "p0stgres-secret-marker"
 		secretClientSecret = "oidc-client-secret-marker"    //nolint:gosec // test marker, not a real credential
 		secretAPIKey       = "headscale-cli-api-key-marker" //nolint:gosec // test marker, not a real credential
 		secretDNSToken     = "dns-provider-token-marker"    //nolint:gosec // test marker, not a real credential
+		secretDERPUser     = "derp-url-username-marker"     //nolint:gosec // test marker, not a real credential
+		secretDERPPass     = "derp-url-password-marker"     //nolint:gosec // test marker, not a real credential
+		secretDERPToken    = "derp-url-token-marker"        //nolint:gosec // test marker, not a real credential
+		derpMapMarker      = "go-only-derp-map-marker"
+		secretServerUser   = "server-url-username-marker" //nolint:gosec // test marker, not a real credential
+		secretServerPass   = "server-url-password-marker" //nolint:gosec // test marker, not a real credential
+		secretCLIToken     = "cli-address-token-marker"   //nolint:gosec // test marker, not a real credential
+		secretDNSUser      = "dns-url-username-marker"    //nolint:gosec // test marker, not a real credential
+		secretDNSPass      = "dns-url-password-marker"    //nolint:gosec // test marker, not a real credential
+		secretSplitToken   = "split-url-token-marker"     //nolint:gosec // test marker, not a real credential
 	)
 
 	cfg := &Config{
+		ServerURL: "https://" + secretServerUser + ":" + secretServerPass + "@headscale.example.com",
 		Database: DatabaseConfig{
 			Postgres: PostgresConfig{
 				Pass: secretPostgresPass,
@@ -982,111 +56,76 @@ func TestConfigJSONOmitsSecrets(t *testing.T) {
 			ClientSecret: secretClientSecret,
 		},
 		CLI: CLIConfig{
-			APIKey: secretAPIKey,
+			Address: "https://" + secretCLIToken + "@cli.example.com",
+			APIKey:  secretAPIKey,
 		},
-		DNSChallenge: DNSChallengeConfig{
-			ProviderName: "cloudflare",
-			Provider:     &cloudflare.Provider{APIToken: secretDNSToken},
+		DNSConfig: DNSConfig{
+			Nameservers: Nameservers{
+				Global: []string{"1.1.1.1", "https://" + secretDNSUser + ":" + secretDNSPass + "@dns.example.com/dns-query"},
+				Split:  map[string][]string{"corp.example.com": {"https://" + secretSplitToken + "@dns.example.com/q"}},
+			},
+			Challenge: DNSChallengeConfig{
+				ProviderSettings: map[string]any{"name": "cloudflare", "api_token": secretDNSToken},
+				Provider:         &cloudflare.Provider{APIToken: secretDNSToken},
+			},
 		},
+		DERP: DERPConfig{
+			URLs: []HTTPURL{
+				"https://" + secretDERPUser + ":" + secretDERPPass + "@derp.example/map",
+				"https://" + secretDERPToken + "@derp.example/token-map",
+			},
+			DERPMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+				900: {RegionCode: derpMapMarker},
+			}},
+		},
+	}
+
+	secrets := []string{
+		secretPostgresPass, secretClientSecret, secretAPIKey, secretDNSToken,
+		secretDERPUser, secretDERPPass, secretDERPToken,
+		secretServerUser, secretServerPass, secretCLIToken, secretDNSUser, secretDNSPass, secretSplitToken,
 	}
 
 	out, err := json.Marshal(cfg)
 	require.NoError(t, err)
 
-	body := string(out)
-	for _, secret := range []string{secretPostgresPass, secretClientSecret, secretAPIKey, secretDNSToken} {
-		assert.NotContains(t, body, secret,
+	for _, secret := range secrets {
+		assert.NotContains(t, string(out), secret,
 			"marshalled Config must not contain secret %q", secret)
 	}
-}
 
-//nolint:goconst // repeated CIDR strings are test fixtures, not refactor candidates
-func TestTrustedProxies(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   any
-		want    []netip.Prefix
-		wantErr string
-	}{
-		{
-			name:  "unset",
-			input: nil,
-			want:  nil,
-		},
-		{
-			name:  "empty",
-			input: []string{},
-			want:  nil,
-		},
-		{
-			name:  "single-v4",
-			input: []string{"10.0.0.0/16"},
-			want:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
-		},
-		{
-			name:  "single-v6",
-			input: []string{"fd00::/8"},
-			want:  []netip.Prefix{netip.MustParsePrefix("fd00::/8")},
-		},
-		{
-			name:  "mixed-v4-v6",
-			input: []string{"127.0.0.1/32", "::1/128", "10.0.0.0/16"},
-			want: []netip.Prefix{
-				netip.MustParsePrefix("127.0.0.1/32"),
-				netip.MustParsePrefix("::1/128"),
-				netip.MustParsePrefix("10.0.0.0/16"),
-			},
-		},
-		{
-			name:  "non-canonical-masked",
-			input: []string{"10.0.0.5/16"},
-			want:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/16")},
-		},
-		{
-			name:    "bare-ip-rejected",
-			input:   []string{"10.0.0.1"},
-			wantErr: `trusted_proxies[0] "10.0.0.1"`,
-		},
-		{
-			name:    "garbage-reports-index",
-			input:   []string{"10.0.0.0/16", "not-an-ip"},
-			wantErr: `trusted_proxies[1] "not-an-ip"`,
-		},
-		{
-			name:    "ipv4-zero-rejected",
-			input:   []string{"0.0.0.0/0"},
-			wantErr: "0.0.0.0/0 and ::/0 are not allowed",
-		},
-		{
-			name:    "ipv6-zero-rejected",
-			input:   []string{"::/0"},
-			wantErr: "0.0.0.0/0 and ::/0 are not allowed",
-		},
-	}
+	// The URLs are still shown, without userinfo; the running values keep it.
+	assert.Contains(t, string(out), `"https://derp.example/map"`)
+	assert.Contains(t, string(out), `"https://derp.example/token-map"`)
+	assert.Contains(t, string(out), `"ServerURL":"https://headscale.example.com"`)
+	assert.Contains(t, string(out), `"Address":"https://cli.example.com"`)
+	assert.Contains(t, string(out), `"Global":["1.1.1.1","https://dns.example.com/dns-query"]`)
+	assert.Contains(t, string(out), `"Split":{"corp.example.com":["https://dns.example.com/q"]}`)
+	assert.Contains(t, string(cfg.DERP.URLs[0]), secretDERPUser+":"+secretDERPPass)
+	assert.Contains(t, string(cfg.DERP.URLs[1]), secretDERPToken)
+	assert.Contains(t, cfg.ServerURL, secretServerUser+":"+secretServerPass)
+	assert.Contains(t, cfg.CLI.Address, secretCLIToken)
+	assert.Contains(t, cfg.DNSConfig.Nameservers.Global[1], secretDNSUser+":"+secretDNSPass)
+	assert.Contains(t, cfg.DNSConfig.Nameservers.Split["corp.example.com"][0], secretSplitToken)
+	// DERPMap is Go-only.
+	assert.NotContains(t, string(out), derpMapMarker)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
+	// Secret redacts only through fmt's String; zerolog marshals it. Test
+	// binaries log at Error (testlog.go), which would drop this record.
+	oldLevel := zerolog.GlobalLevel()
 
-			if tt.input != nil {
-				viper.Set("trusted_proxies", tt.input)
-			}
+	t.Cleanup(func() { zerolog.SetGlobalLevel(oldLevel) })
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
-			got, err := trustedProxies()
+	var logged bytes.Buffer
 
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+	logger := zerolog.New(&logged)
+	logger.Info().Interface("config", cfg).Send()
+	require.Contains(t, logged.String(), `"config":{`)
 
-				return
-			}
-
-			require.NoError(t, err)
-
-			if diff := cmp.Diff(tt.want, got, cmpopts.EquateComparable(netip.Prefix{})); diff != "" {
-				t.Errorf("trustedProxies() mismatch (-want +got):\n%s", diff)
-			}
-		})
+	for _, secret := range secrets {
+		assert.NotContains(t, logged.String(), secret,
+			"logged Config must not contain secret %q", secret)
 	}
 }
 
@@ -1111,447 +150,164 @@ func TestExtraRecordsAreLowercased(t *testing.T) {
 		t.Errorf("dnsToTailcfgDNS extra records mismatch (-want +got):\n%s", diff)
 	}
 
-	cfg := &Config{TailcfgDNSConfig: &tailcfg.DNSConfig{}}
+	cfg := &Config{}
+	cfg.StartDNS(nil)
 	cfg.SetExtraRecords(mixed)
 
-	if diff := cmp.Diff(want, cfg.TailcfgDNSConfig.ExtraRecords); diff != "" {
+	if diff := cmp.Diff(want, cfg.CloneTailcfgDNSConfig().ExtraRecords); diff != "" {
 		t.Errorf("SetExtraRecords mismatch (-want +got):\n%s", diff)
 	}
 }
 
-func TestDNSChallengeConfig(t *testing.T) {
-	secret := filepath.Join(t.TempDir(), "token")
-	require.NoError(t, os.WriteFile(secret, []byte("file-token\n"), 0o600))
-
-	base := `---
-server_url: https://headscale.example.com
-noise:
-  private_key_path: noise_private.key
-prefixes:
-  v4: 100.64.0.0/10
-database:
-  type: sqlite
-dns:
-  magic_dns: true
-  override_local_dns: false
-  base_domain: ts.example.com
-`
+func TestTailcfgDNSConfig(t *testing.T) {
+	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	ten := netip.MustParsePrefix("10.0.0.0/8")
+	ula := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	fd00 := netip.MustParsePrefix("fd00::/48")
 
 	tests := []struct {
-		name          string
-		yaml          string
-		env           map[string]string
-		wantErr       string
-		wantZone      string
-		wantToken     string
-		wantNoProv    bool
-		wantResolvers []string
-		wantIsolates  string
+		name string
+		cfg  Config
+		want *tailcfg.DNSConfig
 	}{
 		{
-			name: "disabled by default",
-			yaml: base,
-			// Zone follows base_domain even when unused, so it is never empty.
-			wantZone:      "ts.example.com",
-			wantNoProv:    true,
-			wantResolvers: []string{"1.1.1.1:53", "8.8.8.8:53"},
+			name: "empty",
+			want: &tailcfg.DNSConfig{Routes: map[string][]*dnstype.Resolver{}},
 		},
 		{
-			name: "resolvers default to port 53",
-			yaml: base + `  challenge:
-    resolvers: ["9.9.9.9", "2620:fe::fe", "127.0.0.1:5353"]
-`,
-			wantZone:      "ts.example.com",
-			wantNoProv:    true,
-			wantResolvers: []string{"9.9.9.9:53", "[2620:fe::fe]:53", "127.0.0.1:5353"},
-		},
-		{
-			name: "enabled with inline token",
-			yaml: base + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: cloudflare
-      api_token: yaml-token
-`,
-			wantZone:  "ts.example.com",
-			wantToken: "yaml-token",
-		},
-		{
-			name: "env only",
-			yaml: base,
-			env: map[string]string{
-				"HEADSCALE_DNS_CERTIFICATES_ENABLED":              "true",
-				"HEADSCALE_DNS_CERTIFICATES_ZONE":                 "example.com",
-				"HEADSCALE_DNS_CHALLENGE_PROVIDER_NAME":           "cloudflare",
-				"HEADSCALE_DNS_CHALLENGE_PROVIDER_API_TOKEN_PATH": secret,
+			name: "magic dns with base domain",
+			cfg:  Config{DNSConfig: DNSConfig{MagicDNS: true, BaseDomain: "example.com", SearchDomains: []string{"corp.com"}}},
+			want: &tailcfg.DNSConfig{
+				Proxied: true,
+				Domains: []string{"example.com", "corp.com"},
+				Routes:  map[string][]*dnstype.Resolver{},
 			},
-			wantZone:  "example.com",
-			wantToken: "file-token",
 		},
 		{
-			name: "env overrides yaml",
-			yaml: base + `  challenge:
-    provider:
-      name: cloudflare
-      api_token: yaml-token
-`,
-			env:       map[string]string{"HEADSCALE_DNS_CHALLENGE_PROVIDER_API_TOKEN": "env-token"},
-			wantZone:  "ts.example.com",
-			wantToken: "env-token",
+			name: "override local dns",
+			cfg:  Config{DNSConfig: DNSConfig{OverrideLocalDNS: true, Nameservers: Nameservers{Global: []string{"1.1.1.1"}}}},
+			want: &tailcfg.DNSConfig{
+				Resolvers: []*dnstype.Resolver{{Addr: "1.1.1.1"}},
+				Routes:    map[string][]*dnstype.Resolver{},
+			},
 		},
 		{
-			name: "typo in provider key",
-			yaml: base + `  challenge:
-    provider:
-      name: cloudflare
-      auth_token: tok
-`,
-			wantErr: "dns.challenge.provider is invalid",
+			// Nothing to override with: clients keep their own DNS.
+			name: "override local dns without global nameservers",
+			cfg:  Config{DNSConfig: DNSConfig{OverrideLocalDNS: true}},
+			want: &tailcfg.DNSConfig{Routes: map[string][]*dnstype.Resolver{}},
 		},
 		{
-			name: "unknown provider",
-			yaml: base + `  challenge:
-    provider:
-      name: route53
-`,
-			wantErr: "dns.challenge.provider is invalid",
+			name: "fallback resolvers",
+			cfg:  Config{DNSConfig: DNSConfig{Nameservers: Nameservers{Global: []string{"1.1.1.1"}}}},
+			want: &tailcfg.DNSConfig{
+				FallbackResolvers: []*dnstype.Resolver{{Addr: "1.1.1.1"}},
+				Routes:            map[string][]*dnstype.Resolver{},
+			},
 		},
 		{
-			name: "acmedns one account for node certificates",
-			yaml: base + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: acmedns
-      username: user
-      password: pass
-      subdomain: reg
-      server_url: https://auth.acme-dns.io
-`,
-			wantErr: "registration per name",
+			name: "split dns",
+			cfg:  Config{DNSConfig: DNSConfig{Nameservers: Nameservers{Split: map[string][]string{"corp.com": {"10.0.0.1"}}}}},
+			want: &tailcfg.DNSConfig{
+				Routes: map[string][]*dnstype.Resolver{"corp.com": {{Addr: "10.0.0.1"}}},
+			},
 		},
 		{
-			name: "acmedns registration per name",
-			yaml: base + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: acmedns
-      config:
-        laptop.ts.example.com:
-          username: user
-          password: pass
-          subdomain: reg-laptop
-          server_url: https://auth.acme-dns.io
-        desktop.ts.example.com:
-          username: user
-          password: pass
-          subdomain: reg-desktop
-          server_url: https://auth.acme-dns.io
-`,
-			wantZone:     "ts.example.com",
-			wantIsolates: "laptop.ts.example.com",
+			name: "magic dns reverse routes outside cgnat",
+			cfg: Config{
+				Prefixes:  PrefixesConfig{V4: &ten},
+				DNSConfig: DNSConfig{MagicDNS: true, BaseDomain: "example.com"},
+			},
+			want: &tailcfg.DNSConfig{
+				Proxied: true,
+				Domains: []string{"example.com"},
+				Routes:  map[string][]*dnstype.Resolver{"10.in-addr.arpa": {}},
+			},
 		},
 		{
-			name: "acmedns registration shared by node names",
-			yaml: base + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: acmedns
-      config:
-        laptop.ts.example.com:
-          username: user
-          password: pass
-          subdomain: reg
-          server_url: https://auth.acme-dns.io
-        desktop.ts.example.com:
-          username: user
-          password: pass
-          subdomain: reg
-          server_url: https://auth.acme-dns.io
-`,
-			wantErr: "desktop.ts.example.com and laptop.ts.example.com share registration reg",
+			name: "magic dns reverse routes outside ula",
+			cfg: Config{
+				Prefixes:  PrefixesConfig{V6: &fd00},
+				DNSConfig: DNSConfig{MagicDNS: true, BaseDomain: "example.com"},
+			},
+			want: &tailcfg.DNSConfig{
+				Proxied: true,
+				Domains: []string{"example.com"},
+				Routes:  map[string][]*dnstype.Resolver{"0.0.0.0.0.0.0.0.0.0.d.f.ip6.arpa": {}},
+			},
 		},
 		{
-			name: "acmedns one account for headscale's own certificate",
-			yaml: base + `  challenge:
-    provider:
-      name: acmedns
-      username: user
-      password: pass
-      subdomain: reg
-      server_url: https://auth.acme-dns.io
-tls:
-  acme:
-    hostname: headscale.example.com
-    challenge_type: DNS-01
-`,
-			wantZone: "ts.example.com",
+			name: "magic dns inside cgnat and ula",
+			cfg: Config{
+				Prefixes:  PrefixesConfig{V4: &cgnat, V6: &ula},
+				DNSConfig: DNSConfig{MagicDNS: true, BaseDomain: "example.com"},
+			},
+			want: &tailcfg.DNSConfig{
+				Proxied: true,
+				Domains: []string{"example.com"},
+				Routes:  map[string][]*dnstype.Resolver{},
+			},
 		},
 		{
-			name: "acmedns registration shared with headscale's own name",
-			yaml: base + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: acmedns
-      config:
-        laptop.ts.example.com:
-          username: user
-          password: pass
-          subdomain: reg
-          server_url: https://auth.acme-dns.io
-        headscale.example.com:
-          username: user
-          password: pass
-          subdomain: reg
-          server_url: https://auth.acme-dns.io
-tls:
-  acme:
-    hostname: headscale.example.com
-    challenge_type: DNS-01
-`,
-			wantErr: "headscale.example.com and laptop.ts.example.com share registration reg",
+			name: "no reverse routes without magic dns",
+			cfg:  Config{Prefixes: PrefixesConfig{V4: &ten}},
+			want: &tailcfg.DNSConfig{Routes: map[string][]*dnstype.Resolver{}},
 		},
 		{
-			name: "enabled without magic dns",
-			yaml: strings.Replace(base, "magic_dns: true", "magic_dns: false", 1) + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: cloudflare
-      api_token: tok
-`,
-			wantErr: "dns.certificates requires dns.magic_dns",
-		},
-		{
-			name: "enabled without provider",
-			yaml: base + `  certificates:
-    enabled: true
-`,
-			wantErr: "dns.certificates and tls.acme DNS-01 require dns.challenge.provider",
-		},
-		{
-			name: "base_domain outside zone",
-			yaml: base + `  certificates:
-    enabled: true
-    zone: notexample.com
-  challenge:
-    provider:
-      name: cloudflare
-      api_token: tok
-`,
-			wantErr: "dns.base_domain is not inside dns.certificates.zone",
-		},
-		{
-			name: "zone suffix without label boundary",
-			yaml: base + `  certificates:
-    enabled: true
-    zone: ample.com
-  challenge:
-    provider:
-      name: cloudflare
-      api_token: tok
-`,
-			wantErr: "dns.base_domain is not inside dns.certificates.zone",
-		},
-		{
-			name: "uppercase base_domain",
-			yaml: strings.Replace(base, "ts.example.com", "TS.example.com", 1) + `  certificates:
-    enabled: true
-  challenge:
-    provider:
-      name: cloudflare
-      api_token: tok
-`,
-			wantErr: "dns.base_domain must be a lowercase DNS name",
-		},
-		{
-			name: "tls DNS-01 without provider",
-			yaml: base + `tls:
-  acme:
-    hostname: headscale.example.com
-    challenge_type: DNS-01
-`,
-			wantErr: "dns.certificates and tls.acme DNS-01 require dns.challenge.provider",
-		},
-		{
-			name: "negative propagation timeout",
-			yaml: base + `  challenge:
-    propagation_timeout: -1s
-`,
-			wantErr: "dns.challenge.propagation_timeout must not be negative",
+			name: "extra record names lowercased",
+			cfg: Config{DNSConfig: DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
+				{Name: "Grafana.Example.com", Type: "A", Value: "100.64.0.3"},
+			}}},
+			want: &tailcfg.DNSConfig{
+				Routes:       map[string][]*dnstype.Resolver{},
+				ExtraRecords: []tailcfg.DNSRecord{{Name: "grafana.example.com", Type: "A", Value: "100.64.0.3"}},
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
-
-			for k, v := range tt.env {
-				t.Setenv(k, v)
+			// No EquateEmpty: a reverse route must be an empty, non-nil slice.
+			if diff := cmp.Diff(tt.want, tt.cfg.TailcfgDNSConfig()); diff != "" {
+				t.Errorf("TailcfgDNSConfig() mismatch (-want +got):\n%s", diff)
 			}
-
-			tmpDir := t.TempDir()
-			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(tt.yaml), 0o600))
-			require.NoError(t, LoadConfig(tmpDir, false))
-
-			cfg, err := LoadServerConfig()
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-
-				return
-			}
-
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantZone, cfg.DNSConfig.Certificates.Zone)
-
-			if tt.wantResolvers != nil {
-				assert.Equal(t, tt.wantResolvers, cfg.DNSChallenge.Resolvers)
-			}
-
-			if tt.wantNoProv {
-				assert.Nil(t, cfg.DNSChallenge.Provider)
-
-				return
-			}
-
-			if iso, ok := cfg.DNSChallenge.Provider.(hsdns.Isolator); ok {
-				if tt.wantIsolates != "" {
-					assert.True(t, iso.Isolates(tt.wantIsolates))
-				}
-
-				return
-			}
-
-			provider, ok := cfg.DNSChallenge.Provider.(*cloudflare.Provider)
-			require.True(t, ok, "provider is %T", cfg.DNSChallenge.Provider)
-			assert.Equal(t, tt.wantToken, provider.APIToken)
 		})
 	}
 }
 
-// TestTLSLegacyKeys pins that the flat TLS keys keep working under the tls
-// block, with the tls keys winning, and that the NixOS module's defaults
-// for the flat keys leave TLS off.
-func TestTLSLegacyKeys(t *testing.T) {
-	base := `---
-server_url: https://headscale.example.com
-noise:
-  private_key_path: noise_private.key
-prefixes:
-  v4: 100.64.0.0/10
-database:
-  type: sqlite
-dns:
-  magic_dns: false
-  override_local_dns: false
-`
-
-	tests := []struct {
-		name string
-		yaml string
-		env  map[string]string
-		want TLSConfig
-	}{
-		{
-			name: "defaults",
-			yaml: base,
-			want: TLSConfig{ACME: ACMEConfig{
-				ChallengeType: HTTP01ChallengeType,
-				HTTPListen:    ":http",
-				CacheDir:      "/var/lib/headscale/cache",
-			}},
-		},
-		{
-			name: "legacy keys",
-			yaml: base + `tls_letsencrypt_hostname: headscale.example.com
-tls_letsencrypt_challenge_type: TLS-ALPN-01
-tls_letsencrypt_listen: ":8080"
-tls_letsencrypt_cache_dir: /var/lib/headscale/cache
-acme_url: https://acme.example.com/directory
-acme_email: admin@example.com
-`,
-			want: TLSConfig{ACME: ACMEConfig{
-				Hostname:      "headscale.example.com",
-				ChallengeType: TLSALPN01ChallengeType,
-				HTTPListen:    ":8080",
-				URL:           "https://acme.example.com/directory",
-				Email:         "admin@example.com",
-				CacheDir:      "/var/lib/headscale/cache",
-			}},
-		},
-		{
-			name: "tls keys win over legacy keys",
-			yaml: base + `tls_cert_path: /old/cert.pem
-tls_key_path: /old/key.pem
-tls:
-  cert_path: /new/cert.pem
-  key_path: /new/key.pem
-`,
-			want: TLSConfig{
-				CertPath: "/new/cert.pem",
-				KeyPath:  "/new/key.pem",
-				ACME: ACMEConfig{
-					ChallengeType: HTTP01ChallengeType,
-					HTTPListen:    ":http",
-					CacheDir:      "/var/lib/headscale/cache",
-				},
-			},
-		},
-		{
-			// What the NixOS module writes when TLS is off.
-			name: "nixos defaults",
-			yaml: base + `tls_letsencrypt_hostname: ""
-tls_letsencrypt_challenge_type: HTTP-01
-tls_letsencrypt_listen: ":http"
-tls_letsencrypt_cache_dir: /var/lib/headscale/.cache
-`,
-			want: TLSConfig{ACME: ACMEConfig{
-				ChallengeType: HTTP01ChallengeType,
-				HTTPListen:    ":http",
-				CacheDir:      "/var/lib/headscale/.cache",
-			}},
-		},
-		{
-			// Both keys read HEADSCALE_TLS_CERT_PATH.
-			name: "env",
-			yaml: base,
-			env: map[string]string{
-				"HEADSCALE_TLS_CERT_PATH": "/env/cert.pem",
-				"HEADSCALE_TLS_KEY_PATH":  "/env/key.pem",
-			},
-			want: TLSConfig{
-				CertPath: "/env/cert.pem",
-				KeyPath:  "/env/key.pem",
-				ACME: ACMEConfig{
-					ChallengeType: HTTP01ChallengeType,
-					HTTPListen:    ":http",
-					CacheDir:      "/var/lib/headscale/cache",
-				},
-			},
+func TestLiveDNS(t *testing.T) {
+	goOnly := &cloudflare.Provider{APIToken: "go-only"}
+	cfg := &Config{
+		DNSConfig: DNSConfig{
+			MagicDNS:     true,
+			BaseDomain:   "example.com",
+			ExtraRecords: []tailcfg.DNSRecord{{Name: "Old.example.com", Type: "A", Value: "100.64.0.1"}},
+			Challenge:    DNSChallengeConfig{Provider: goOnly},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			viper.Reset()
+	assert.Equal(t, cfg.TailcfgDNSConfig(), cfg.CloneTailcfgDNSConfig())
+	assert.Same(t, goOnly, cfg.DNSProvider())
+	assert.True(t, cfg.HasExtraRecord("old.example.com."))
 
-			for k, v := range tt.env {
-				t.Setenv(k, v)
-			}
+	// Nothing holds the records before StartDNS.
+	cfg.SetExtraRecords([]tailcfg.DNSRecord{{Name: "early.example.com", Type: "A", Value: "100.64.0.9"}})
+	assert.False(t, cfg.HasExtraRecord("early.example.com"))
+	assert.Equal(t, cfg.DNSConfig.ExtraRecords[0].Value, cfg.CloneTailcfgDNSConfig().ExtraRecords[0].Value)
 
-			tmpDir := t.TempDir()
-			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "config.yaml"), []byte(tt.yaml), 0o600))
-			require.NoError(t, LoadConfig(tmpDir, false))
+	started := &cloudflare.Provider{APIToken: "started"}
+	cfg.StartDNS(started)
+	cfg.SetExtraRecords([]tailcfg.DNSRecord{{Name: "A.Example.com", Type: "A", Value: "100.64.0.2"}})
 
-			cfg, err := LoadServerConfig()
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, cfg.TLS)
-		})
-	}
+	clone := cfg.CloneTailcfgDNSConfig()
+	assert.Equal(t, []tailcfg.DNSRecord{{Name: "a.example.com", Type: "A", Value: "100.64.0.2"}}, clone.ExtraRecords)
+	assert.True(t, cfg.HasExtraRecord("A.Example.com."))
+	assert.False(t, cfg.HasExtraRecord("old.example.com"))
+	assert.Same(t, started, cfg.DNSProvider())
+
+	clone.ExtraRecords = nil
+
+	assert.Len(t, cfg.CloneTailcfgDNSConfig().ExtraRecords, 1, "a clone is a copy")
 }
 
 func TestPostgresConfigDSN(t *testing.T) {
@@ -1651,7 +407,7 @@ func TestPostgresConfigDSN(t *testing.T) {
 func TestServesRoute(t *testing.T) {
 	v4 := netip.MustParsePrefix("100.64.0.0/10")
 	v6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
-	cfg := &Config{PrefixV4: &v4, PrefixV6: &v6}
+	cfg := &Config{Prefixes: PrefixesConfig{V4: &v4, V6: &v6}}
 
 	for route, want := range map[string]bool{
 		"100.64.0.11/32":                   false,
@@ -1675,156 +431,29 @@ func TestServesRoute(t *testing.T) {
 
 	// Only the configured ranges hold nodes.
 	narrow := netip.MustParsePrefix("100.64.0.0/24")
-	assert.True(t, (&Config{PrefixV4: &narrow}).ServesRoute(netip.MustParsePrefix("100.100.0.1/32")))
+	assert.True(t, (&Config{Prefixes: PrefixesConfig{V4: &narrow}}).ServesRoute(netip.MustParsePrefix("100.100.0.1/32")))
 }
 
-func TestBoolConfigValidation(t *testing.T) {
-	for _, source := range []string{"file", "env"} {
-		for _, tt := range []struct {
-			value   string
-			want    bool
-			invalid bool
-		}{
-			{"true", true, false},
-			{"false", false, false},
-			{"1", true, false},
-			{"0", false, false},
-			{"T", true, false},
-			{"f", false, false},
-			{"TRUE", true, false},
-			{"False", false, false},
-			{"True", true, false},
-			{"FALSE", false, false},
-			{"", true, false},
-			{"null", true, false},
-			{"yes", false, true},
-			{"on", false, true},
-			{"ture", false, true},
-			{"tRuE", false, true},
-			{"2", false, true},
-			{"[true]", false, true},
-			{`""`, false, true},
-		} {
-			if source == "env" && tt.value == "null" {
-				continue
-			}
-
-			t.Run(source+"/"+tt.value, func(t *testing.T) {
-				viper.Reset()
-				t.Cleanup(viper.Reset)
-				t.Setenv("HEADSCALE_OIDC_EMAIL_VERIFIED_REQUIRED", "")
-
-				config := `server_url: https://headscale.example.com
-noise:
-  private_key_path: noise_private.key
-prefixes:
-  v4: 100.64.0.0/10
-database:
-  type: sqlite3
-dns:
-  magic_dns: false
-  override_local_dns: false
-`
-				if source == "file" && tt.value != "" {
-					config += "oidc:\n  email_verified_required: " + tt.value + "\n"
-				}
-
-				if source == "env" {
-					t.Setenv("HEADSCALE_OIDC_EMAIL_VERIFIED_REQUIRED", tt.value)
-				}
-
-				path := filepath.Join(t.TempDir(), "config.yaml")
-				require.NoError(t, os.WriteFile(path, []byte(config), 0o600))
-				require.NoError(t, LoadConfig(path, true))
-
-				loaded, err := LoadServerConfig()
-				if tt.invalid {
-					require.Error(t, err)
-					assert.Contains(t, err.Error(), "oidc.email_verified_required")
-
-					return
-				}
-
-				require.NoError(t, err)
-				assert.Equal(t, tt.want, loaded.OIDC.EmailVerifiedRequired)
-			})
-		}
-	}
-}
-
-func TestBoolConfigKeysComplete(t *testing.T) {
-	file, err := parser.ParseFile(token.NewFileSet(), "config.go", nil, 0)
-	require.NoError(t, err)
-
-	keys := make(map[string]bool)
-
-	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "GetBool" {
-			return true
-		}
-
-		object, ok := selector.X.(*ast.Ident)
-		if !ok || object.Name != "viper" {
-			return true
-		}
-
-		require.Len(t, call.Args, 1)
-		literal, ok := call.Args[0].(*ast.BasicLit)
-		require.True(t, ok, "boolean config keys must be string literals")
-
-		key, err := strconv.Unquote(literal.Value)
-		require.NoError(t, err)
-
-		keys[key] = true
-
-		return true
-	})
-	require.NotEmpty(t, keys)
-
-	for _, key := range boolConfigKeys {
-		assert.Contains(t, keys, key, "unused or repeated boolean config key")
-		delete(keys, key)
+// TestDERPShuffleSeed: servers left on the default base domain do not all
+// share one DERP order; any other domain seeds it.
+func TestDERPShuffleSeed(t *testing.T) {
+	tests := []struct {
+		name       string
+		serverURL  string
+		baseDomain string
+		want       string
+	}{
+		{name: "default domain a", serverURL: "https://a.example.com", baseDomain: DefaultBaseDomain, want: "a.example.com"},
+		{name: "default domain b", serverURL: "https://b.example.com:8443", baseDomain: DefaultBaseDomain, want: "b.example.com"},
+		{name: "default domain unparsable url", serverURL: "https://a.example.com/%zz", baseDomain: DefaultBaseDomain, want: ""},
+		{name: "operator domain", serverURL: "https://a.example.com", baseDomain: "corp.example.com", want: "corp.example.com"},
+		{name: "empty domain", serverURL: "https://a.example.com", baseDomain: "", want: ""},
 	}
 
-	assert.Empty(t, keys, "GetBool keys missing from boolean validation")
-}
-
-func TestExampleConfigBooleanSettings(t *testing.T) {
-	viper.Reset()
-	t.Cleanup(viper.Reset)
-	require.NoError(t, LoadConfig("../../config-example.yaml", true))
-
-	_, err := LoadServerConfig()
-	require.NoError(t, err)
-}
-
-func TestLoadCLIConfigRejectsNonBoolean(t *testing.T) {
-	for _, key := range []string{"cli.insecure", "disable_check_updates"} {
-		t.Run(key, func(t *testing.T) {
-			viper.Reset()
-			t.Cleanup(viper.Reset)
-
-			path := filepath.Join(t.TempDir(), "config.yaml")
-			require.NoError(t, os.WriteFile(path, nil, 0o600))
-			require.NoError(t, LoadConfig(path, true))
-
-			env := "HEADSCALE_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
-			t.Setenv(env, "true")
-
-			_, err := LoadCLIConfig()
-			require.NoError(t, err)
-
-			t.Setenv(env, "ture")
-
-			_, err = LoadCLIConfig()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), key)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Config{ServerURL: tt.serverURL, DNSConfig: DNSConfig{BaseDomain: tt.baseDomain}}
+			assert.Equal(t, tt.want, c.DERPShuffleSeed())
 		})
 	}
 }
@@ -1848,4 +477,118 @@ func TestDNSDomainsCompat(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDerivedValues pins the values computed from what the configuration
+// says, which the loader stores as written.
+func TestDerivedValues(t *testing.T) {
+	etc := &Config{ConfigDir: "/etc/hs"}
+	sqlite := func(path string) *Config {
+		return &Config{ConfigDir: "/etc/hs", Database: DatabaseConfig{Sqlite: SqliteConfig{Path: path}}}
+	}
+	resolvers := func(r ...string) DNSChallengeConfig { return DNSChallengeConfig{Resolvers: r} }
+
+	tests := []struct {
+		name      string
+		got, want any
+	}{
+		{"relative path", etc.AbsPath("./noise.key"), "/etc/hs/noise.key"},
+		{"absolute path", etc.AbsPath("/var/lib/hs/noise.key"), "/var/lib/hs/noise.key"},
+		{"no config dir", (&Config{}).AbsPath("./noise.key"), "./noise.key"},
+		{"empty path", etc.AbsPath(""), ""},
+		{"sqlite relative", sqlite("db.sqlite").SQLitePath(), "/etc/hs/db.sqlite"},
+		{"sqlite memory", sqlite(":memory:").SQLitePath(), ":memory:"},
+		{"sqlite", DatabaseConfig{Type: "sqlite"}.IsSQLite(), true},
+		{"sqlite3", DatabaseConfig{Type: "sqlite3"}.IsSQLite(), true},
+		{"postgres", DatabaseConfig{Type: "postgres"}.IsSQLite(), false},
+		{"workers unset", Tuning{}.BatcherWorkerCount(), DefaultBatcherWorkers()},
+		{"workers set", Tuning{BatcherWorkers: 7}.BatcherWorkerCount(), 7},
+		{"zone unset", DNSConfig{BaseDomain: "ts.example.com"}.CertificateZone(), "ts.example.com"},
+		{"zone set", DNSConfig{BaseDomain: "ts.example.com", Certificates: CertificatesConfig{Zone: "example.com"}}.CertificateZone(), "example.com"},
+		{"resolvers unset", resolvers().ResolverAddrs(), []string{"9.9.9.9:53", "149.112.112.112:53"}},
+		{"resolver bare IPv4", resolvers("9.9.9.9").ResolverAddrs(), []string{"9.9.9.9:53"}},
+		{"resolver bare IPv6", resolvers("2620:fe::fe").ResolverAddrs(), []string{"[2620:fe::fe]:53"}},
+		{"resolver with port", resolvers("[::1]:5353").ResolverAddrs(), []string{"[::1]:5353"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.got)
+		})
+	}
+
+	// Callers share the config, so deriving must not write to it.
+	written := []string{"9.9.9.9"}
+	resolvers(written...).ResolverAddrs()
+	assert.Equal(t, []string{"9.9.9.9"}, written)
+}
+
+// TestConfigFieldsDocumented pins a doc comment on every exported field
+// reachable from Config: generated docs and option descriptions read them.
+func TestConfigFieldsDocumented(t *testing.T) {
+	files, err := filepath.Glob("config*.go")
+	require.NoError(t, err)
+
+	fset := token.NewFileSet()
+	structs := map[string]*ast.StructType{}
+
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+
+		f, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
+		require.NoError(t, err)
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			if ts, ok := n.(*ast.TypeSpec); ok {
+				if st, ok := ts.Type.(*ast.StructType); ok {
+					structs[ts.Name.Name] = st
+				}
+			}
+
+			return true
+		})
+	}
+
+	var missing []string
+
+	seen := map[string]bool{}
+	queue := []string{"Config"}
+
+	for len(queue) > 0 {
+		typ := queue[0]
+		queue = queue[1:]
+
+		if seen[typ] {
+			continue
+		}
+
+		seen[typ] = true
+
+		require.Contains(t, structs, typ)
+
+		for _, field := range structs[typ].Fields.List {
+			for _, name := range field.Names {
+				if name.IsExported() && field.Doc == nil {
+					missing = append(missing, typ+"."+name.Name)
+				}
+			}
+
+			ast.Inspect(field.Type, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.SelectorExpr:
+					return false // another package's type
+				case *ast.Ident:
+					if structs[n.Name] != nil {
+						queue = append(queue, n.Name)
+					}
+				}
+
+				return true
+			})
+		}
+	}
+
+	assert.Empty(t, missing, "fields without a doc comment")
 }

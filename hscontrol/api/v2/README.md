@@ -18,6 +18,10 @@ headscale's own conventions. The headscale-native admin API stays at `/api/v1`
 ## Conventions
 
 - Operations derived from Tailscale carry the `Tailscale compat` tag.
+- `POST /device/{id}/update-client` is undocumented by Tailscale. Its shape
+  comes from SaaS captures (`servertest/testdata/steps/update-client*.hujson`):
+  no body, `200 {}` once the node started the update, `404 "not found"` for
+  every device it will not update. It reaches the node as c2n `POST /update`.
 - The `{tailnet}` path segment must be `-` (the single Headscale tailnet);
   anything else is `404`. See `requireDefaultTailnet`.
 - Errors use **Tailscale's** body (`{"message","data","status"}`), installed as
@@ -27,8 +31,9 @@ headscale's own conventions. The headscale-native admin API stays at `/api/v1`
   sends) or **Bearer**: an admin API key (`hskey-api-…`), or an OAuth access
   token (`hskey-oauthtok-…`). See `authMiddleware`.
 - Each operation declares the Tailscale scope it requires (`auth_keys`,
-  `oauth_keys`, `devices:core`, `devices:routes`, `policy_file`,
-  `feature_settings`, each with a `:read` subset, plus `all`/`all:read`).
+  `oauth_keys`, `devices:core`, `devices:routes`,
+  `devices:posture_attributes`, `policy_file`, `feature_settings`, each with a
+  `:read` subset, plus `all`/`all:read`).
   `requireScope` records it both for the middleware and in the generated
   OpenAPI, as an `x-required-scope` extension and a sentence in the operation
   description, so the scope shows up in the docs and spec. Enforcement: an

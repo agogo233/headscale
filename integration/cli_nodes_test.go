@@ -1261,3 +1261,67 @@ func TestNodeBackfillIPsCommand(t *testing.T) {
 		}
 	}, integrationutil.ScaledTimeout(20*time.Second), 1*time.Second)
 }
+
+// TestNodeUpdateClientCommand verifies that `headscale nodes update-client`
+// answers every client version as Tailscale does. The test clients have
+// auto-updates off, so Hostinfo.AllowsUpdate is false and each is "not found".
+func TestNodeUpdateClientCommand(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: len(MustTestVersions),
+		Users:        []string{"node-update-user"},
+	}
+
+	scenario, err := NewScenario(spec)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("cli-nodeupdate"))
+	require.NoError(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	require.NoError(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	require.NoError(t, err)
+
+	var nodes []*clientv1.Node
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		nodes, err = headscale.ListNodes()
+		assert.NoError(c, err)
+		assert.Len(c, nodes, len(allClients))
+
+		for _, node := range nodes {
+			assert.True(c, node.Online, "node %s should be online", node.Name)
+		}
+	}, integrationutil.ScaledTimeout(30*time.Second), integrationutil.FastPoll, "Waiting for all nodes to be online")
+
+	for _, node := range nodes {
+		_, err := headscale.Execute([]string{
+			"headscale",
+			"nodes",
+			"update-client",
+			"--identifier",
+			node.Id,
+		})
+		require.Error(t, err, "node %s has auto-updates off and must be refused", node.Name)
+		assert.Contains(t, err.Error(), "api error (404): not found", "node %s", node.Name)
+	}
+
+	// Unknown nodes are rejected before anything is sent.
+	_, err = headscale.Execute([]string{
+		"headscale",
+		"nodes",
+		"update-client",
+		"--identifier",
+		"9999",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "api error (404): no manageable device matching this ID found")
+}

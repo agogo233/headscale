@@ -11,12 +11,14 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -198,29 +200,29 @@ func TestDNS01SolverWait(t *testing.T) {
 // TestACMETLSSettings obtains headscale's own certificate from Pebble with
 // each challenge type, serving it the way [Headscale.Serve] does.
 func TestACMETLSSettings(t *testing.T) {
-	for _, challenge := range []string{
+	for _, challenge := range []types.ACMEChallenge{
 		types.DNS01ChallengeType,
 		types.HTTP01ChallengeType,
 		types.TLSALPN01ChallengeType,
 	} {
-		t.Run(challenge, func(t *testing.T) {
+		t.Run(string(challenge), func(t *testing.T) {
 			httpPort, tlsPort := freePort(t), freePort(t)
 			acme := startTestACME(t, httpPort, tlsPort)
 
 			h := &Headscale{cfg: &types.Config{
 				ServerURL: "https://" + acmeTestHost,
-				Addr:      net.JoinHostPort("127.0.0.1", strconv.Itoa(tlsPort)),
+				Addr:      types.ListenAddr(net.JoinHostPort("127.0.0.1", strconv.Itoa(tlsPort))),
 				TLS: types.TLSConfig{ACME: types.ACMEConfig{
 					Hostname:      acmeTestHost,
 					ChallengeType: challenge,
-					HTTPListen:    net.JoinHostPort("127.0.0.1", strconv.Itoa(httpPort)),
-					URL:           acme.directory,
+					HTTPListen:    types.ListenAddr(net.JoinHostPort("127.0.0.1", strconv.Itoa(httpPort))),
+					URL:           types.HTTPURL(acme.directory),
 					CacheDir:      t.TempDir(),
 				}},
-				DNSChallenge: types.DNSChallengeConfig{
+				DNSConfig: types.DNSConfig{Challenge: types.DNSChallengeConfig{
 					Provider:  acme.provider,
 					Resolvers: []string{acme.resolver},
-				},
+				}},
 			}}
 
 			bundle, err := h.getTLSSettings(t.Context())
@@ -228,7 +230,7 @@ func TestACMETLSSettings(t *testing.T) {
 			t.Cleanup(bundle.Stop)
 			assert.Nil(t, bundle.Reload, "certmagic renews the certificate itself")
 
-			ln, err := tls.Listen("tcp", h.cfg.Addr, bundle.Config)
+			ln, err := tls.Listen("tcp", string(h.cfg.Addr), bundle.Config)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = ln.Close() })
 
@@ -260,7 +262,7 @@ func TestACMETLSSettings(t *testing.T) {
 
 				d.Config = &tls.Config{ServerName: acmeTestHost, RootCAs: acme.roots, MinVersion: tls.VersionTLS12}
 
-				conn, err := d.DialContext(t.Context(), "tcp", h.cfg.Addr)
+				conn, err := d.DialContext(t.Context(), "tcp", string(h.cfg.Addr))
 				if assert.NoError(c, err) {
 					_ = conn.Close()
 				}
@@ -274,6 +276,77 @@ func TestACMETLSSettings(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestACMERetryStaysOnConfiguredCA pins that a failed issuance is retried
+// against tls.acme.url and nothing else. The default tls.acme.url is
+// certmagic's default CA, Let's Encrypt production, for which certmagic
+// retries against Let's Encrypt staging and registers an account there
+// (#3589). Pebble stands in for production, so the test waits for
+// certmagic's first retry interval.
+func TestACMERetryStaysOnConfiguredCA(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for certmagic's first retry interval")
+	}
+
+	acme := startTestACME(t, freePort(t), freePort(t))
+
+	var stagingHits atomic.Int32
+
+	staging := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		stagingHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(staging.Close)
+
+	prevCA, prevTestCA := certmagic.DefaultACME.CA, certmagic.DefaultACME.TestCA
+	certmagic.DefaultACME.CA, certmagic.DefaultACME.TestCA = acme.directory, staging.URL
+
+	t.Cleanup(func() { certmagic.DefaultACME.CA, certmagic.DefaultACME.TestCA = prevCA, prevTestCA })
+
+	// The CA resolves TXT from acme.provider, so records published here are
+	// never seen and every validation fails, like a mistyped DNS delegation.
+	published := &dnstest.Provider{}
+
+	h := &Headscale{cfg: &types.Config{
+		ServerURL: "https://" + acmeTestHost,
+		Addr:      types.ListenAddr(net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t)))),
+		TLS: types.TLSConfig{ACME: types.ACMEConfig{
+			Hostname:      acmeTestHost,
+			ChallengeType: types.DNS01ChallengeType,
+			URL:           types.HTTPURL(acme.directory),
+			CacheDir:      t.TempDir(),
+		}},
+		DNSConfig: types.DNSConfig{Challenge: types.DNSChallengeConfig{
+			Provider:  published,
+			Resolvers: []string{acme.resolver},
+		}},
+	}}
+
+	bundle, err := h.getTLSSettings(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(bundle.Stop)
+
+	require.NoError(t, bundle.Manage(t.Context()))
+
+	attempts := func() int {
+		n := 0
+
+		for _, c := range published.Calls() {
+			if c.Method == "append" {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		assert.True(c, attempts() >= 2 || stagingHits.Load() > 0)
+	}, 2*time.Minute, time.Second, "certmagic should retry the failed issuance")
+
+	assert.Zero(t, stagingHits.Load(), "retry must not leave tls.acme.url")
+	assert.GreaterOrEqual(t, attempts(), 2, "retry must reach tls.acme.url")
 }
 
 // testKeypair returns a new certificate as DER, and as PEM with its key.

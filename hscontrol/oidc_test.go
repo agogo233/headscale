@@ -896,8 +896,8 @@ func TestOIDCPendingCallbackCookieBinding(t *testing.T) {
 }
 
 func TestOIDCPendingCallbackPKCEFlow(t *testing.T) {
-	for _, method := range []string{"", types.PKCEMethodPlain, types.PKCEMethodS256} {
-		t.Run("method="+method, func(t *testing.T) {
+	for _, method := range []types.PKCEMethod{"", types.PKCEMethodPlain, types.PKCEMethodS256} {
+		t.Run("method="+string(method), func(t *testing.T) {
 			b := newOIDCBrowser(t)
 			a, ok := b.app.authProvider.(*AuthProviderOIDC)
 			require.True(t, ok)
@@ -1103,11 +1103,11 @@ func newOIDCBrowserWithPrefix(t *testing.T, prefix string) *oidcBrowser {
 		app,
 		publicURL,
 		&types.OIDCConfig{
-			Issuer:       idp.Issuer(),
-			ClientID:     idp.ClientID,
-			ClientSecret: idp.ClientSecret,
-			Scope:        []string{"openid", "profile", "email"},
+			Issuer:   types.HTTPURL(idp.Issuer()),
+			ClientID: idp.ClientID,
+			Scope:    []string{"openid", "profile", "email"},
 		},
+		idp.ClientSecret,
 	)
 	require.NoError(t, err)
 	t.Cleanup(provider.authCache.Close)
@@ -1510,6 +1510,52 @@ func TestOIDCLoginClearsUnverifiedEmail(t *testing.T) {
 	stored, err := app.state.GetUserByID(types.UserID(first.ID))
 	require.NoError(t, err)
 	assert.Empty(t, stored.Email)
+}
+
+// Clients of a new OIDC user often log in at once; every callback must land
+// on the one user instead of failing on the unique provider identifier.
+func TestOIDCConcurrentFirstLoginCreatesOneUser(t *testing.T) {
+	app := createTestApp(t)
+	provider := &AuthProviderOIDC{h: app, cfg: &types.OIDCConfig{}}
+	claims := types.OIDCClaims{Iss: "https://idp.example.com", Sub: "racer", Username: "racer"}
+
+	const logins = 8
+
+	var (
+		start sync.WaitGroup
+		done  sync.WaitGroup
+		ids   [logins]uint
+		errs  [logins]error
+	)
+
+	start.Add(1)
+
+	for i := range logins {
+		done.Go(func() {
+			start.Wait()
+
+			c := claims
+
+			user, _, err := provider.createOrUpdateUserFromClaim(&c)
+			if user != nil {
+				ids[i] = user.ID
+			}
+
+			errs[i] = err
+		})
+	}
+
+	start.Done()
+	done.Wait()
+
+	for i := range logins {
+		require.NoError(t, errs[i], "login %d", i)
+		assert.Equal(t, ids[0], ids[i], "login %d", i)
+	}
+
+	users, err := app.state.ListAllUsers()
+	require.NoError(t, err)
+	assert.Len(t, users, 1)
 }
 
 func TestOIDCCallbackDispatchesUserIdentityChange(t *testing.T) {

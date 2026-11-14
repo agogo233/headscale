@@ -37,8 +37,15 @@ in
         challenge.provider = {
           name = "rfc2136";
           server = "127.0.0.1:53";
+          key_name = "headscale.";
+          key_alg = "hmac-sha256.";
+          key = "file:\${CREDENTIALS_DIRECTORY}/tsig";
         };
       };
+      # Read by serve, never by the checks.
+      systemd.services.headscale.serviceConfig.LoadCredential = [
+        "tsig:${pkgs.writeText "tsig" "c2VjcmV0"}"
+      ];
     };
     # All of peer1's noise goes over the kit's TLS listener, not plain :80.
     peer1 = {
@@ -69,6 +76,11 @@ in
     )
 
     headscale.succeed("headscale policy set -f ${policy}")
+    # The default socket needs neither a config file nor a variable.
+    headscale.succeed("env -u HEADSCALE_UNIX_SOCKET headscale nodes list")
+    # sudo resets the environment; PAM sets the module's variables again.
+    out = headscale.succeed("env -u HEADSCALE_DISABLE_CHECK_UPDATES sudo printenv HEADSCALE_DISABLE_CHECK_UPDATES")
+    assert out.strip() == "true", out
 
     # The docs tell operators to run this; it needs ExecReload in the unit.
     headscale.succeed("systemctl reload headscale.service")

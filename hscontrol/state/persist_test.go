@@ -86,10 +86,8 @@ func persistTestConfig(dbPath string) *types.Config {
 				Path: dbPath,
 			},
 		},
-		PrefixV4:     &prefixV4,
-		PrefixV6:     &prefixV6,
-		IPAllocation: types.IPAllocationStrategySequential,
-		BaseDomain:   "headscale.test",
+		Prefixes:  types.PrefixesConfig{V4: &prefixV4, V6: &prefixV6, Allocation: types.IPAllocationStrategySequential},
+		DNSConfig: types.DNSConfig{BaseDomain: "headscale.test"},
 		Policy: types.PolicyConfig{
 			Mode: types.PolicyModeDB,
 		},
@@ -103,9 +101,9 @@ func persistTestConfig(dbPath string) *types.Config {
 func TestLoadedDuplicateNamesAreResolvedInMemory(t *testing.T) {
 	dbPath := t.TempDir() + "/headscale.db"
 	cfg := persistTestConfig(dbPath)
-	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
-		{Name: "grafana." + cfg.BaseDomain, Type: "A", Value: "100.64.0.100"},
-	}}
+	cfg.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{
+		{Name: "grafana." + cfg.DNSConfig.BaseDomain, Type: "A", Value: "100.64.0.100"},
+	}
 	database, err := db.NewHeadscaleDatabase(cfg)
 	require.NoError(t, err)
 
@@ -314,6 +312,64 @@ func TestPersistEmptyEndpoints(t *testing.T) {
 	require.True(t, ok)
 	assert.Empty(t, nv.AsStruct().Endpoints,
 		"after restart, NodeStore should reflect the cleared endpoints")
+}
+
+func TestSetLastControlAddressPersists(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		addr string
+		want string
+	}{
+		{name: "IPv4", addr: "203.0.113.10", want: "203.0.113.10"},
+		{name: "IPv6", addr: "2001:db8::10", want: "2001:db8::10"},
+		{name: "IPv4-mapped", addr: "::ffff:203.0.113.44", want: "203.0.113.44"},
+		{name: "zoned", addr: "fe80::1%eth0", want: "fe80::1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dbPath, s, nodeID := persistTestSetup(t)
+			want := netip.MustParseAddr(test.want)
+
+			require.NoError(t, s.SetLastControlAddress(nodeID, netip.MustParseAddr(test.addr)))
+			require.NoError(t, s.SetLastControlAddress(nodeID, netip.MustParseAddr(test.addr)))
+
+			nv, ok := s.GetNodeByID(nodeID)
+			require.True(t, ok)
+			assert.Equal(t, want, nv.LastControlAddress().Get())
+
+			_, err := s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
+				NodeKey:  nv.NodeKey(),
+				Hostinfo: &tailcfg.Hostinfo{Hostname: "updated-after-control-address"},
+			})
+			require.NoError(t, err)
+
+			stored, err := s.DB().GetNodeByID(nodeID)
+			require.NoError(t, err)
+			require.NotNil(t, stored.LastControlAddress)
+			assert.Equal(t, want, *stored.LastControlAddress,
+				"an unrelated node update must preserve the address")
+
+			require.NoError(t, s.Close())
+			s2 := persistTestReopen(t, dbPath)
+
+			reloaded, ok := s2.GetNodeByID(nodeID)
+			require.True(t, ok)
+			require.True(t, reloaded.LastControlAddress().Valid())
+			assert.Equal(t, want, reloaded.LastControlAddress().Get())
+		})
+	}
+}
+
+func TestSetLastControlAddressRejects(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+
+	require.ErrorIs(t, s.SetLastControlAddress(nodeID, netip.Addr{}),
+		ErrInvalidLastControlAddress)
+	require.ErrorIs(t, s.SetLastControlAddress(nodeID+999, netip.MustParseAddr("192.0.2.1")),
+		ErrNodeNotInNodeStore)
+
+	stored, err := s.DB().GetNodeByID(nodeID)
+	require.NoError(t, err, "a rejected address must leave the node readable")
+	assert.Nil(t, stored.LastControlAddress)
 }
 
 // TestRegistrationRejectsNodeKeyClaimedByAnotherMachine proves a new
@@ -679,9 +735,9 @@ func (failingSetNodesPolicyManager) SetNodes(views.Slice[types.NodeView]) (bool,
 func TestDeleteNodeTwiceReleasesAddressOnce(t *testing.T) {
 	prefix := netip.MustParsePrefix("100.64.0.0/30")
 	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
-	cfg.PrefixV4 = &prefix
-	cfg.PrefixV6 = nil
-	cfg.IPAllocation = types.IPAllocationStrategyRandom
+	cfg.Prefixes.V4 = &prefix
+	cfg.Prefixes.V6 = nil
+	cfg.Prefixes.Allocation = types.IPAllocationStrategyRandom
 
 	s, err := NewState(cfg)
 	require.NoError(t, err)
@@ -1497,7 +1553,7 @@ func TestPostgresUpdatePolicyConcurrentWrites(t *testing.T) {
 			Port: port,
 			Name: strings.TrimLeft(u.Path, "/"),
 			User: u.User.Username(),
-			Pass: pass,
+			Pass: types.Secret(pass),
 			Ssl:  "disable",
 		},
 	}
@@ -1609,6 +1665,22 @@ func TestReloadPolicyEmpty(t *testing.T) {
 	})
 }
 
+// TestNewStateEmptyPolicyFile: startup takes an empty policy file as no
+// policy, although a write, a reload and "headscale check policy" refuse it.
+func TestNewStateEmptyPolicyFile(t *testing.T) {
+	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
+	cfg.Policy = types.PolicyConfig{
+		Mode: types.PolicyModeFile,
+		Path: filepath.Join(t.TempDir(), "policy.hujson"),
+	}
+
+	require.NoError(t, os.WriteFile(cfg.Policy.Path, nil, 0o600))
+
+	s, err := NewState(cfg)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+}
+
 // TestNodeWriteChangeWhenPolicyRefreshFails fails both the NodeStore
 // writer's SetNodes and the caller's. The write still reached the
 // NodeStore, so the change returned with the error must resend the node to
@@ -1670,7 +1742,7 @@ func TestBackfillNodeIPsSurvivesConcurrentPersist(t *testing.T) {
 
 	// Dropping the IPv6 prefix gives the backfill work to do.
 	cfg := persistTestConfig(dbPath)
-	cfg.PrefixV6 = nil
+	cfg.Prefixes.V6 = nil
 
 	s, err := NewState(cfg)
 	require.NoError(t, err)
@@ -2820,4 +2892,27 @@ func TestUserNameCollisionDoesNotBlockCreationOrRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, users, 3)
 	require.Empty(t, reopened.polMan.NodeCapMap(node.ID))
+}
+
+// TestSetLastControlAddressWritesNodeStoreOutsidePersistMu holds persistMu
+// and expects the NodeStore write to land anyway: every map request calls
+// SetLastControlAddress, and waiting for a NodeStore batch under the lock
+// would serialise all nodes' persists behind one batch interval each.
+func TestSetLastControlAddressWritesNodeStoreOutsidePersistMu(t *testing.T) {
+	_, s, nodeID := persistTestSetup(t)
+	addr := netip.MustParseAddr("203.0.113.10")
+
+	s.persistMu.Lock()
+
+	done := make(chan error, 1)
+	go func() { done <- s.SetLastControlAddress(nodeID, addr) }()
+
+	assert.Eventually(t, func() bool {
+		nv, ok := s.GetNodeByID(nodeID)
+
+		return ok && nv.LastControlAddress().GetOr(netip.Addr{}) == addr
+	}, 5*time.Second, 10*time.Millisecond)
+
+	s.persistMu.Unlock()
+	require.NoError(t, <-done)
 }

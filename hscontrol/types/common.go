@@ -17,8 +17,13 @@ import (
 
 const (
 	SelfUpdateIdentifier = "self-update"
-	DatabasePostgres     = "postgres"
-	DatabaseSqlite       = "sqlite3"
+
+	// DatabasePostgres is PostgreSQL, at `database.postgres.host`.
+	DatabasePostgres DatabaseType = "postgres"
+	// DatabaseSqlite is the same as `sqlite`.
+	DatabaseSqlite DatabaseType = "sqlite3"
+	// DatabaseSqliteShort is SQLite, in the file `database.sqlite.path`.
+	DatabaseSqliteShort DatabaseType = "sqlite"
 )
 
 // Common errors.

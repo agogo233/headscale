@@ -105,27 +105,6 @@ func sourcesHaveDangerAll(srcs Aliases) bool {
 	return false
 }
 
-// srcIPsWithRoutes returns the [tailcfg.FilterRule.SrcIPs] string slice,
-// appending approved subnet routes when the sources include a wildcard.
-// When hasDangerAll is true, returns ["*"] to represent all IPs.
-func srcIPsWithRoutes(
-	resolved ResolvedAddresses,
-	hasWildcard bool,
-	hasDangerAll bool,
-	nodes views.Slice[types.NodeView],
-) []string {
-	if hasDangerAll {
-		return []string{"*"}
-	}
-
-	ips := resolved.Strings()
-	if hasWildcard {
-		ips = append(ips, approvedSubnetRoutes(nodes)...)
-	}
-
-	return ips
-}
-
 // compileFilterRules takes a set of nodes and a [Policy] and generates a
 // set of Tailscale compatible [tailcfg.FilterRule]s used to allow traffic
 // on clients.
@@ -188,12 +167,10 @@ func (pol *Policy) destinationsToNetPortRange(
 			continue
 		}
 
-		prefixes := ips.Prefixes()
-
-		for _, pref := range prefixes {
+		for _, ip := range ips.Strings() {
 			for _, port := range ports {
 				ret = append(ret, tailcfg.NetPortRange{
-					IP:    filterIP(pref),
+					IP:    ip,
 					Ports: port,
 				})
 			}
@@ -219,17 +196,15 @@ func (pol *Policy) compileFilterRulesForNode(
 	node types.NodeView,
 	nodes views.Slice[types.NodeView],
 ) []tailcfg.FilterRule {
-	if pol == nil {
+	if pol == nil || (pol.ACLs == nil && pol.Grants == nil) {
 		return noRulesFilter(users, nodes)
 	}
 
 	grants := pol.compileGrants(users, nodes)
 	userIdx := buildUserNodeIndex(nodes)
+	precomputeSelfRules(grants, userIdx)
 
-	return append(
-		filterRulesForNode(grants, node, userIdx),
-		exitNodeSelfRules(grants, node, userIdx)...,
-	)
+	return filterRulesForNode(grants, node, userIdx)
 }
 
 var sshAccept = tailcfg.SSHAction{
@@ -746,18 +721,10 @@ func filterRuleKey(rule tailcfg.FilterRule) string {
 	return fmt.Sprintf("%s|%v", strings.Join(rule.SrcIPs, ","), rule.IPProto)
 }
 
-// mergeFilterRules merges rules with identical [tailcfg.FilterRule.SrcIPs] and
-// [tailcfg.FilterRule.IPProto] by combining their [tailcfg.FilterRule.DstPorts].
-// DstPorts are NOT deduplicated to match Tailscale behavior.
-// [tailcfg.CapGrant] rules (which have no [tailcfg.FilterRule.DstPorts]) are
-// passed through without merging since [tailcfg.CapGrant] and
-// [tailcfg.FilterRule.DstPorts] are mutually exclusive in a
-// [tailcfg.FilterRule].
-func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
-	if len(rules) <= 1 {
-		return rules
-	}
-
+// ruleKeys returns each rule's merge key, see [filterRuleKey]. Rules
+// sharing a SrcIPs slice, as an ACL's rules do, build its key once.
+// [tailcfg.CapGrant] rules get no key: they are never merged.
+func ruleKeys(rules []tailcfg.FilterRule) []string {
 	// sharedSrcIPs identifies a SrcIPs slice by its backing array.
 	type sharedSrcIPs struct {
 		first   *string
@@ -765,22 +732,14 @@ func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 		ipProto string
 	}
 
-	keyToIdx := make(map[string]int)
-	sharedToIdx := make(map[sharedSrcIPs]int)
-	result := make([]tailcfg.FilterRule, 0, len(rules))
+	built := make(map[sharedSrcIPs]string)
+	keys := make([]string, len(rules))
 
-	for _, rule := range rules {
-		// CapGrant rules are not merged — they are structurally
-		// different from DstPorts rules and passed through as-is.
+	for i, rule := range rules {
 		if len(rule.CapGrant) > 0 {
-			result = append(result, rule)
-
 			continue
 		}
 
-		// An ACL compiles to one rule per destination, all with the same
-		// SrcIPs slice. Build the key of a slice once, or merging them is
-		// len(src) × len(dst) work.
 		shared := sharedSrcIPs{
 			n:       len(rule.SrcIPs),
 			ipProto: fmt.Sprint(rule.IPProto),
@@ -789,30 +748,48 @@ func mergeFilterRules(rules []tailcfg.FilterRule) []tailcfg.FilterRule {
 			shared.first = &rule.SrcIPs[0]
 		}
 
-		idx, exists := sharedToIdx[shared]
-		if !exists {
-			key := filterRuleKey(rule)
-
-			idx, exists = keyToIdx[key]
-			if !exists {
-				idx = len(result)
-				keyToIdx[key] = idx
-			}
-
-			sharedToIdx[shared] = idx
+		key, ok := built[shared]
+		if !ok {
+			key = filterRuleKey(rule)
+			built[shared] = key
 		}
 
-		if exists {
-			// Merge: append DstPorts to existing rule
+		keys[i] = key
+	}
+
+	return keys
+}
+
+// mergeKeyedRules merges rules whose keys are equal into the first of them,
+// keeping first-appearance order, as Tailscale does. keys[i] is rules[i]'s
+// key; [tailcfg.CapGrant] rules pass through.
+func mergeKeyedRules(rules []tailcfg.FilterRule, keys []string) []tailcfg.FilterRule {
+	if len(rules) <= 1 {
+		return rules
+	}
+
+	keyToIdx := make(map[string]int)
+	result := make([]tailcfg.FilterRule, 0, len(rules))
+
+	for i, rule := range rules {
+		if len(rule.CapGrant) > 0 {
+			result = append(result, rule)
+
+			continue
+		}
+
+		if idx, ok := keyToIdx[keys[i]]; ok {
 			result[idx].DstPorts = append(result[idx].DstPorts, rule.DstPorts...)
-		} else {
-			// New unique combination
-			result = append(result, tailcfg.FilterRule{
-				SrcIPs:   rule.SrcIPs,
-				DstPorts: slices.Clone(rule.DstPorts),
-				IPProto:  rule.IPProto,
-			})
+
+			continue
 		}
+
+		keyToIdx[keys[i]] = len(result)
+		result = append(result, tailcfg.FilterRule{
+			SrcIPs:   rule.SrcIPs,
+			DstPorts: slices.Clone(rule.DstPorts),
+			IPProto:  rule.IPProto,
+		})
 	}
 
 	return result

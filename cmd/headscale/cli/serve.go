@@ -3,10 +3,12 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"net/http"
+	"os/signal"
 	"syscall"
 
+	"github.com/juanfont/headscale/hscontrol/config"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"github.com/tailscale/squibble"
 )
@@ -19,6 +21,8 @@ var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Launches the headscale server",
 	RunE: func(cmd *cobra.Command, args []string) error {
+		logNoConfigFile(loaded)
+
 		app, err := newHeadscaleServerWithConfig()
 		if err != nil {
 			if squibbleErr, ok := errors.AsType[squibble.ValidationError](err); ok {
@@ -29,13 +33,42 @@ var serveCmd = &cobra.Command{
 			return fmt.Errorf("initializing: %w", err)
 		}
 
-		err = app.Serve()
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			return nil
+		ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+		defer stop()
+
+		err = app.Serve(ctx)
+		if err != nil {
+			return classifyServeError(err)
 		}
 
-		return classifyServeError(err)
+		return nil
 	},
+}
+
+// exitConfig is EX_CONFIG from sysexits.h. serve exits with it when its
+// configuration is the cause, which a restart with the same inputs cannot
+// fix, so the systemd units set RestartPreventExitStatus to it.
+const exitConfig = 78
+
+// exitCode is how cmd exits on err, file being the configuration file it
+// loaded: exitConfig when serve stops on what that configuration says; 1
+// otherwise. Without a file, the one expected may be on a mount not yet up,
+// and a database, a port or a file the configuration names may yet become
+// available, so systemd keeps retrying those.
+func exitCode(cmd *cobra.Command, file string, err error) int {
+	if cmd == serveCmd && file != "" && errors.Is(err, types.ErrConfig) {
+		return exitConfig
+	}
+
+	return 1
+}
+
+// logNoConfigFile says when the server runs without a file. The loader does
+// not warn: client commands need no file unless they use an API key.
+func logNoConfigFile(l *config.Loaded) {
+	if l.File == "" {
+		log.Info().Msg("no configuration file, using defaults and the environment")
+	}
 }
 
 // classifyServeError augments specific error classes with operator

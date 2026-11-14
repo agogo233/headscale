@@ -1,20 +1,31 @@
 package cli
 
 import (
+	"cmp"
+	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
 
+	"github.com/juanfont/headscale/hscontrol/config"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"github.com/tcnksm/go-latest"
 )
 
-var cfgFile string = ""
+var (
+	cfgFile string = ""
+
+	// loaded is what initConfig loaded, or generate config --running, which
+	// skips initConfig and loads it itself; nil for the other commands that
+	// skip initConfig: check, generate config, generate nixos-options,
+	// version, mockoidc and completion.
+	loaded *config.Loaded
+)
 
 func init() {
 	if len(os.Args) > 1 &&
@@ -39,24 +50,86 @@ func init() {
 	})
 }
 
-func initConfig() {
-	if cfgFile == "" {
-		cfgFile = os.Getenv("HEADSCALE_CONFIG")
+// skipsInitConfig reports whether args select the check command group,
+// generate config or generate nixos-options, which must work without a
+// loadable config. Find runs lazily because init order across files is not
+// guaranteed to have registered every command.
+func skipsInitConfig(args []string) bool {
+	cmd, rest, err := rootCmd.Find(args)
+	// `help check …` must work wherever `check …` does.
+	if err == nil && cmd.Name() == "help" && cmd.Parent() == rootCmd {
+		cmd, _, err = rootCmd.Find(rest)
 	}
 
-	if cfgFile != "" {
-		err := types.LoadConfig(cfgFile, true)
-		if err != nil {
-			log.Fatal().Caller().Err(err).Msgf("error loading config file %s", cfgFile)
-		}
-	} else {
-		err := types.LoadConfig("", false)
-		if err != nil {
-			log.Fatal().Caller().Err(err).Msgf("error loading config")
-		}
+	return err == nil && (cmd == checkCmd || cmd.HasParent() && cmd.Parent() == checkCmd || cmd == generateConfigCmd || cmd == generateNixOSOptionsCmd)
+}
+
+// loadConfig loads path, else the file -c names, else $HEADSCALE_CONFIG,
+// else the first config.* in /etc/headscale, $XDG_CONFIG_HOME/headscale,
+// headscale under each $XDG_CONFIG_DIRS entry, ~/.headscale or ".". Without
+// a file it loads defaults and environment only. The result is never nil.
+func loadConfig(path string) (*config.Loaded, error) {
+	path = cmp.Or(path, cfgFile, os.Getenv("HEADSCALE_CONFIG"))
+
+	l, err := config.Load(path, path != "", os.Environ())
+	switch {
+	case err != nil && path != "":
+		return l, fmt.Errorf("loading config file %s: %w", path, err)
+	case err != nil:
+		return l, fmt.Errorf("loading config: %w", err)
+	}
+
+	return l, nil
+}
+
+// useLogConfig applies cfg's log.level, and logs to w as JSON when cfg sets
+// log.format: json.
+func useLogConfig(cfg *types.Config, w io.Writer) {
+	zerolog.SetGlobalLevel(cfg.Log.Level.Zerolog())
+
+	if cfg.Log.Format == types.JSONLogFormat {
+		log.Logger = log.Output(w)
+	}
+}
+
+func logWarnings(warnings []string) {
+	for _, w := range warnings {
+		log.Warn().Msg(w)
+	}
+}
+
+func initConfig() {
+	if skipsInitConfig(os.Args[1:]) {
+		// Loading a config sets the log level; without one, use log.level's default.
+		zerolog.SetGlobalLevel(zerolog.InfoLevel)
+
+		return
 	}
 
 	machineOutput := hasMachineOutputFlag()
+
+	l, err := loadConfig("")
+	if err != nil {
+		// No log.format applies: main's console logger, on stderr.
+		logWarnings(l.Warnings)
+
+		// A Cobra initializer cannot return err to Execute; report it the same way.
+		cmd, _, _ := rootCmd.Find(os.Args[1:])
+		exitWithError(cmd, l.File, err)
+	}
+
+	loaded = l
+	cfg := l.Config
+
+	// Machine output owns stdout.
+	logOut := os.Stdout
+	if machineOutput {
+		logOut = os.Stderr
+	}
+
+	useLogConfig(cfg, logOut)
+
+	logWarnings(l.Warnings)
 
 	// If the user has requested a "node" readable format,
 	// then disable login so the output remains valid.
@@ -64,13 +137,7 @@ func initConfig() {
 		zerolog.SetGlobalLevel(zerolog.Disabled)
 	}
 
-	logFormat := viper.GetString("log.format")
-	if logFormat == types.JSONLogFormat {
-		log.Logger = log.Output(os.Stdout)
-	}
-
-	disableUpdateCheck := viper.GetBool("disable_check_updates")
-	if !disableUpdateCheck && !machineOutput {
+	if !cfg.DisableUpdateCheck && !machineOutput {
 		versionInfo := types.GetVersionInfo()
 		if (runtime.GOOS == "linux" || runtime.GOOS == "darwin") &&
 			!versionInfo.Dirty {
@@ -135,8 +202,19 @@ https://github.com/juanfont/headscale`,
 func Execute() {
 	cmd, err := rootCmd.ExecuteC()
 	if err != nil {
-		outputFormat, _ := cmd.Flags().GetString("output")
-		printError(err, outputFormat)
-		os.Exit(1)
+		var file string
+		if loaded != nil {
+			file = loaded.File
+		}
+
+		exitWithError(cmd, file, err)
 	}
+}
+
+// exitWithError prints err in cmd's --output format and exits with
+// exitCode; file is the configuration file loaded, if any.
+func exitWithError(cmd *cobra.Command, file string, err error) {
+	outputFormat, _ := cmd.Flags().GetString("output")
+	printError(err, outputFormat)
+	os.Exit(exitCode(cmd, file, err))
 }

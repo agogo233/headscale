@@ -3,6 +3,7 @@ package servertest
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"path"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/testcapture"
 	"tailscale.com/control/controlclient"
+	_ "tailscale.com/feature/c2n" // registers the c2n answer hook used by [WithC2NHandler]
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
@@ -54,6 +56,8 @@ type TestClient struct {
 
 	// stopFollowup ends the follow-up [TestClient.RotateDisco] left waiting.
 	stopFollowup context.CancelFunc
+	// c2nHandler answers c2n requests; see [WithC2NHandler].
+	c2nHandler http.Handler
 
 	// Connection lifecycle.
 	pollCtx    context.Context //nolint:containedctx // test-only; context stored for cancel control
@@ -83,6 +87,9 @@ type TestClient struct {
 	frames  int
 	stamped bool
 
+	// firstMap closes on the first netmap, without taking it from updates.
+	firstMap chan struct{}
+
 	// updates is a buffered channel that receives a signal
 	// each time a new [netmap.NetworkMap] arrives.
 	updates chan *netmap.NetworkMap
@@ -107,6 +114,7 @@ type clientConfig struct {
 	approve      func(authID string) error
 	loginFlags   controlclient.LoginFlags
 	endpoints    []tailcfg.Endpoint
+	c2nHandler   http.Handler
 }
 
 // WithoutNetmapHistory retains only the latest netmap and one queued update.
@@ -170,6 +178,12 @@ func WithEndpoints(eps ...tailcfg.Endpoint) ClientOption {
 	return func(c *clientConfig) { c.endpoints = eps }
 }
 
+// WithC2NHandler makes the client answer c2n requests from the server
+// with handler, as tailscaled answers them with its LocalBackend.
+func WithC2NHandler(handler http.Handler) ClientOption {
+	return func(c *clientConfig) { c.c2nHandler = handler }
+}
+
 // WithUser sets the user for the client. If not set, the harness
 // creates a default user.
 func WithUser(user *types.User) ClientOption {
@@ -177,7 +191,9 @@ func WithUser(user *types.User) ClientOption {
 }
 
 // NewClient creates a [TestClient], registers it with the [TestServer]
-// using a pre-auth key, and starts long-polling for map updates.
+// using a pre-auth key, starts long-polling for map updates, and returns
+// once the first map arrives. That map is still queued for
+// [TestClient.WaitForUpdate].
 func NewClient(tb testing.TB, server *TestServer, name string, opts ...ClientOption) *TestClient {
 	tb.Helper()
 
@@ -252,7 +268,9 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 		approve:    cc.approve,
 		loginFlags: cc.loginFlags,
 		endpoints:  cc.endpoints,
+		c2nHandler: cc.c2nHandler,
 		updates:    make(chan *netmap.NetworkMap, updateBuffer),
+		firstMap:   make(chan struct{}),
 		bus:        bus,
 		dialer:     dialer,
 		tracker:    tracker,
@@ -306,6 +324,16 @@ func TryNewClient(tb testing.TB, server *TestServer, name string, opts ...Client
 	// Start long-polling in the background.
 	tc.startPoll(tb)
 
+	// The first map follows [state.State.Connect], so clients created in
+	// turn open their control sessions in that order: the HA election
+	// ranks routers by session age.
+	select {
+	case <-tc.firstMap:
+	case <-tc.pollDone:
+	case <-time.After(10 * time.Second):
+		tb.Fatalf("servertest: NewClient(%s): no map after 10s", name)
+	}
+
 	return tc, nil
 }
 
@@ -326,6 +354,7 @@ func (c *TestClient) newDirect(
 		HealthTracker:        c.tracker,
 		Dialer:               c.dialer,
 		Bus:                  c.bus,
+		C2NHandler:           c.c2nHandler,
 	})
 	if err == nil && len(c.endpoints) > 0 {
 		direct.SetEndpoints(c.endpoints)
@@ -458,12 +487,17 @@ func (c *TestClient) UpdateFullNetmap(nm *netmap.NetworkMap) {
 	c.updatesReceived++
 	c.streamMaps++
 
+	// A client built without TryNewClient has no firstMap.
+	if c.updatesReceived == 1 && c.firstMap != nil {
+		close(c.firstMap)
+	}
+
 	if !c.noHistory {
 		c.history = append(c.history, nm)
 	}
 
-	// Removals sent ahead of their batch and a deleted node's expiry carry
-	// no ControlTime, so a rebuild with none before it is a response too.
+	// Removals sent ahead of their batch carry no ControlTime, so a rebuild
+	// with none before it is a response too.
 	// shortcut: one right after a response a delta client applied in place
 	// goes uncounted; count at the decoder if headscale sends one alone.
 	if !c.stamped {
@@ -723,9 +757,18 @@ func (c *TestClient) Login(
 //
 // Safe to call from non-test goroutines.
 func (c *TestClient) Restart(ctx context.Context, hi *tailcfg.Hostinfo) error {
+	return c.RestartWithKey(ctx, "", hi)
+}
+
+// RestartWithKey is [TestClient.Restart] for a client that hands authKey to
+// its backend on every start, as a tsnet program does with TS_AUTHKEY: the
+// key goes out under the node key the client already has.
+//
+// Safe to call from non-test goroutines.
+func (c *TestClient) RestartWithKey(ctx context.Context, authKey string, hi *tailcfg.Hostinfo) error {
 	c.discoKey = key.NewDisco().Public()
 
-	return c.Login(ctx, c.Persist(), "", controlclient.LoginDefault, hi, nil)
+	return c.Login(ctx, c.Persist(), authKey, controlclient.LoginDefault, hi, nil)
 }
 
 // RotateDisco gives the client a new disco key and reports it, then logs in

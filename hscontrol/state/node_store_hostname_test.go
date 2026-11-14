@@ -41,10 +41,10 @@ func TestNewNodeStoreBumpsDuplicateNames(t *testing.T) {
 
 func TestPutNodeBumpsPastReservedLabel(t *testing.T) {
 	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
-	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
-		{Name: "laptop." + cfg.BaseDomain},
-		{Name: "laptop-1." + cfg.BaseDomain},
-	}}
+	cfg.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{
+		{Name: "laptop." + cfg.DNSConfig.BaseDomain},
+		{Name: "laptop-1." + cfg.DNSConfig.BaseDomain},
+	}
 	s, err := NewState(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
@@ -55,9 +55,9 @@ func TestPutNodeBumpsPastReservedLabel(t *testing.T) {
 
 func TestSetGivenNameRejectsReservedLabel(t *testing.T) {
 	cfg := persistTestConfig(t.TempDir() + "/headscale.db")
-	cfg.TailcfgDNSConfig = &tailcfg.DNSConfig{ExtraRecords: []tailcfg.DNSRecord{
-		{Name: "laptop." + cfg.BaseDomain},
-	}}
+	cfg.DNSConfig.ExtraRecords = []tailcfg.DNSRecord{
+		{Name: "laptop." + cfg.DNSConfig.BaseDomain},
+	}
 	s, err := NewState(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })

@@ -120,6 +120,22 @@ func getDeviceRoutes(t *testing.T, api humatest.TestAPI, deviceID string) apiv2.
 	return routes
 }
 
+func getDevicePostureAttributes(
+	t *testing.T,
+	api humatest.TestAPI,
+	deviceID string,
+) apiv2.DevicePostureAttributes {
+	t.Helper()
+
+	resp := api.Get("/api/v2/device/" + deviceID + "/attributes")
+	require.Equalf(t, http.StatusOK, resp.Code, "body: %s", resp.Body)
+
+	var attrs apiv2.DevicePostureAttributes
+	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &attrs))
+
+	return attrs
+}
+
 func approvedRouteStrings(nv types.NodeView) []string {
 	return util.PrefixesToString(nv.ApprovedRoutes().AsSlice())
 }
@@ -171,7 +187,7 @@ func TestAPIv2Device_EmptyRouteLists(t *testing.T) {
 // MagicDNS FQDN, in a read and in the list.
 func TestAPIv2Device_NameIsFQDN(t *testing.T) {
 	e := newDeviceTestEnv(t)
-	e.app.cfg.BaseDomain = "tailnet.example.com"
+	e.app.cfg.DNSConfig.BaseDomain = "tailnet.example.com"
 
 	assert.Equal(t, "contract-dut.tailnet.example.com", getDevice(t, e.api, e.deviceID).Name)
 
@@ -189,6 +205,45 @@ func TestAPIv2Device_Get_UnknownID_404(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, e.api.Get("/api/v2/device/999999").Code)
 	assert.Equal(t, http.StatusNotFound, e.api.Get("/api/v2/device/not-a-number").Code)
+}
+
+func TestAPIv2Device_GetPostureAttributes(t *testing.T) {
+	e := newDeviceTestEnv(t)
+
+	t.Run("unknown address", func(t *testing.T) {
+		resp := e.api.Get("/api/v2/device/" + e.deviceID + "/attributes")
+		require.Equalf(t, http.StatusOK, resp.Code, "body: %s", resp.Body)
+		// SaaS leaves expiries out when no attribute has one.
+		assert.JSONEq(t, `{"attributes":{}}`, resp.Body.String())
+	})
+
+	for _, test := range []struct {
+		name string
+		addr string
+	}{
+		{name: "IPv4", addr: "203.0.113.10"},
+		{name: "IPv6", addr: "2001:db8::10"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.NoError(t, e.app.state.SetLastControlAddress(
+				e.nodeID,
+				netip.MustParseAddr(test.addr),
+			))
+
+			attrs := getDevicePostureAttributes(t, e.api, e.deviceID)
+			assert.Equal(t, test.addr, attrs.Attributes["ip:publicAddress"])
+			assert.Empty(t, attrs.Expiries)
+		})
+	}
+}
+
+func TestAPIv2Device_GetPostureAttributes_UnknownID_404(t *testing.T) {
+	e := newDeviceTestEnv(t)
+
+	assert.Equal(t, http.StatusNotFound,
+		e.api.Get("/api/v2/device/999999/attributes").Code)
+	assert.Equal(t, http.StatusNotFound,
+		e.api.Get("/api/v2/device/not-a-number/attributes").Code)
 }
 
 func TestAPIv2Device_List(t *testing.T) {

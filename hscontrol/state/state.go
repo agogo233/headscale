@@ -26,7 +26,9 @@ import (
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/juanfont/headscale/hscontrol/config"
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/derp"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -48,26 +50,9 @@ import (
 	"tailscale.com/util/truncate"
 )
 
-const (
-	// registerCacheExpiration defines how long node registration entries remain in cache.
-	registerCacheExpiration = time.Minute * 15
-
-	// defaultRegisterCacheMaxEntries bounds pending authentication transactions.
-	// Admission refuses new work at capacity instead of invalidating approvals.
-	defaultRegisterCacheMaxEntries = 1024
-
-	// authCacheSSHReserve keeps registered nodes' SSH checks available when
-	// unauthenticated registrations have filled their allocation.
-	authCacheSSHReserve = 64
-
-	// defaultNodeStoreBatchSize is the default number of write operations to batch
-	// before rebuilding the in-memory node snapshot.
-	defaultNodeStoreBatchSize = 100
-
-	// defaultNodeStoreBatchTimeout is the default maximum time to wait before
-	// processing a partial batch of node operations.
-	defaultNodeStoreBatchTimeout = 500 * time.Millisecond
-)
+// authCacheSSHReserve keeps registered nodes' SSH checks available when
+// unauthenticated registrations have filled their allocation.
+const authCacheSSHReserve = 64
 
 // ErrUnsupportedPolicyMode is returned for invalid policy modes. Valid modes are "file" and "db".
 var ErrUnsupportedPolicyMode = errors.New("unsupported policy mode")
@@ -88,6 +73,9 @@ var ErrNodeNotFound = errors.New("node not found")
 
 // ErrInvalidNodeView is returned when an invalid node view is provided.
 var ErrInvalidNodeView = errors.New("invalid node view provided")
+
+// ErrInvalidLastControlAddress is returned for a non-IP control address.
+var ErrInvalidLastControlAddress = errors.New("invalid last control address")
 
 // ErrNodeNotInNodeStore is returned when a node no longer exists in the [NodeStore].
 var ErrNodeNotInNodeStore = errors.New("node no longer exists in NodeStore")
@@ -129,6 +117,7 @@ var nodeUpdateColumns = []string{
 	"Hostinfo",
 	"IPv4",
 	"IPv6",
+	"LastControlAddress",
 	"Hostname",
 	"GivenName",
 	"UserID",
@@ -140,6 +129,40 @@ var nodeUpdateColumns = []string{
 	"ApprovedRoutes",
 	"AutoApprovedRoutes",
 	"UpdatedAt",
+}
+
+// SetLastControlAddress stores the source IP of a node's latest authenticated
+// control connection. Every map request calls it, so it takes persistMu only
+// for the database write, and an unchanged address writes nothing.
+func (s *State) SetLastControlAddress(id types.NodeID, addr netip.Addr) error {
+	// A zero address would be stored as text that no longer parses, failing
+	// every later read of the node.
+	if !addr.IsValid() {
+		return ErrInvalidLastControlAddress
+	}
+
+	// The zone names the server's interface, or is header text from a proxy.
+	addr = addr.Unmap().WithZone("")
+
+	node, ok := s.nodeStore.GetNode(id)
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
+	}
+
+	if node.LastControlAddress().GetOr(netip.Addr{}) == addr {
+		return nil
+	}
+
+	node, ok = s.nodeStore.UpdateNode(id, func(n *types.Node) {
+		n.LastControlAddress = &addr
+	})
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
+	}
+
+	_, err := s.persistNodeWith(node, []string{"LastControlAddress"}, nil)
+
+	return err
 }
 
 // ErrRegistrationExpired is returned when a registration has expired.
@@ -209,8 +232,11 @@ type State struct {
 	db *hsdb.HSDatabase
 	// ipAlloc manages IP address allocation for nodes
 	ipAlloc *hsdb.IPAllocator
-	// derpMap contains the current DERP relay configuration
-	derpMap atomic.Pointer[tailcfg.DERPMap]
+	// derpMap is configDERPMap with the policy's derpMap applied: the DERP
+	// map every node gets. derpMu orders its writers.
+	derpMap       atomic.Pointer[tailcfg.DERPMap]
+	derpMu        sync.Mutex
+	configDERPMap *tailcfg.DERPMap
 	// polMan handles policy evaluation and management
 	polMan policy.PolicyManager
 
@@ -224,6 +250,7 @@ type State struct {
 	authCache               *expirable.LRU[types.AuthID, *types.AuthRequest]
 	authCacheMu             sync.Mutex
 	authCacheMaxEntries     int
+	authCacheExpiration     time.Duration
 	authCacheClosed         bool
 	authCacheRegularEntries atomic.Int64
 
@@ -329,9 +356,11 @@ func (s *State) lockRegistration(machineKey key.MachinePublic) func() {
 // NewState creates and initializes a new [State] instance, setting up the database,
 // IP allocator, DERP map, policy manager, and loading existing users and nodes.
 func NewState(cfg *types.Config) (*State, error) {
-	cacheExpiration := cmp.Or(cfg.Tuning.RegisterCacheExpiration, registerCacheExpiration)
+	defaults := config.Default().Tuning
 
-	cacheMaxEntries := defaultRegisterCacheMaxEntries
+	cacheExpiration := cmp.Or(cfg.Tuning.RegisterCacheExpiration, defaults.RegisterCacheExpiration)
+
+	cacheMaxEntries := defaults.RegisterCacheMaxEntries
 	if cfg.Tuning.RegisterCacheMaxEntries > 0 {
 		cacheMaxEntries = cfg.Tuning.RegisterCacheMaxEntries
 	}
@@ -341,7 +370,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing database: %w", err)
 	}
 
-	ipAlloc, err := hsdb.NewIPAllocator(db, cfg.PrefixV4, cfg.PrefixV6, cfg.IPAllocation)
+	ipAlloc, err := hsdb.NewIPAllocator(db, cfg.Prefixes.V4, cfg.Prefixes.V6, cfg.Prefixes.Allocation)
 	if err != nil {
 		return nil, fmt.Errorf("initializing IP allocator: %w", err)
 	}
@@ -412,16 +441,14 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
 
-	// Apply defaults for [NodeStore] batch configuration if not set.
-	// This ensures tests that create Config directly (without viper) still work.
-	batchSize := cmp.Or(cfg.Tuning.NodeStoreBatchSize, defaultNodeStoreBatchSize)
+	batchSize := cmp.Or(cfg.Tuning.NodeStoreBatchSize, defaults.NodeStoreBatchSize)
 
-	batchTimeout := cmp.Or(cfg.Tuning.NodeStoreBatchTimeout, defaultNodeStoreBatchTimeout)
+	batchTimeout := cmp.Or(cfg.Tuning.NodeStoreBatchTimeout, defaults.NodeStoreBatchTimeout)
 
 	nodeStore := NewNodeStore(nodes, policyPeersFunc(polMan), batchSize, batchTimeout)
 	polMan.SetRouterSession(nodeStore.RouterSession)
 	nodeStore.reservedLabel = func(label string) bool {
-		return cfg.BaseDomain != "" && cfg.HasExtraRecord(label+"."+cfg.BaseDomain)
+		return cfg.DNSConfig.BaseDomain != "" && cfg.HasExtraRecord(label+"."+cfg.DNSConfig.BaseDomain)
 	}
 	nodeStore.Start()
 
@@ -432,6 +459,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		ipAlloc:             ipAlloc,
 		polMan:              polMan,
 		authCacheMaxEntries: cacheMaxEntries,
+		authCacheExpiration: cacheExpiration,
 		nodeStore:           nodeStore,
 		pings:               newPingTracker(),
 
@@ -506,9 +534,30 @@ func (s *State) Close() error {
 	return nil
 }
 
-// SetDERPMap updates the DERP relay configuration.
+// SetDERPMap sets the DERP map built from the configuration; nodes get it
+// with the policy's derpMap applied.
 func (s *State) SetDERPMap(dm *tailcfg.DERPMap) {
-	s.derpMap.Store(dm)
+	s.derpMu.Lock()
+	defer s.derpMu.Unlock()
+
+	s.configDERPMap = dm
+	s.derpMap.Store(derp.ApplyPolicy(dm, s.polMan.DERPMap()))
+}
+
+// applyPolicyDERPMap applies the current policy's derpMap to the configured
+// DERP map again and reports whether the map nodes get changed.
+func (s *State) applyPolicyDERPMap() bool {
+	s.derpMu.Lock()
+	defer s.derpMu.Unlock()
+
+	next := derp.ApplyPolicy(s.configDERPMap, s.polMan.DERPMap())
+	if reflect.DeepEqual(next, s.derpMap.Load()) {
+		return false
+	}
+
+	s.derpMap.Store(next)
+
+	return true
 }
 
 // DERPMap returns the current DERP relay configuration for peer-to-peer connectivity.
@@ -525,22 +574,28 @@ func (s *State) ReloadPolicy() ([]change.Change, error) {
 	s.policyMu.Lock()
 	defer s.policyMu.Unlock()
 
-	_, err := s.reloadPolicyLocked()
+	_, derpChanged, err := s.reloadPolicyLocked()
 	if err != nil {
 		return nil, err
 	}
 
 	// Nodes whose CapMap shifted get their self refresh from
 	// [State.DrainSelfRefreshes] when these changes are dispatched.
-	return []change.Change{change.PolicyChange()}, nil
+	changes := []change.Change{change.PolicyChange()}
+	if derpChanged {
+		changes = append(changes, change.DERPMap())
+	}
+
+	return changes, nil
 }
 
 // reloadPolicyLocked is [State.ReloadPolicy] for callers holding policyMu. It
-// reports whether the policy changed.
-func (s *State) reloadPolicyLocked() (bool, error) {
+// reports whether the policy changed, and apart from that whether the DERP
+// map nodes get did: a derpMap edit changes no filter.
+func (s *State) reloadPolicyLocked() (bool, bool, error) {
 	pol, err := hsdb.PolicyBytes(s.db.DB, s.cfg)
 	if err != nil {
-		return false, fmt.Errorf("loading policy: %w", err)
+		return false, false, fmt.Errorf("loading policy: %w", err)
 	}
 
 	// nil means no policy is configured: nothing to install.
@@ -548,9 +603,13 @@ func (s *State) reloadPolicyLocked() (bool, error) {
 	if pol != nil {
 		policyChanged, err = s.polMan.SetPolicy(pol)
 		if err != nil {
-			return false, fmt.Errorf("setting policy: %w", err)
+			return false, false, fmt.Errorf("setting policy: %w", err)
 		}
 	}
+
+	// Checked even when the policy is unchanged: [State.SetPolicy] may have
+	// installed it already.
+	derpChanged := s.applyPolicyDERPMap()
 
 	// Rebuild peer maps after policy changes because the peersFunc in [NodeStore]
 	// uses the [policy.PolicyManager]'s filters. Without this, nodes won't see
@@ -572,7 +631,7 @@ func (s *State) reloadPolicyLocked() (bool, error) {
 		log.Info().Msg("Policy reload completed with changes")
 	}
 
-	return policyChanged, nil
+	return policyChanged, derpChanged, nil
 }
 
 // CreateUser creates a new user and updates the policy manager.
@@ -1682,7 +1741,7 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 	// Validate the label AND that the resulting FQDN fits MaxHostnameLength:
 	// a valid 63-char label can still overflow under a long base_domain, and
 	// an unmappable name would break this node and its peers (issue #3346).
-	err := types.ValidateGivenName(newName, s.cfg.BaseDomain)
+	err := types.ValidateGivenName(newName, s.cfg.DNSConfig.BaseDomain)
 	if err != nil {
 		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %w", ErrGivenNameInvalid, err)
 	}
@@ -1734,7 +1793,7 @@ func (s *State) WarnNodesHoldingExtraRecords() []types.NodeID {
 		ids = append(ids, n.ID())
 		log.Warn().
 			Uint64(zf.NodeID, n.ID().Uint64()).
-			Str("record", n.GivenName()+"."+s.cfg.BaseDomain).
+			Str("record", n.GivenName()+"."+s.cfg.DNSConfig.BaseDomain).
 			Msg("node keeps a name that is also an extra DNS record")
 	}
 
@@ -2054,34 +2113,18 @@ func (s *State) SetPolicyInDB(data string) (*types.Policy, error) {
 	return s.db.SetPolicy(data)
 }
 
-// ValidatePolicy reports whether [State.UpdatePolicy] would accept pol. It
-// compiles pol against the current users and nodes on a throwaway policy
-// manager; the live policy is not touched.
+// ValidatePolicy reports whether [State.UpdatePolicy] would accept pol,
+// checking it against the current users and nodes with
+// [policy.ValidatePolicy]; the live policy is not touched.
 func (s *State) ValidatePolicy(pol []byte) error {
 	users, err := s.ListAllUsers()
 	if err != nil {
 		return fmt.Errorf("loading users: %w", err)
 	}
 
-	nodes := s.ListNodes()
-
-	pm, err := policy.NewPolicyManager(nil, users, nodes)
-	if err != nil {
-		return fmt.Errorf("creating policy manager: %w", err)
-	}
-
-	_, err = pm.SetPolicy(pol)
+	err = policy.ValidatePolicy(pol, users, s.ListNodes())
 	if err != nil {
 		return invalidPolicyError{err}
-	}
-
-	// SSH rules compile per node, so a server without nodes cannot catch
-	// every case here.
-	if nodes.Len() > 0 {
-		_, err = pm.SSHPolicy(s.cfg.ServerURL, nodes.At(0))
-		if err != nil {
-			return invalidPolicyError{fmt.Errorf("verifying SSH rules: %w", err)}
-		}
 	}
 
 	return nil
@@ -2107,17 +2150,23 @@ func (s *State) UpdatePolicy(pol []byte) (*types.Policy, []change.Change, error)
 		return nil, nil, fmt.Errorf("storing policy: %w", err)
 	}
 
-	changed, err := s.reloadPolicyLocked()
+	changed, derpChanged, err := s.reloadPolicyLocked()
 	if err != nil {
 		return stored, nil, err
 	}
 
+	var changes []change.Change
+
 	// As on SaaS, a write that changes nothing sends clients nothing.
-	if !changed {
-		return stored, nil, nil
+	if changed {
+		changes = append(changes, change.PolicyChange())
 	}
 
-	return stored, []change.Change{change.PolicyChange()}, nil
+	if derpChanged {
+		changes = append(changes, change.DERPMap())
+	}
+
+	return stored, changes, nil
 }
 
 // GetNodePrimaryRoutes returns the primary routes for a node.
@@ -3563,59 +3612,37 @@ func canClaimTaggedNode(node types.NodeView, userID types.UserID) bool {
 	return node.IsTagged() && (node.ClaimableBy(userID) || node.RegisterMethod() != util.RegisterMethodAuthKey)
 }
 
-// pakSkipsValidation reports whether re-registering n with pak may skip key
-// validation at now. The machine key proves identity and a pre-auth key only
-// authorises the initial join, so a plain restart (container "tailscale up
-// --authkey=KEY") re-presents a spent key legitimately. Anything that
-// authorises something new must present a valid key:
-//   - a node key rotation;
-//   - an expired node. Tagged nodes expire at logout, by an administrative
-//     expiry, or keep the expiry they had when an admin tagged them;
-//   - a tagged key converting a user-owned node to tagged;
-//   - a tagged key other than the one the node last authed with, which retags
-//     it.
+// pakReregister reports whether re-registering n with pak at now logs it in
+// (true) or only wakes it (false). As on Tailscale SaaS, the machine and node
+// keys prove a node's identity and a pre-auth key only authorises a new node
+// key. Under its own, unexpired node key the node only wakes, whatever key it
+// sends: tsnet programs, containerboot and a --config auth key send theirs on
+// every start, and it may be spent, expired, revoked, another node's or carry
+// other tags. That key is not judged, not spent and changes nothing (see
+// reregisterNodeWithPAK). A new node key needs a valid key that speaks for
+// the node; an expired node is asked for one first.
 //
 // It is a pure function of the node so the NodeStore writer can decide again
 // on the node it actually replaces.
-func pakSkipsValidation(n types.NodeView, pak *types.PreAuthKey, nodeKey key.NodePublic, now time.Time) bool {
-	if !n.Valid() {
-		return false
-	}
-
-	isNodeKeyRotation := n.NodeKey() != nodeKey
-	isExpired := n.IsExpiredAt(now)
-	isOwnershipConversion := pak.ConvertsNodeToTagged(n)
-	isRetag := pak.RetagsNode(n)
-	ownershipMatches := n.IsTagged() ||
-		(pak.User != nil && n.UserID().Valid() && n.UserID().Get() == pak.User.ID)
-
-	return ownershipMatches && !isNodeKeyRotation && !isExpired &&
-		!isOwnershipConversion && !isRetag
-}
-
-// pakReregister distinguishes re-authentication with a valid key from a
-// wake-up that only refreshes a live node's reported metadata.
 func pakReregister(n types.NodeView, pak *types.PreAuthKey, nodeKey key.NodePublic, now time.Time) (bool, error) {
-	// As on Tailscale SaaS, an expired node is asked for a new node key before
-	// any key is judged.
-	if n.NodeKey() == nodeKey && n.IsExpiredAt(now) {
-		return false, ErrNodeKeyExpired
-	}
-
-	err := pak.ValidAt(now)
-	if err == nil {
-		if pak.CanReauthenticate(n) {
-			return true, nil
+	if n.NodeKey() == nodeKey {
+		if n.IsExpiredAt(now) {
+			return false, ErrNodeKeyExpired
 		}
 
-		err = types.PAKError("authkey cannot re-authenticate this node")
-	}
-
-	if pakSkipsValidation(n, pak, nodeKey, now) {
 		return false, nil
 	}
 
-	return false, err
+	err := pak.ValidAt(now)
+	if err != nil {
+		return false, err
+	}
+
+	if !pak.CanReauthenticate(n) {
+		return false, types.PAKError("authkey cannot re-authenticate this node")
+	}
+
+	return true, nil
 }
 
 // requestedTagsForPreAuthKey returns an authorised replacement set, or nil
@@ -3978,11 +4005,11 @@ func (s *State) reregisterNodeWithPAK(
 		node.RegisterMethod = util.RegisterMethodAuthKey
 
 		// Tags from a PreAuthKey are applied on initial registration and
-		// re-applied whenever a *different* key is presented on
-		// re-registration: re-keying is Tailscale's documented way to change
-		// an auth-key device's tags, replacing its existing ones. Presenting
-		// the SAME key again (a container restart) preserves the node's
-		// current tags and any admin override. A tagged key presented for a
+		// re-applied when a login with a new node key (--force-reauth)
+		// presents a *different* key: re-keying is Tailscale's documented way
+		// to change an auth-key device's tags, replacing its existing ones.
+		// Logging in with the SAME key again preserves the node's current
+		// tags and any admin override. A tagged key presented for a
 		// user-owned node also converts it, dropping user ownership.
 		// See https://tailscale.com/kb/1068/tags#apply-a-tag-to-a-device-with-the-cli.
 		//

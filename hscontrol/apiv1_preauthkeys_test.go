@@ -76,6 +76,66 @@ func TestAPIV1CreatePreAuthKey(t *testing.T) {
 		assert.Equal(t, []any{"tag:test"}, got.PreAuthKey["aclTags"])
 	})
 
+	t.Run("expiration stored and reported as sent", func(t *testing.T) {
+		future := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+
+		for _, tc := range []struct {
+			name string
+			body string
+			want *time.Time
+		}{
+			{"omitted", `{"aclTags":["tag:test"]}`, nil},
+			{"null", `{"aclTags":["tag:test"],"expiration":null}`, nil},
+			{
+				"future",
+				`{"aclTags":["tag:test"],"expiration":"` + future.Format(time.RFC3339) + `"}`,
+				&future,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				h := newAPIV1Harness(t)
+
+				res := h.callHuma(http.MethodPost, "/api/v1/preauthkey", []byte(tc.body))
+				require.Equal(t, http.StatusOK, res.status)
+
+				var created struct {
+					PreAuthKey map[string]any `json:"preAuthKey"`
+				}
+				require.NoError(t, json.Unmarshal(res.body, &created))
+
+				res = h.callHuma(http.MethodGet, "/api/v1/preauthkey", nil)
+				require.Equal(t, http.StatusOK, res.status)
+
+				var listed struct {
+					PreAuthKeys []map[string]any `json:"preAuthKeys"`
+				}
+				require.NoError(t, json.Unmarshal(res.body, &listed))
+				require.Len(t, listed.PreAuthKeys, 1)
+
+				keys, err := h.app.state.ListPreAuthKeys()
+				require.NoError(t, err)
+				require.Len(t, keys, 1)
+
+				// The zero time is already past, so an omitted expiration must
+				// stay NULL for the key to be usable.
+				require.NoError(t, keys[0].Validate())
+
+				if tc.want == nil {
+					assert.Nil(t, keys[0].Expiration)
+					assert.Nil(t, created.PreAuthKey["expiration"])
+					assert.Nil(t, listed.PreAuthKeys[0]["expiration"])
+
+					return
+				}
+
+				require.NotNil(t, keys[0].Expiration)
+				assert.True(t, tc.want.Equal(*keys[0].Expiration))
+				assert.Equal(t, future.Format(time.RFC3339), created.PreAuthKey["expiration"])
+				assert.Equal(t, future.Format(time.RFC3339), listed.PreAuthKeys[0]["expiration"])
+			})
+		}
+	})
+
 	t.Run("invalid tag parity", func(t *testing.T) {
 		h := newAPIV1Harness(t)
 		h.app.state.CreateUserForTest("alice")

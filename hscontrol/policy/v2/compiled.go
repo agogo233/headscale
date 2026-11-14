@@ -5,16 +5,16 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"strings"
 
+	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"go4.org/netipx"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/types/views"
-	"tailscale.com/util/set"
 )
 
 // grantCategory classifies a grant by what per-node work it needs.
@@ -53,6 +53,9 @@ type compiledGrant struct {
 	// For self grants with mixed destinations (self + other), this
 	// is the non-self portion only.
 	rules []tailcfg.FilterRule
+	// ruleKeys are rules' merge keys, built once per compile so that
+	// merging per node does not join long SrcIPs again.
+	ruleKeys []string
 
 	// self is non-nil when the grant has autogroup:self destinations.
 	self *selfGrantData
@@ -67,6 +70,25 @@ type selfGrantData struct {
 	resolvedSrcs      []ResolvedAddresses
 	internetProtocols []ProtocolPort
 	app               tailcfg.PeerCapMap
+
+	// byUser holds each user's rules, see [precomputeSelfRules].
+	byUser map[uint]keyedRules
+}
+
+// keyedRules are filter rules with their merge keys, see [filterRuleKey],
+// and their matchers.
+type keyedRules struct {
+	rules    []tailcfg.FilterRule
+	keys     []string
+	matchers []matcher.Match
+}
+
+func newKeyedRules(rules []tailcfg.FilterRule) keyedRules {
+	return keyedRules{
+		rules:    rules,
+		keys:     ruleKeys(rules),
+		matchers: matcher.MatchesFromFilterRules(rules),
+	}
 }
 
 // viaGrantData holds data needed for per-node via-grant compilation.
@@ -80,6 +102,13 @@ type viaGrantData struct {
 	hasAutoGroupInternet bool
 	internetProtocols    []ProtocolPort
 	srcIPStrings         []string
+	// srcSet is srcIPStrings parsed once for the matchers of the grant's
+	// rules, which every router of the grant shares.
+	srcSet *netipx.IPSet
+	// keyPrefix and keys, by IPProto, build the merge keys of the grant's
+	// rules once, see [viaRuleKey].
+	keyPrefix string
+	keys      map[string]string
 }
 
 // resolveViaDestinations splits a via grant's destinations into the
@@ -142,20 +171,6 @@ func buildUserNodeIndex(
 // A user association alone does not establish ownership: tagged nodes may retain their creator.
 func nodeHasUserIdentity(node types.NodeView) bool {
 	return !node.IsTagged() && node.User().Valid()
-}
-
-// nodeAddrSet is the addresses of every node.
-func nodeAddrSet(nodes views.Slice[types.NodeView]) *netipx.IPSet {
-	var b netipx.IPSetBuilder
-
-	for _, n := range nodes.All() {
-		n.AppendToIPSet(&b)
-	}
-
-	// The builder only fails on invalid addresses, which nodes never hold.
-	set, _ := b.IPSet()
-
-	return set
 }
 
 // compileNodeAttrs returns the per-node CapMap derived from policy
@@ -274,6 +289,7 @@ func (pol *Policy) compileGrants(
 		}
 
 		if cg != nil {
+			cg.ruleKeys = ruleKeys(cg.rules)
 			compiled = append(compiled, *cg)
 		}
 	}
@@ -368,26 +384,6 @@ func (pol *Policy) compileOneGrant(
 	return cg, nil
 }
 
-// mergeResolvedSrcs merges every prefix from the resolved sources into a
-// single [resolved] address set.
-func mergeResolvedSrcs(resolvedSrcs []ResolvedAddresses) (resolved, error) {
-	var b netipx.IPSetBuilder
-
-	for _, ips := range resolvedSrcs {
-		if r, ok := ips.(resolved); ok {
-			b.AddSet(&r.ips)
-
-			continue
-		}
-
-		for _, pref := range ips.Prefixes() {
-			b.AddPrefix(pref)
-		}
-	}
-
-	return newResolved(&b)
-}
-
 // sourceCache holds each source list's resolution for one compile: an ACL
 // compiles to one grant per destination, all sharing its sources, and
 // resolving and merging them is most of a wide ACL's compile.
@@ -400,11 +396,11 @@ type sourcesKey struct {
 	n     int
 }
 
-// grantSources is a source list resolved per alias, all and without
-// wildcards, and its SrcIPs once built.
+// grantSources is a source list resolved per alias, and its SrcIPs once
+// built.
 type grantSources struct {
-	all, nonWild []ResolvedAddresses
-	err          error
+	all []ResolvedAddresses
+	err error
 
 	built bool
 	strs  []string
@@ -427,7 +423,7 @@ func (c sourceCache) get(
 	}
 
 	s := &grantSources{}
-	s.all, s.nonWild, s.err = resolveSources(pol, sources, users, nodes)
+	s.all, s.err = resolveSources(pol, sources, users, nodes)
 
 	if c != nil {
 		c[key] = s
@@ -441,7 +437,7 @@ func (c sourceCache) get(
 // and clipped, so a caller appending to it copies.
 func (s *grantSources) strings(hasWildcard, hasDangerAll bool, nodes views.Slice[types.NodeView]) []string {
 	if !s.built {
-		s.strs = slices.Clip(buildSrcIPStrings(s.all, s.nonWild, hasWildcard, hasDangerAll, nodes))
+		s.strs = slices.Clip(buildSrcIPStrings(s.all, hasWildcard, hasDangerAll, nodes))
 		s.built = true
 	}
 
@@ -456,64 +452,72 @@ func (pol *Policy) compileOneViaGrant(
 	users types.Users,
 	nodes views.Slice[types.NodeView],
 ) (*compiledGrant, error) {
-	resolvedSrcs, _, err := resolveSources(
+	resolvedSrcs, err := resolveSources(
 		pol, grant.Sources, users, nodes,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(resolvedSrcs) == 0 {
-		return nil, nil //nolint:nilnil
-	}
-
-	// Build merged SrcIPs.
-	srcResolved, err := mergeResolvedSrcs(resolvedSrcs)
-	if err != nil {
-		return nil, err
-	}
-
-	if srcResolved.Empty() {
-		return nil, nil //nolint:nilnil
-	}
-
 	hasWildcard := sourcesHaveWildcard(grant.Sources)
 	hasDangerAll := sourcesHaveDangerAll(grant.Sources)
+
+	srcIPStrings := buildSrcIPStrings(resolvedSrcs, hasWildcard, hasDangerAll, nodes)
+	if len(srcIPStrings) == 0 {
+		return nil, nil //nolint:nilnil
+	}
 
 	resolvedDsts, hasAutoGroupInternet := resolveViaDestinations(
 		pol, users, nodes, grant.Destinations,
 	)
 
-	return &compiledGrant{
-		category: grantCategoryVia,
-		via: &viaGrantData{
-			viaTags:              grant.Via,
-			resolvedDsts:         resolvedDsts,
-			hasAutoGroupInternet: hasAutoGroupInternet,
-			internetProtocols:    grant.InternetProtocols,
-			srcIPStrings: srcIPsWithRoutes(
-				srcResolved, hasWildcard, hasDangerAll, nodes,
-			),
-		},
-	}, nil
+	via := &viaGrantData{
+		viaTags:              grant.Via,
+		resolvedDsts:         resolvedDsts,
+		hasAutoGroupInternet: hasAutoGroupInternet,
+		internetProtocols:    grant.InternetProtocols,
+		srcIPStrings:         srcIPStrings,
+		srcSet:               matcher.ParseSrcs(srcIPStrings),
+		keyPrefix:            fmt.Sprintf("via:%v|%s|", grant.Via, strings.Join(srcIPStrings, ",")),
+	}
+
+	via.keys = map[string]string{"[]": via.keyPrefix + "[]"}
+
+	for _, ipp := range grant.InternetProtocols {
+		proto := fmt.Sprint(ipp.Protocol.toIANAProtocolNumbers())
+		via.keys[proto] = via.keyPrefix + proto
+	}
+
+	return &compiledGrant{category: grantCategoryVia, via: via}, nil
 }
 
-// resolveSources resolves grant sources per-alias, returning the
-// resolved addresses and a separate slice of non-wildcard sources.
-// This is the canonical source-resolution path. Its output lands in
-// [compiledGrant.srcIPStrings] (among other places) and callers on the
-// hot path should prefer reading that over calling [Alias.Resolve] again.
+// viaRuleKey returns the merge key of a rule of a via grant: Tailscale
+// merges a via rule only with via rules through the same tags. Keys of
+// the IPProtos the grant lists are built once; others on use.
+func viaRuleKey(cg *compiledGrant, rule tailcfg.FilterRule) string {
+	proto := fmt.Sprint(rule.IPProto)
+	if key, ok := cg.via.keys[proto]; ok {
+		return key
+	}
+
+	return cg.via.keyPrefix + proto
+}
+
+// resolveSources resolves grant sources per alias. This is the canonical
+// source-resolution path. Its output lands in [compiledGrant.srcIPStrings]
+// (among other places) and callers on the hot path should prefer reading
+// that over calling [Alias.Resolve] again.
 func resolveSources(
 	pol *Policy,
 	sources Aliases,
 	users types.Users,
 	nodes views.Slice[types.NodeView],
-) ([]ResolvedAddresses, []ResolvedAddresses, error) {
-	var all, nonWild []ResolvedAddresses
+) ([]ResolvedAddresses, error) {
+	var all []ResolvedAddresses
 
-	for i, src := range sources {
+	for _, src := range sources {
 		if ag, ok := src.(*AutoGroup); ok && ag.Is(AutoGroupSelf) {
-			return nil, nil, errSelfInSources
+			return nil, errSelfInSources
 		}
 
 		ips, err := src.Resolve(pol, users, nodes)
@@ -524,51 +528,41 @@ func resolveSources(
 
 		if ips != nil {
 			all = append(all, ips)
-
-			if _, isWildcard := sources[i].(Asterix); !isWildcard {
-				nonWild = append(nonWild, ips)
-			}
 		}
 	}
 
-	return all, nonWild, nil
+	return all, nil
 }
 
-// buildSrcIPStrings builds the final SrcIPs string slice from
-// resolved sources, preserving non-wildcard IPs alongside wildcard
-// CGNAT ranges to match Tailscale SaaS behavior.
+// buildSrcIPStrings writes sources as Tailscale does: each alias on its
+// own, unioned and sorted as text, so a node address stays next to a
+// wildcard range that contains it. A wildcard adds every approved subnet
+// route; danger-all is "*".
 func buildSrcIPStrings(
-	resolvedSrcs, nonWildcardSrcs []ResolvedAddresses,
+	resolvedSrcs []ResolvedAddresses,
 	hasWildcard, hasDangerAll bool,
 	nodes views.Slice[types.NodeView],
 ) []string {
-	srcResolved, err := mergeResolvedSrcs(resolvedSrcs)
-	if err != nil || srcResolved.Empty() {
+	var strs []string
+	for _, src := range resolvedSrcs {
+		strs = append(strs, src.Strings()...)
+	}
+
+	if len(strs) == 0 {
 		return nil
 	}
 
-	srcIPStrs := srcIPsWithRoutes(
-		srcResolved, hasWildcard, hasDangerAll, nodes,
-	)
-
-	// When sources include a wildcard (*) alongside explicit
-	// sources (tags, groups, etc.), Tailscale preserves the
-	// individual IPs from non-wildcard sources alongside the
-	// merged CGNAT ranges rather than absorbing them.
-	if hasWildcard && len(nonWildcardSrcs) > 0 {
-		seen := set.SetOf(srcIPStrs)
-
-		for _, ips := range nonWildcardSrcs {
-			for _, s := range ips.Strings() {
-				if !seen.Contains(s) {
-					seen.Add(s)
-					srcIPStrs = append(srcIPStrs, s)
-				}
-			}
-		}
+	if hasDangerAll {
+		return []string{"*"}
 	}
 
-	return srcIPStrs
+	if hasWildcard {
+		strs = append(strs, approvedSubnetRoutes(nodes)...)
+	}
+
+	slices.Sort(strs)
+
+	return slices.Compact(strs)
 }
 
 type resolvedDestination struct {
@@ -769,7 +763,10 @@ func collectViaTargetTags(grants []compiledGrant) map[Tag]struct{} {
 // grants contribute their full pre-compiled ruleset; self grants
 // contribute their non-self portion.
 func globalFilterRules(grants []compiledGrant) []tailcfg.FilterRule {
-	var rules []tailcfg.FilterRule
+	var (
+		rules []tailcfg.FilterRule
+		keys  []string
+	)
 
 	for i := range grants {
 		if grants[i].category == grantCategoryVia {
@@ -777,9 +774,10 @@ func globalFilterRules(grants []compiledGrant) []tailcfg.FilterRule {
 		}
 
 		rules = append(rules, grants[i].rules...)
+		keys = append(keys, grants[i].ruleKeys...)
 	}
 
-	return mergeFilterRules(rules)
+	return mergeKeyedRules(rules, keys)
 }
 
 // filterRulesForNode produces unreduced filter rules for a specific
@@ -792,26 +790,48 @@ func filterRulesForNode(
 	node types.NodeView,
 	userIdx userNodeIndex,
 ) []tailcfg.FilterRule {
-	return rulesForNode(grants, node, userIdx, compileViaForNode)
+	return rulesForNode(grants, node, userIdx, filterSelfRules, compileViaForNode)
 }
 
-// peerRulesForNode returns the rules that decide a node's peers: its
-// unreduced filter rules, with [viaPeerRule] in place of each via rule.
-func peerRulesForNode(
+// nodeOnlyMatchers returns the matchers of the self and via rules a node
+// adds to the pre-compiled rules every node shares. Self matchers are
+// shared per user; via rules reuse their grant's parsed sources.
+func nodeOnlyMatchers(
 	grants []compiledGrant,
 	node types.NodeView,
 	userIdx userNodeIndex,
-) []tailcfg.FilterRule {
-	return rulesForNode(grants, node, userIdx, viaPeerRule)
+	viaRules func(*compiledGrant, types.NodeView) []tailcfg.FilterRule,
+) []matcher.Match {
+	var matchers []matcher.Match
+
+	for i := range grants {
+		cg := &grants[i]
+
+		switch cg.category {
+		case grantCategoryRegular:
+		case grantCategorySelf:
+			matchers = append(matchers, ownSelfRules(cg, node, userIdx).matchers...)
+		case grantCategoryVia:
+			for _, rule := range viaRules(cg, node) {
+				matchers = append(matchers, matcher.MatchFromFilterRuleSrcs(rule, cg.via.srcSet))
+			}
+		}
+	}
+
+	return matchers
 }
 
 func rulesForNode(
 	grants []compiledGrant,
 	node types.NodeView,
 	userIdx userNodeIndex,
+	selfRules func(*compiledGrant, types.NodeView, userNodeIndex) keyedRules,
 	viaRules func(*compiledGrant, types.NodeView) []tailcfg.FilterRule,
 ) []tailcfg.FilterRule {
-	var rules []tailcfg.FilterRule
+	var (
+		rules []tailcfg.FilterRule
+		keys  []string
+	)
 
 	for i := range grants {
 		cg := &grants[i]
@@ -819,76 +839,96 @@ func rulesForNode(
 		// Pre-compiled rules apply to all grant categories
 		// (empty for via-only grants).
 		rules = append(rules, cg.rules...)
+		keys = append(keys, cg.ruleKeys...)
 
 		switch cg.category {
 		case grantCategoryRegular:
 			// Nothing more to do.
 
 		case grantCategorySelf:
-			rules = append(
-				rules,
-				compileAutogroupSelf(cg, node, userIdx)...,
-			)
+			self := selfRules(cg, node, userIdx)
+			rules = append(rules, self.rules...)
+			keys = append(keys, self.keys...)
 
 		case grantCategoryVia:
-			rules = append(
-				rules,
-				viaRules(cg, node)...,
-			)
+			for _, rule := range viaRules(cg, node) {
+				rules = append(rules, rule)
+				keys = append(keys, viaRuleKey(cg, rule))
+			}
 		}
 	}
 
-	return mergeFilterRules(rules)
+	return mergeKeyedRules(rules, keys)
 }
 
-// compileAutogroupSelf produces filter rules for autogroup:self
-// destinations for a specific node. Only called for grants with
-// self destinations and only produces rules for untagged nodes.
-func compileAutogroupSelf(
+// ownSelfRules returns the autogroup:self rules of node's own user.
+func ownSelfRules(
 	cg *compiledGrant,
 	node types.NodeView,
 	userIdx userNodeIndex,
-) []tailcfg.FilterRule {
+) keyedRules {
 	if node.IsTagged() || cg.self == nil || !node.User().Valid() {
-		return nil
+		return keyedRules{}
 	}
 
-	return compileSelfForUser(cg, userIdx[node.User().ID()])
+	return userSelfRules(cg, node.User().ID(), userIdx)
 }
 
-// exitNodeSelfRules returns the autogroup:self rules of every user
-// other than the node's own for an exit node, whose exit routes contain
-// every self destination. Only the packet filter needs them: they never
-// make the exit node a peer, and expanding every user for peer matching
-// would cost O(users) per exit node on each peer map build.
-func exitNodeSelfRules(
-	grants []compiledGrant,
+// filterSelfRules returns the autogroup:self rules a node's packet filter
+// holds: its own user's, or, on an exit node, whose exit routes contain
+// every self destination, every user's in user order, as Tailscale sends
+// them. Only the packet filter needs other users' rules: they never make
+// the exit node a peer, so the peer paths use [ownSelfRules].
+func filterSelfRules(
+	cg *compiledGrant,
 	node types.NodeView,
 	userIdx userNodeIndex,
-) []tailcfg.FilterRule {
+) keyedRules {
 	if !node.IsExitNode() {
-		return nil
+		return ownSelfRules(cg, node, userIdx)
 	}
 
-	var rules []tailcfg.FilterRule
+	if cg.self == nil {
+		return keyedRules{}
+	}
 
+	var all keyedRules
+
+	for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
+		r := userSelfRules(cg, uid, userIdx)
+		all.rules = append(all.rules, r.rules...)
+		all.keys = append(all.keys, r.keys...)
+	}
+
+	return all
+}
+
+// userSelfRules returns uid's autogroup:self rules, shared from
+// [precomputeSelfRules], or built now for a grant compiled without it.
+func userSelfRules(cg *compiledGrant, uid uint, userIdx userNodeIndex) keyedRules {
+	if r, ok := cg.self.byUser[uid]; ok {
+		return r
+	}
+
+	return newKeyedRules(compileSelfForUser(cg, userIdx[uid]))
+}
+
+// precomputeSelfRules builds every user's autogroup:self rules once per
+// compile. They depend only on the user, so all of a user's nodes share
+// them instead of each node building them again.
+func precomputeSelfRules(grants []compiledGrant, userIdx userNodeIndex) {
 	for i := range grants {
-		cg := &grants[i]
-		if cg.self == nil {
+		self := grants[i].self
+		if self == nil {
 			continue
 		}
 
-		for _, uid := range slices.Sorted(maps.Keys(userIdx)) {
-			// compileAutogroupSelf already covers an untagged node's own user.
-			if nodeHasUserIdentity(node) && node.User().ID() == uid {
-				continue
-			}
+		self.byUser = make(map[uint]keyedRules, len(userIdx))
 
-			rules = append(rules, compileSelfForUser(cg, userIdx[uid])...)
+		for uid, nodes := range userIdx {
+			self.byUser[uid] = newKeyedRules(compileSelfForUser(&grants[i], nodes))
 		}
 	}
-
-	return rules
 }
 
 // compileSelfForUser produces the autogroup:self rules for one user's
@@ -903,11 +943,10 @@ func compileSelfForUser(
 
 	var rules []tailcfg.FilterRule
 
-	// Filter sources to only same-user untagged devices.
-	srcResolved := filterSourcesToSameUser(
-		cg.self.resolvedSrcs, sameUserNodes,
-	)
-	if srcResolved == nil || srcResolved.Empty() {
+	// Tailscale writes autogroup:self once per source alias, each with the
+	// same-user devices that alias names.
+	perSrc, srcResolved := sameUserSources(cg.self.resolvedSrcs, sameUserNodes)
+	if len(perSrc) == 0 {
 		return nil
 	}
 
@@ -930,11 +969,13 @@ func compileSelfForUser(
 		}
 
 		if len(destPorts) > 0 {
-			rules = append(rules, tailcfg.FilterRule{
-				SrcIPs:   srcResolved.Strings(),
-				DstPorts: destPorts,
-				IPProto:  ipp.Protocol.toIANAProtocolNumbers(),
-			})
+			for _, src := range perSrc {
+				rules = append(rules, tailcfg.FilterRule{
+					SrcIPs:   src.Strings(),
+					DstPorts: destPorts,
+					IPProto:  ipp.Protocol.toIANAProtocolNumbers(),
+				})
+			}
 		}
 	}
 
@@ -983,29 +1024,44 @@ func compileSelfForUser(
 	return rules
 }
 
-// filterSourcesToSameUser intersects resolved source addresses with
-// same-user untagged device IPs, returning only the addresses that
-// belong to those devices.
-func filterSourcesToSameUser(
+// sameUserSources returns, per source alias, the same-user untagged
+// devices it names, and all of them together.
+func sameUserSources(
 	resolvedSrcs []ResolvedAddresses,
 	sameUserNodes []types.NodeView,
-) ResolvedAddresses {
-	var srcIPs netipx.IPSetBuilder
+) ([]ResolvedAddresses, ResolvedAddresses) {
+	var (
+		perSrc []ResolvedAddresses
+		all    netipx.IPSetBuilder
+	)
 
 	for _, ips := range resolvedSrcs {
+		var named netipx.IPSetBuilder
+
 		for _, n := range sameUserNodes {
 			if slices.ContainsFunc(n.IPs(), ips.Contains) {
-				n.AppendToIPSet(&srcIPs)
+				n.AppendToIPSet(&named)
+				n.AppendToIPSet(&all)
 			}
 		}
+
+		set, err := named.IPSet()
+		if err != nil || len(set.Ranges()) == 0 {
+			continue
+		}
+
+		src, _ := newNodeAddresses(set, nil)
+		perSrc = append(perSrc, src)
 	}
 
-	srcResolved, err := newResolved(&srcIPs)
+	set, err := all.IPSet()
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 
-	return srcResolved
+	union, _ := newNodeAddresses(set, nil)
+
+	return perSrc, union
 }
 
 // viaDstsForNode returns the destinations node serves for a via grant: none
@@ -1014,9 +1070,9 @@ func filterSourcesToSameUser(
 func viaDstsForNode(
 	cg *compiledGrant,
 	node types.NodeView,
-) []netip.Prefix {
+) ([]netip.Prefix, bool) {
 	if cg.via == nil {
-		return nil
+		return nil, false
 	}
 
 	// Check if node matches any via tag.
@@ -1031,7 +1087,7 @@ func viaDstsForNode(
 	}
 
 	if !matchesVia {
-		return nil
+		return nil, false
 	}
 
 	// [types.NodeView.SubnetRoutes] excludes exit routes, so the overlap
@@ -1062,14 +1118,7 @@ func viaDstsForNode(
 	// to the grant source via [matcher.Match.DestsIsTheInternet].
 	// [policyutil.ReduceFilterRules] strips the rule from the wire format
 	// on non-exit advertisers, preserving SaaS PacketFilter encoding.
-	if cg.via.hasAutoGroupInternet && node.IsExitNode() {
-		viaDstPrefixes = append(
-			viaDstPrefixes,
-			util.TheInternet().Prefixes()...,
-		)
-	}
-
-	return viaDstPrefixes
+	return viaDstPrefixes, cg.via.hasAutoGroupInternet && node.IsExitNode()
 }
 
 // compileViaForNode produces via-grant filter rules for a specific
@@ -1079,9 +1128,18 @@ func compileViaForNode(
 	cg *compiledGrant,
 	node types.NodeView,
 ) []tailcfg.FilterRule {
-	viaDstPrefixes := viaDstsForNode(cg, node)
-	if len(viaDstPrefixes) == 0 {
+	viaDstPrefixes, internet := viaDstsForNode(cg, node)
+	if len(viaDstPrefixes) == 0 && !internet {
 		return nil
+	}
+
+	dsts := make([]string, 0, len(viaDstPrefixes))
+	for _, prefix := range viaDstPrefixes {
+		dsts = append(dsts, filterIP(prefix))
+	}
+
+	if internet {
+		dsts = append(dsts, internetStrings()...)
 	}
 
 	// Build rules using pre-resolved srcIPStrings.
@@ -1090,12 +1148,12 @@ func compileViaForNode(
 	for _, ipp := range cg.via.internetProtocols {
 		var destPorts []tailcfg.NetPortRange
 
-		for _, prefix := range viaDstPrefixes {
+		for _, ip := range dsts {
 			for _, port := range ipp.Ports {
 				destPorts = append(
 					destPorts,
 					tailcfg.NetPortRange{
-						IP:    filterIP(prefix),
+						IP:    ip,
 						Ports: port,
 					},
 				)
@@ -1125,7 +1183,7 @@ func viaPeerRule(
 	cg *compiledGrant,
 	node types.NodeView,
 ) []tailcfg.FilterRule {
-	if len(viaDstsForNode(cg, node)) == 0 {
+	if prefixes, internet := viaDstsForNode(cg, node); len(prefixes) == 0 && !internet {
 		return nil
 	}
 

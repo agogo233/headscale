@@ -72,12 +72,14 @@ type ViaRouteResult struct {
 	// Include contains prefixes this peer should serve to this viewer (via-designated).
 	Include []netip.Prefix
 	// Exclude contains prefixes steered to OTHER peers (suppress from global primary).
+	// Two via grants can list one prefix in both; Include wins.
 	Exclude []netip.Prefix
 	// UsePrimary contains prefixes from [ViaRouteResult.Include] where a regular
 	// (non-via) grant also covers the prefix. In these cases HA
 	// primary election wins — only the primary router should get
 	// the route in [tailcfg.Node.AllowedIPs]. When a prefix is NOT in [ViaRouteResult.UsePrimary],
-	// per-viewer via steering applies.
+	// per-viewer via steering applies. Exit routes have no election, so
+	// they are never here.
 	UsePrimary []netip.Prefix
 }
 
@@ -140,6 +142,10 @@ type Node struct {
 
 	IPv4 *netip.Addr `gorm:"column:ipv4;serializer:text"`
 	IPv6 *netip.Addr `gorm:"column:ipv6;serializer:text"`
+
+	// LastControlAddress is the source IP most recently observed on an
+	// authenticated control connection from this node.
+	LastControlAddress *netip.Addr `gorm:"column:last_control_address;serializer:text"`
 
 	// Hostname represents the name given by the Tailscale
 	// client during registration
@@ -914,7 +920,7 @@ func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
 		return "", false
 	}
 
-	fqdn, err := nv.GetFQDN(cfg.BaseDomain)
+	fqdn, err := nv.GetFQDN(cfg.DNSConfig.BaseDomain)
 	if err != nil {
 		return "", false
 	}
@@ -938,7 +944,7 @@ func (nv NodeView) CertDomain(cfg *Config) (string, bool) {
 	// A node may publish only its own name's challenge, which keeps it from
 	// other names' certificates only where the provider answers each name's
 	// challenge apart.
-	if iso, ok := cfg.DNSChallenge.Provider.(hsdns.Isolator); ok && !iso.Isolates(domain) {
+	if iso, ok := cfg.DNSProvider().(hsdns.Isolator); ok && !iso.Isolates(domain) {
 		return "", false
 	}
 
@@ -1374,7 +1380,7 @@ func (nv NodeView) TailNode(
 		return nil, ErrInvalidNodeView
 	}
 
-	hostname, err := nv.GetFQDN(cfg.BaseDomain)
+	hostname, err := nv.GetFQDN(cfg.DNSConfig.BaseDomain)
 	if err != nil {
 		return nil, err
 	}

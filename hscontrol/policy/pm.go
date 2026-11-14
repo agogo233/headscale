@@ -26,6 +26,8 @@ type PolicyManager interface {
 	// client-provided URL params.
 	SSHCheckParams(srcNodeID, dstNodeID types.NodeID, localUser string) (time.Duration, bool)
 	SetPolicy(pol []byte) (bool, error)
+	// DERPMap returns the policy's derpMap, nil without one.
+	DERPMap() *tailcfg.DERPMap
 	// SetUsers replaces the user list. policyChanged reports whether clients
 	// need a policy refresh; peerMapChanged reports whether user-derived peer
 	// adjacency may have changed. Both are false when the list is unchanged.
@@ -120,6 +122,12 @@ func NewPolicyManager(pol []byte, users []types.User, nodes views.Slice[types.No
 	}
 
 	return polMan, err
+}
+
+// ValidatePolicy reports whether a policy write of pol would be accepted
+// against users and nodes; see [policyv2.ValidatePolicy].
+func ValidatePolicy(pol []byte, users []types.User, nodes views.Slice[types.NodeView]) error {
+	return policyv2.ValidatePolicy(pol, users, nodes)
 }
 
 // PolicyManagersForTest returns all available [PolicyManager] implementations to

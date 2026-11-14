@@ -1063,8 +1063,8 @@ func TestSSHPolicySharedBetweenNodes(t *testing.T) {
 	}
 
 	pm, err := NewPolicyManager([]byte(`{"ssh": [
-		{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member"], "users": ["a"]},
-		{"action": "accept", "src": ["user1@headscale.net"], "dst": ["autogroup:member"], "users": ["b"]}
+		{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self"], "users": ["a"]},
+		{"action": "accept", "src": ["user1@headscale.net"], "dst": ["autogroup:self"], "users": ["b"]}
 	]}`), users, nodes[:2].ViewSlice())
 	require.NoError(t, err)
 
@@ -3176,7 +3176,7 @@ func TestSetPolicy_DuplicateUsername(t *testing.T) {
 	require.NotNil(t, filter, "filter must remain populated after rejected SetPolicy")
 }
 
-// Empty users → syntax-only check, used by `headscale policy check`.
+// Empty users → user-reference validation is skipped.
 func TestValidateUserReferences_EmptyUsersTolerant(t *testing.T) {
 	polB := []byte(`{
   "groups":    {"group:admins": ["yala@"]},
@@ -3613,6 +3613,16 @@ var benchPolicies = []struct {
 	{name: "via", policy: `{
 		"tagOwners": {"tag:router": ["u1@"]},
 		"grants": [{"src": ["u2@"], "dst": ["10.0.0.0/8"], "ip": ["*"], "via": ["tag:router"]}]}`, routerFiltered: true},
+	// Names every user node, so its sources grow with the tailnet.
+	{name: "member-all", policy: `{
+		"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["*:*"]}]}`, routerFiltered: true},
+	// Every member's address is a destination of every member.
+	{name: "member-member", policy: `{
+		"acls": [{"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:22"]}]}`},
+	// A per-node via rule whose sources grow with the tailnet.
+	{name: "via-members", policy: `{
+		"tagOwners": {"tag:router": ["u1@"]},
+		"grants": [{"src": ["autogroup:member"], "dst": ["10.0.0.0/8"], "ip": ["*"], "via": ["tag:router"]}]}`, routerFiltered: true},
 }
 
 // benchSetNodesPolicies is the subset of benchPolicies BenchmarkSetNodes
@@ -3682,6 +3692,56 @@ func BenchmarkBuildPeerMap(b *testing.B) {
 
 				for b.Loop() {
 					pm.BuildPeerMap(nodes.ViewSlice())
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkFilterForAllNodes measures FilterForNode for every node from a
+// cold cache: the filter work one policy change costs.
+func BenchmarkFilterForAllNodes(b *testing.B) {
+	for _, pol := range benchPolicies {
+		for _, n := range []int{100, 1000, 5000} {
+			b.Run(fmt.Sprintf("%s/n=%d", pol.name, n), func(b *testing.B) {
+				users, nodes := benchNodes(n)
+				pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
+				require.NoError(b, err)
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					pm.filterRulesMap.Clear()
+
+					for _, node := range nodes {
+						_, err := pm.FilterForNode(node.View())
+						require.NoError(b, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkMatchersForAllNodes measures MatchersForNode for every node from
+// a cold cache.
+func BenchmarkMatchersForAllNodes(b *testing.B) {
+	for _, pol := range benchPolicies {
+		for _, n := range []int{100, 1000, 5000} {
+			b.Run(fmt.Sprintf("%s/n=%d", pol.name, n), func(b *testing.B) {
+				users, nodes := benchNodes(n)
+				pm, err := NewPolicyManager([]byte(pol.policy), users, nodes.ViewSlice())
+				require.NoError(b, err)
+
+				b.ReportAllocs()
+
+				for b.Loop() {
+					pm.matchersForNodeMap.Clear()
+
+					for _, node := range nodes {
+						_, err := pm.MatchersForNode(node.View())
+						require.NoError(b, err)
+					}
 				}
 			})
 		}
